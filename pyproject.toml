@@ -1,0 +1,15 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "hexo-rs"
+requires-python = ">=3.10"
+dynamic = ["version"]
+
+[tool.maturin]
+features = ["python", "pyo3/extension-module"]
+module-name = "hexo_rs"
+
+[dependency-groups]
+dev = ["pytest>=8.0"]
