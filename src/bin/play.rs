@@ -16,10 +16,11 @@ use hexo_rs::{Coord, GameState, Player};
 const FILLED: &str = "\u{2b22}"; // ⬢
 const EMPTY: &str = "\u{2b21}";  // ⬡
 
-/// Each hex cell: 2 terminal columns (hex char) + 1 space = 3 cols.
-/// Rows are staggered by 1 col. Vertical spacing: 1 row per hex row.
-const W: i32 = 3;
-const H: i32 = 1;
+/// Hex char is 2 cols wide. W=4 gives 2 cols gap between hexes.
+/// H=2 gives 1 blank row between hex rows. r_offset = W/2 = 2.
+const W: i32 = 4;
+const H: i32 = 2;
+const R_OFF: i32 = W / 2; // stagger offset per row
 const STATUS_H: u16 = 5;
 
 #[derive(Clone, Copy)]
@@ -60,13 +61,13 @@ impl App {
     fn screen_to_axial(&self, col: u16, row: u16) -> Coord {
         // Center of the (0,0) hex.
         let ccx = self.origin_x as f64 + 1.0; // hex char center ~1 col in
-        let ccy = self.origin_y as f64 + 0.5;
+        let ccy = self.origin_y as f64;
 
         let dx = col as f64 - ccx;
         let dy = row as f64 - ccy;
 
         let rf = dy / H as f64;
-        let qf = (dx - rf * 1.0) / W as f64; // r_offset = 1
+        let qf = (dx - rf * R_OFF as f64) / W as f64;
 
         // Cube-coordinate rounding.
         let cx = qf;
@@ -140,8 +141,7 @@ fn sym(p: Player) -> &'static str {
 }
 
 fn axial_to_screen(q: i32, r: i32, ox: i32, oy: i32) -> (i32, i32) {
-    // r_offset = 1 col (closest integer to W/2 for hex stagger).
-    (ox + q * W + r, oy + r * H)
+    (ox + q * W + r * R_OFF, oy + r * H)
 }
 
 fn in_board(sx: i32, sy: i32, area: Rect) -> bool {
