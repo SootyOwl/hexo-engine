@@ -1,7 +1,10 @@
+use std::collections::BTreeSet;
+
 use crate::board::Board;
 use crate::legal_moves::legal_moves;
 use crate::turn::TurnState;
-use crate::types::{Coord, Player};
+use crate::types::Coord;
+use crate::types::Player;
 use crate::win::check_win;
 
 /// Configuration parameters for a HeXO game.
@@ -41,6 +44,8 @@ pub struct GameState {
     config: GameConfig,
     move_count: u32,
     winner: Option<Player>,
+    /// Cached set of legal moves, updated incrementally on each apply_move.
+    cached_legal: BTreeSet<Coord>,
 }
 
 impl GameState {
@@ -54,12 +59,16 @@ impl GameState {
     /// P1's first stone is placed at (0,0) by `Board::new()`.
     /// The game starts with P2 to move with 2 moves remaining.
     pub fn with_config(config: GameConfig) -> Self {
+        let board = Board::new();
+        let initial_legal: BTreeSet<Coord> =
+            legal_moves(&board, config.placement_radius).into_iter().collect();
         GameState {
-            board: Board::new(),
+            board,
             turn: TurnState::P2Turn { moves_left: 2 },
             config,
             move_count: 0,
             winner: None,
+            cached_legal: initial_legal,
         }
     }
 
@@ -84,11 +93,8 @@ impl GameState {
             return Err(MoveError::CellOccupied);
         }
 
-        // 3. Within placement radius of any existing stone?
-        let in_range = self.board.stones().keys().any(|&stone| {
-            crate::hex::hex_distance(stone, coord) <= self.config.placement_radius
-        });
-        if !in_range {
+        // 3. Check coord is a legal move (within radius and empty).
+        if !self.cached_legal.contains(&coord) {
             return Err(MoveError::OutOfRange);
         }
 
@@ -101,30 +107,45 @@ impl GameState {
             .place(coord, player)
             .expect("cell was verified empty");
 
-        // 4. Increment move count.
+        // 5. Update legal moves cache incrementally.
+        self.cached_legal.remove(&coord);
+        // Add new empty cells within radius of the newly placed stone.
+        let radius = self.config.placement_radius;
+        for dq in -radius..=radius {
+            for dr in -radius..=radius {
+                if dq.abs().max(dr.abs()).max((dq + dr).abs()) <= radius {
+                    let cell = (coord.0 + dq, coord.1 + dr);
+                    if self.board.get(cell).is_none() {
+                        self.cached_legal.insert(cell);
+                    }
+                }
+            }
+        }
+
+        // 6. Increment move count.
         self.move_count += 1;
 
-        // 5. Check for win.
+        // 7. Check for win.
         let won = check_win(&self.board, coord, player, self.config.win_length);
         if won {
             self.winner = Some(player);
         }
 
-        // 6. Check for draw.
+        // 8. Check for draw.
         let draw = !won && self.move_count >= self.config.max_moves;
 
-        // 7. Advance turn.
+        // 9. Advance turn.
         self.turn = self.turn.advance(won || draw);
 
         Ok(())
     }
 
-    /// Returns all legal moves for the current position.
+    /// Returns all legal moves for the current position, sorted lexicographically.
     pub fn legal_moves(&self) -> Vec<Coord> {
         if self.is_terminal() {
             return Vec::new();
         }
-        legal_moves(&self.board, self.config.placement_radius)
+        self.cached_legal.iter().copied().collect()
     }
 
     /// Returns `true` when the game has ended (win or draw).
@@ -180,6 +201,7 @@ impl Clone for GameState {
             },
             move_count: self.move_count,
             winner: self.winner,
+            cached_legal: self.cached_legal.clone(),
         }
     }
 }
