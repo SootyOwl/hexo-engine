@@ -72,5 +72,49 @@ fn bench_apply_move_50(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_legal_moves_50, bench_legal_moves_100, bench_apply_move_50);
+fn bench_clone_50(c: &mut Criterion) {
+    let game = build_game_state(50, GameConfig::FULL_HEXO);
+    c.bench_function("clone_50_stones", |b| {
+        b.iter(|| {
+            criterion::black_box(game.clone());
+        });
+    });
+}
+
+fn bench_clone_100(c: &mut Criterion) {
+    let game = build_game_state(100, GameConfig::FULL_HEXO);
+    c.bench_function("clone_100_stones", |b| {
+        b.iter(|| {
+            criterion::black_box(game.clone());
+        });
+    });
+}
+
+fn bench_mcts_cycle_clone_50(c: &mut Criterion) {
+    let game = build_game_state(50, GameConfig::FULL_HEXO);
+    c.bench_function("mcts_clone_cycle_50_stones", |b| {
+        b.iter_batched(
+            || {
+                let state = game.clone();
+                let moves = state.legal_moves();
+                let coord = moves[0];
+                (state, coord)
+            },
+            |(mut state, coord)| {
+                criterion::black_box(state.apply_move(coord))
+            },
+            BatchSize::SmallInput,
+        );
+    });
+}
+
+criterion_group!(
+    benches,
+    bench_legal_moves_50,
+    bench_legal_moves_100,
+    bench_apply_move_50,
+    bench_clone_50,
+    bench_clone_100,
+    bench_mcts_cycle_clone_50,
+);
 criterion_main!(benches);

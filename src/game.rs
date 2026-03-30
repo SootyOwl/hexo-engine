@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use crate::board::Board;
 use crate::hex::hex_offsets;
@@ -46,8 +47,8 @@ pub struct GameState {
     config: GameConfig,
     move_count: u32,
     winner: Option<Player>,
-    /// Precomputed hex-circle offsets for the configured radius.
-    offsets: Vec<Coord>,
+    /// Precomputed hex-circle offsets for the configured radius (shared across clones).
+    offsets: Arc<[Coord]>,
     /// Cached set of legal moves, updated incrementally on each apply_move.
     cached_legal: HashSet<Coord>,
 }
@@ -71,7 +72,7 @@ impl GameState {
         assert!(config.max_moves >= 1, "max_moves must be >= 1");
 
         let board = Board::new();
-        let offsets = hex_offsets(config.placement_radius);
+        let offsets: Arc<[Coord]> = hex_offsets(config.placement_radius).into();
         let initial_legal: HashSet<Coord> =
             legal_moves(&board, config.placement_radius).into_iter().collect();
         GameState {
@@ -107,11 +108,12 @@ impl GameState {
             .place(coord, player)
             .expect("cell was verified empty");
 
-        // Update legal moves cache incrementally using precomputed offsets.
+        // Update legal moves cache incrementally.
         self.cached_legal.remove(&coord);
-        for &(dq, dr) in &self.offsets {
+        let stones = self.board.stones();
+        for &(dq, dr) in self.offsets.iter() {
             let cell = (coord.0 + dq, coord.1 + dr);
-            if self.board.get(cell).is_none() {
+            if !stones.contains_key(&cell) {
                 self.cached_legal.insert(cell);
             }
         }
@@ -137,6 +139,17 @@ impl GameState {
         let mut moves: Vec<Coord> = self.cached_legal.iter().copied().collect();
         moves.sort_unstable();
         moves
+    }
+
+    /// Returns the number of legal moves without allocating.
+    pub fn legal_move_count(&self) -> usize {
+        if self.is_terminal() { 0 } else { self.cached_legal.len() }
+    }
+
+    /// Returns a reference to the internal legal moves set. Iteration order is
+    /// arbitrary (not sorted). Use this on hot paths where sorting is unnecessary.
+    pub fn legal_moves_set(&self) -> &HashSet<Coord> {
+        &self.cached_legal
     }
 
     /// Returns `true` when the game has ended (win or draw).
@@ -386,4 +399,5 @@ mod tests {
     fn invalid_config_zero_max_moves() {
         GameState::with_config(GameConfig { win_length: 6, placement_radius: 8, max_moves: 0 });
     }
+
 }

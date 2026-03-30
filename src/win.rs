@@ -4,10 +4,10 @@ use crate::types::{Coord, Player, WIN_AXES};
 /// Counts consecutive stones belonging to `player` starting from `coord`
 /// (exclusive), stepping in direction `dir`.
 /// Stops at the first empty cell or opponent stone.
-fn count_consecutive(board: &Board, coord: Coord, dir: Coord, player: Player) -> u8 {
+fn count_consecutive(board: &Board, coord: Coord, dir: Coord, player: Player, max: u8) -> u8 {
     let mut count = 0u8;
     let mut cur = (coord.0 + dir.0, coord.1 + dir.1);
-    loop {
+    while count < max {
         match board.get(cur) {
             Some(p) if p == player => {
                 count += 1;
@@ -22,9 +22,10 @@ fn count_consecutive(board: &Board, coord: Coord, dir: Coord, player: Player) ->
 /// Returns true if placing at `coord` for `player` creates a run of
 /// at least `win_length` stones along any of the three hex axes.
 pub fn check_win(board: &Board, coord: Coord, player: Player, win_length: u8) -> bool {
+    let max = win_length - 1; // max consecutive needed in any one direction
     for &(dq, dr) in &WIN_AXES {
-        let fwd = count_consecutive(board, coord, (dq, dr), player);
-        let bwd = count_consecutive(board, coord, (-dq, -dr), player);
+        let fwd = count_consecutive(board, coord, (dq, dr), player, max);
+        let bwd = count_consecutive(board, coord, (-dq, -dr), player, max.saturating_sub(fwd));
         if 1 + fwd + bwd >= win_length {
             return true;
         }
@@ -67,7 +68,7 @@ mod tests {
     fn count_consecutive_empty_returns_zero() {
         let board = build_board(&[]);
         // Walking right from (0,0) — the cell to the right (1,0) is empty.
-        let n = count_consecutive(&board, (0, 0), (1, 0), Player::P1);
+        let n = count_consecutive(&board, (0, 0), (1, 0), Player::P1, u8::MAX);
         assert_eq!(n, 0);
     }
 
@@ -80,7 +81,7 @@ mod tests {
             ((2, 0), Player::P1),
             ((3, 0), Player::P1),
         ]);
-        let n = count_consecutive(&board, (0, 0), (1, 0), Player::P1);
+        let n = count_consecutive(&board, (0, 0), (1, 0), Player::P1, u8::MAX);
         assert_eq!(n, 3);
     }
 
@@ -93,7 +94,7 @@ mod tests {
             ((2, 0), Player::P2),
             ((3, 0), Player::P1),
         ]);
-        let n = count_consecutive(&board, (0, 0), (1, 0), Player::P1);
+        let n = count_consecutive(&board, (0, 0), (1, 0), Player::P1, u8::MAX);
         assert_eq!(n, 1); // only (1,0) before opponent
     }
 
@@ -105,7 +106,7 @@ mod tests {
             ((1, 0), Player::P1),
             ((3, 0), Player::P1),
         ]);
-        let n = count_consecutive(&board, (0, 0), (1, 0), Player::P1);
+        let n = count_consecutive(&board, (0, 0), (1, 0), Player::P1, u8::MAX);
         assert_eq!(n, 1); // stops at gap (2,0)
     }
 
