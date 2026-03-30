@@ -27,6 +27,9 @@ const W: i32 = 4;
 const H: i32 = 3;
 const STATUS_H: u16 = 5;
 
+#[derive(Clone, Copy)]
+enum Theme { Dark, Light }
+
 struct App {
     game: GameState,
     cursor: Option<Coord>,
@@ -34,6 +37,7 @@ struct App {
     config: GameConfig,
     origin_x: i32,
     origin_y: i32,
+    theme: Theme,
 }
 
 impl App {
@@ -41,10 +45,11 @@ impl App {
         Self {
             game: GameState::with_config(config),
             cursor: None,
-            message: "Click a hex to place a stone. Press 'q' to quit, 'r' to restart.".into(),
+            message: "Click a hex to place a stone. Press 'q' to quit, 'r' to restart, 't' to toggle theme.".into(),
             config,
             origin_x: 0,
             origin_y: 0,
+            theme: Theme::Dark,
         }
     }
 
@@ -159,23 +164,19 @@ fn min_stone_dist(coord: Coord, stones: &[(Coord, Player)]) -> i32 {
         .unwrap_or(i32::MAX)
 }
 
-/// Map a hex distance to a style that fades with distance.
-/// Uses DarkGray color with varying modifiers — works on both light and dark terminals.
-fn fade_style(dist: i32, max_dist: i32) -> Option<Style> {
+/// Map hex distance to a fading grayscale style.
+/// Dark theme: bright near, dim far. Light theme: dark near, light far.
+fn fade_style(dist: i32, max_dist: i32, theme: Theme) -> Option<Style> {
     if dist > max_dist {
         return None;
     }
-    let t = (dist - 1).max(0) as f64 / (max_dist - 1).max(1) as f64; // 0.0 (close) .. 1.0 (far)
-    if t < 0.33 {
-        // Close: normal brightness
-        Some(Style::default().fg(Color::Gray))
-    } else if t < 0.66 {
-        // Mid: darker
-        Some(Style::default().fg(Color::DarkGray))
-    } else {
-        // Far: dim
-        Some(Style::default().fg(Color::DarkGray).dim())
-    }
+    let t = (dist - 1).max(0) as f64 / (max_dist - 1).max(1) as f64;
+    // 256-color grayscale: 232 (near-black) to 255 (near-white).
+    let idx = match theme {
+        Theme::Dark  => (250.0 - t * 12.0) as u8,  // 250 → 238
+        Theme::Light => (236.0 + t * 12.0) as u8,   // 236 → 248
+    };
+    Some(Style::default().fg(Color::Indexed(idx)))
 }
 
 /// Draw a 4×3 half-block hex with explicit style.
@@ -219,7 +220,7 @@ fn render(frame: &mut Frame, app: &mut App) {
                 continue;
             }
             let dist = min_stone_dist((q, r), &stones);
-            if let Some(style) = fade_style(dist, radius) {
+            if let Some(style) = fade_style(dist, radius, app.theme) {
                 draw_hex_styled(frame, sx, sy, "  ", style);
             }
         }
@@ -281,7 +282,7 @@ fn render(frame: &mut Frame, app: &mut App) {
     let status = Paragraph::new(vec![
         Line::from(app.message.as_str()),
         Line::from(player_info),
-        Line::from(" q: quit \u{2502} r: restart \u{2502} click: place "),
+        Line::from(" q: quit \u{2502} r: restart \u{2502} t: toggle theme \u{2502} click: place "),
     ])
     .block(Block::bordered().title(" HeXO "));
 
@@ -317,6 +318,12 @@ fn main() -> io::Result<()> {
                 Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => break,
                     KeyCode::Char('r') => app.restart(),
+                    KeyCode::Char('t') => {
+                        app.theme = match app.theme {
+                            Theme::Dark => Theme::Light,
+                            Theme::Light => Theme::Dark,
+                        };
+                    }
                     _ => {}
                 },
                 Event::Mouse(mouse) => match mouse.kind {
