@@ -13,22 +13,20 @@ use ratatui::widgets::{Block, Paragraph};
 use hexo_rs::game::{GameConfig, MoveError};
 use hexo_rs::{Coord, GameState, Player};
 
-/// Cell: 4 wide × 2 tall, half-block characters.
-///
-///   ▄▄        row 0  (top cap, inset by 1)
-///  ▐X ▌       row 1  (sides + content)
-///   ▀▀        row 2  (bottom cap, inset by 1... wait, that's 3 rows)
-///
-/// Actually 4 wide × 3 tall for a nice hex shape:
-///  ▄▄
-/// ▐  ▌
-///  ▀▀
-const W: i32 = 4;
-const H: i32 = 3;
+const FILLED: &str = "\u{2b22}"; // ⬢
+const EMPTY: &str = "\u{2b21}";  // ⬡
+
+/// Each hex cell: 2 terminal columns (hex char) + 1 space = 3 cols.
+/// Rows are staggered by 1 col. Vertical spacing: 1 row per hex row.
+const W: i32 = 3;
+const H: i32 = 1;
 const STATUS_H: u16 = 5;
 
 #[derive(Clone, Copy)]
-enum Theme { Dark, Light }
+enum Theme {
+    Dark,
+    Light,
+}
 
 struct App {
     game: GameState,
@@ -45,7 +43,7 @@ impl App {
         Self {
             game: GameState::with_config(config),
             cursor: None,
-            message: "Click a hex to place a stone. Press 'q' to quit, 'r' to restart, 't' to toggle theme.".into(),
+            message: "Click to place. q: quit, r: restart, t: theme".into(),
             config,
             origin_x: 0,
             origin_y: 0,
@@ -60,27 +58,28 @@ impl App {
     }
 
     fn screen_to_axial(&self, col: u16, row: u16) -> Coord {
-        let ccx = self.origin_x as f64 + W as f64 / 2.0;
-        let ccy = self.origin_y as f64 + H as f64 / 2.0;
+        // Center of the (0,0) hex.
+        let ccx = self.origin_x as f64 + 1.0; // hex char center ~1 col in
+        let ccy = self.origin_y as f64 + 0.5;
 
         let dx = col as f64 - ccx;
         let dy = row as f64 - ccy;
 
         let rf = dy / H as f64;
-        let qf = (dx - rf * W as f64 / 2.0) / W as f64;
+        let qf = (dx - rf * 1.0) / W as f64; // r_offset = 1
 
         // Cube-coordinate rounding.
-        let cube_x = qf;
-        let cube_z = rf;
-        let cube_y = -cube_x - cube_z;
+        let cx = qf;
+        let cz = rf;
+        let cy = -cx - cz;
 
-        let mut rx = cube_x.round();
-        let ry = cube_y.round();
-        let mut rz = cube_z.round();
+        let mut rx = cx.round();
+        let ry = cy.round();
+        let mut rz = cz.round();
 
-        let ex = (rx - cube_x).abs();
-        let ey = (ry - cube_y).abs();
-        let ez = (rz - cube_z).abs();
+        let ex = (rx - cx).abs();
+        let ey = (ry - cy).abs();
+        let ez = (rz - cz).abs();
 
         if ex > ey && ex > ez {
             rx = -ry - rz;
@@ -93,10 +92,9 @@ impl App {
 
     fn try_place(&mut self, coord: Coord) {
         if self.game.is_terminal() {
-            self.message = "Game is over! Press 'r' to restart.".into();
+            self.message = "Game over! Press 'r' to restart.".into();
             return;
         }
-
         match self.game.apply_move(coord) {
             Ok(()) => {
                 let stones = self.game.placed_stones().len();
@@ -104,34 +102,31 @@ impl App {
                     match self.game.winner() {
                         Some(p) => {
                             self.message = format!(
-                                "{} wins! ({stones} stones). Press 'r' to restart.",
+                                "{} wins! ({stones} stones). Press 'r'.",
                                 sym(p)
                             );
                         }
                         None => {
-                            self.message =
-                                format!("Draw after {stones} stones. Press 'r' to restart.");
+                            self.message = format!("Draw ({stones} stones). Press 'r'.");
                         }
                     }
                 } else {
                     let p = self.game.current_player().unwrap();
-                    let remaining = self.game.moves_remaining_this_turn();
+                    let rem = self.game.moves_remaining_this_turn();
                     self.message = format!(
-                        "{} to move ({remaining} left). Placed at ({}, {}). {stones} stones.",
-                        sym(p),
-                        coord.0,
-                        coord.1,
+                        "{} to move ({rem} left). ({},{}). {stones} stones.",
+                        sym(p), coord.0, coord.1,
                     );
                 }
             }
             Err(MoveError::CellOccupied) => {
-                self.message = format!("({}, {}) is occupied!", coord.0, coord.1);
+                self.message = format!("({},{}) occupied!", coord.0, coord.1);
             }
             Err(MoveError::OutOfRange) => {
-                self.message = format!("({}, {}) is out of range!", coord.0, coord.1);
+                self.message = format!("({},{}) out of range!", coord.0, coord.1);
             }
             Err(MoveError::GameOver) => {
-                self.message = "Game is over! Press 'r' to restart.".into();
+                self.message = "Game over! Press 'r'.".into();
             }
         }
     }
@@ -145,17 +140,17 @@ fn sym(p: Player) -> &'static str {
 }
 
 fn axial_to_screen(q: i32, r: i32, ox: i32, oy: i32) -> (i32, i32) {
-    (ox + q * W + r * (W / 2), oy + r * H)
+    // r_offset = 1 col (closest integer to W/2 for hex stagger).
+    (ox + q * W + r, oy + r * H)
 }
 
 fn in_board(sx: i32, sy: i32, area: Rect) -> bool {
     sx >= area.x as i32
-        && sx + W - 1 < (area.x + area.width) as i32
+        && sx + 2 < (area.x + area.width) as i32 // hex char is ~2 cols
         && sy >= area.y as i32
-        && sy + H - 1 < (area.y + area.height) as i32
+        && sy < (area.y + area.height) as i32
 }
 
-/// Minimum distance from `coord` to any placed stone.
 fn min_stone_dist(coord: Coord, stones: &[(Coord, Player)]) -> i32 {
     stones
         .iter()
@@ -164,47 +159,25 @@ fn min_stone_dist(coord: Coord, stones: &[(Coord, Player)]) -> i32 {
         .unwrap_or(i32::MAX)
 }
 
-/// Map hex distance to a fading grayscale style.
-/// Dark theme: bright near, dim far. Light theme: dark near, light far.
 fn fade_style(dist: i32, max_dist: i32, theme: Theme) -> Option<Style> {
     if dist > max_dist {
         return None;
     }
     let t = (dist - 1).max(0) as f64 / (max_dist - 1).max(1) as f64;
-    // 256-color grayscale: 232 (near-black) to 255 (near-white).
     let idx = match theme {
-        Theme::Dark  => (250.0 - t * 12.0) as u8,  // 250 → 238
-        Theme::Light => (236.0 + t * 12.0) as u8,   // 236 → 248
+        Theme::Dark => (250.0 - t * 12.0) as u8,
+        Theme::Light => (236.0 + t * 12.0) as u8,
     };
     Some(Style::default().fg(Color::Indexed(idx)))
 }
 
-/// Draw a 4×3 half-block hex with explicit style.
-fn draw_hex_styled(frame: &mut Frame, sx: i32, sy: i32, ch: &str, style: Style) {
-    frame.render_widget(
-        Span::styled(" \u{2584}\u{2584} ", style),
-        Rect::new(sx as u16, sy as u16, W as u16, 1),
-    );
-    let line = Line::from(vec![
-        Span::styled("\u{2590}", style),  // ▐
-        Span::styled(ch, style),
-        Span::styled("\u{258c}", style),  // ▌
-    ]);
-    frame.render_widget(line, Rect::new(sx as u16, (sy + 1) as u16, W as u16, 1));
-    frame.render_widget(
-        Span::styled(" \u{2580}\u{2580} ", style),
-        Rect::new(sx as u16, (sy + 2) as u16, W as u16, 1),
-    );
-}
-
 fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
-
     let [board_area, status_area] =
         Layout::vertical([Constraint::Fill(1), Constraint::Length(STATUS_H)]).areas(area);
 
-    let ox = board_area.x as i32 + board_area.width as i32 / 2 - W / 2;
-    let oy = board_area.y as i32 + board_area.height as i32 / 2 - H / 2;
+    let ox = board_area.x as i32 + board_area.width as i32 / 2;
+    let oy = board_area.y as i32 + board_area.height as i32 / 2;
     app.origin_x = ox;
     app.origin_y = oy;
 
@@ -212,7 +185,7 @@ fn render(frame: &mut Frame, app: &mut App) {
     let legal = app.game.legal_moves_set();
     let radius = app.config.placement_radius;
 
-    // 1. Empty hex outlines with distance-based fade.
+    // 1. Empty hex outlines with fade.
     if !app.game.is_terminal() {
         for &(q, r) in legal.iter() {
             let (sx, sy) = axial_to_screen(q, r, ox, oy);
@@ -221,7 +194,10 @@ fn render(frame: &mut Frame, app: &mut App) {
             }
             let dist = min_stone_dist((q, r), &stones);
             if let Some(style) = fade_style(dist, radius, app.theme) {
-                draw_hex_styled(frame, sx, sy, "  ", style);
+                frame.render_widget(
+                    Span::styled(EMPTY, style),
+                    Rect::new(sx as u16, sy as u16, 3, 1),
+                );
             }
         }
     }
@@ -232,11 +208,14 @@ fn render(frame: &mut Frame, app: &mut App) {
         if !in_board(sx, sy, board_area) {
             continue;
         }
-        let (ch, style) = match player {
-            Player::P1 => ("X ", Style::default().fg(Color::Cyan).bold()),
-            Player::P2 => ("O ", Style::default().fg(Color::Magenta).bold()),
+        let color = match player {
+            Player::P1 => Color::Cyan,
+            Player::P2 => Color::Magenta,
         };
-        draw_hex_styled(frame, sx, sy, ch, style);
+        frame.render_widget(
+            Span::styled(FILLED, Style::default().fg(color).bold()),
+            Rect::new(sx as u16, sy as u16, 3, 1),
+        );
     }
 
     // 3. Cursor highlight.
@@ -247,31 +226,33 @@ fn render(frame: &mut Frame, app: &mut App) {
             let is_legal = legal.contains(&(q, r));
 
             if is_stone {
-                let hl = Style::default().fg(Color::Yellow).bold();
+                // Bright outline around the stone.
                 frame.render_widget(
-                    Span::styled("\u{25b8}", hl),
-                    Rect::new(sx as u16, (sy + 1) as u16, 1, 1),
-                );
-                frame.render_widget(
-                    Span::styled("\u{25c2}", hl),
-                    Rect::new((sx + W - 1) as u16, (sy + 1) as u16, 1, 1),
+                    Span::styled(FILLED, Style::default().fg(Color::Yellow).bold()),
+                    Rect::new(sx as u16, sy as u16, 3, 1),
                 );
             } else if is_legal {
-                draw_hex_styled(frame, sx, sy, "\u{b7}\u{b7}", Style::default().fg(Color::Yellow).bold());
+                frame.render_widget(
+                    Span::styled(FILLED, Style::default().fg(Color::Yellow)),
+                    Rect::new(sx as u16, sy as u16, 3, 1),
+                );
             } else {
-                draw_hex_styled(frame, sx, sy, "  ", Style::default().fg(Color::DarkGray).dim());
+                frame.render_widget(
+                    Span::styled(EMPTY, Style::default().fg(Color::DarkGray)),
+                    Rect::new(sx as u16, sy as u16, 3, 1),
+                );
             }
         }
     }
 
     // Status bar.
     let player_info = if let Some(p) = app.game.current_player() {
-        let remaining = app.game.moves_remaining_this_turn();
-        format!(
-            " {} to move \u{2502} {remaining} left \u{2502} {} stones ",
-            sym(p),
-            app.game.placed_stones().len()
-        )
+        let rem = app.game.moves_remaining_this_turn();
+        let marker = match p {
+            Player::P1 => format!("{FILLED} X"),
+            Player::P2 => format!("{FILLED} O"),
+        };
+        format!(" {marker} to move \u{2502} {rem} left \u{2502} {} stones ", app.game.placed_stones().len())
     } else {
         match app.game.winner() {
             Some(p) => format!(" {} wins! ", sym(p)),
@@ -282,10 +263,9 @@ fn render(frame: &mut Frame, app: &mut App) {
     let status = Paragraph::new(vec![
         Line::from(app.message.as_str()),
         Line::from(player_info),
-        Line::from(" q: quit \u{2502} r: restart \u{2502} t: toggle theme \u{2502} click: place "),
+        Line::from(" q: quit \u{2502} r: restart \u{2502} t: theme \u{2502} click: place "),
     ])
     .block(Block::bordered().title(" HeXO "));
-
     frame.render_widget(status, status_area);
 }
 
@@ -295,11 +275,7 @@ fn main() -> io::Result<()> {
         let win_len: u8 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(6);
         let radius: i32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(8);
         let max_moves: u32 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(200);
-        GameConfig {
-            win_length: win_len,
-            placement_radius: radius,
-            max_moves,
-        }
+        GameConfig { win_length: win_len, placement_radius: radius, max_moves }
     } else {
         GameConfig::FULL_HEXO
     };
@@ -307,12 +283,10 @@ fn main() -> io::Result<()> {
     enable_raw_mode()?;
     execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
     let mut terminal = ratatui::init();
-
     let mut app = App::new(config);
 
     loop {
         terminal.draw(|frame| render(frame, &mut app))?;
-
         if event::poll(Duration::from_millis(50))? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
