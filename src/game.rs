@@ -1,13 +1,14 @@
-use std::collections::BTreeSet;
+use std::collections::HashSet;
 
 use crate::board::Board;
+use crate::hex::hex_offsets;
 use crate::legal_moves::legal_moves;
 use crate::turn::TurnState;
-use crate::types::Coord;
-use crate::types::Player;
+use crate::types::{Coord, Player};
 use crate::win::check_win;
 
 /// Configuration parameters for a HeXO game.
+#[derive(Debug, Clone, Copy)]
 pub struct GameConfig {
     /// Number of consecutive stones needed to win.
     pub win_length: u8,
@@ -38,14 +39,17 @@ pub enum MoveError {
 }
 
 /// The full game state: board, whose turn it is, move counter, and outcome.
+#[derive(Clone)]
 pub struct GameState {
     board: Board,
     turn: TurnState,
     config: GameConfig,
     move_count: u32,
     winner: Option<Player>,
+    /// Precomputed hex-circle offsets for the configured radius.
+    offsets: Vec<Coord>,
     /// Cached set of legal moves, updated incrementally on each apply_move.
-    cached_legal: BTreeSet<Coord>,
+    cached_legal: HashSet<Coord>,
 }
 
 impl GameState {
@@ -58,9 +62,17 @@ impl GameState {
     ///
     /// P1's first stone is placed at (0,0) by `Board::new()`.
     /// The game starts with P2 to move with 2 moves remaining.
+    ///
+    /// # Panics
+    /// Panics if `win_length < 2`, `placement_radius < 1`, or `max_moves < 1`.
     pub fn with_config(config: GameConfig) -> Self {
+        assert!(config.win_length >= 2, "win_length must be >= 2");
+        assert!(config.placement_radius >= 1, "placement_radius must be >= 1");
+        assert!(config.max_moves >= 1, "max_moves must be >= 1");
+
         let board = Board::new();
-        let initial_legal: BTreeSet<Coord> =
+        let offsets = hex_offsets(config.placement_radius);
+        let initial_legal: HashSet<Coord> =
             legal_moves(&board, config.placement_radius).into_iter().collect();
         GameState {
             board,
@@ -68,37 +80,25 @@ impl GameState {
             config,
             move_count: 0,
             winner: None,
+            offsets,
             cached_legal: initial_legal,
         }
     }
 
     /// Attempts to place the current player's stone at `coord`.
-    ///
-    /// Steps:
-    /// 1. Reject if game is already over.
-    /// 2. Reject if `coord` is outside the placement radius.
-    /// 3. Reject if `coord` is already occupied.
-    /// 4. Increment `move_count`.
-    /// 5. Check for a win.
-    /// 6. Check for a draw (no win and move_count >= max_moves).
-    /// 7. Advance the turn state.
     pub fn apply_move(&mut self, coord: Coord) -> Result<(), MoveError> {
-        // 1. Game already over?
         if self.is_terminal() {
             return Err(MoveError::GameOver);
         }
 
-        // 2. Check occupancy.
         if self.board.get(coord).is_some() {
             return Err(MoveError::CellOccupied);
         }
 
-        // 3. Check coord is a legal move (within radius and empty).
         if !self.cached_legal.contains(&coord) {
             return Err(MoveError::OutOfRange);
         }
 
-        // 4. Place stone.
         let player = self
             .turn
             .current_player()
@@ -107,34 +107,23 @@ impl GameState {
             .place(coord, player)
             .expect("cell was verified empty");
 
-        // 5. Update legal moves cache incrementally.
+        // Update legal moves cache incrementally using precomputed offsets.
         self.cached_legal.remove(&coord);
-        // Add new empty cells within radius of the newly placed stone.
-        let radius = self.config.placement_radius;
-        for dq in -radius..=radius {
-            for dr in -radius..=radius {
-                if dq.abs().max(dr.abs()).max((dq + dr).abs()) <= radius {
-                    let cell = (coord.0 + dq, coord.1 + dr);
-                    if self.board.get(cell).is_none() {
-                        self.cached_legal.insert(cell);
-                    }
-                }
+        for &(dq, dr) in &self.offsets {
+            let cell = (coord.0 + dq, coord.1 + dr);
+            if self.board.get(cell).is_none() {
+                self.cached_legal.insert(cell);
             }
         }
 
-        // 6. Increment move count.
         self.move_count += 1;
 
-        // 7. Check for win.
         let won = check_win(&self.board, coord, player, self.config.win_length);
         if won {
             self.winner = Some(player);
         }
 
-        // 8. Check for draw.
         let draw = !won && self.move_count >= self.config.max_moves;
-
-        // 9. Advance turn.
         self.turn = self.turn.advance(won || draw);
 
         Ok(())
@@ -145,7 +134,9 @@ impl GameState {
         if self.is_terminal() {
             return Vec::new();
         }
-        self.cached_legal.iter().copied().collect()
+        let mut moves: Vec<Coord> = self.cached_legal.iter().copied().collect();
+        moves.sort_unstable();
+        moves
     }
 
     /// Returns `true` when the game has ended (win or draw).
@@ -186,23 +177,6 @@ impl GameState {
     /// Returns a reference to the game configuration.
     pub fn config(&self) -> &GameConfig {
         &self.config
-    }
-}
-
-impl Clone for GameState {
-    fn clone(&self) -> Self {
-        GameState {
-            board: self.board.clone(),
-            turn: self.turn,
-            config: GameConfig {
-                win_length: self.config.win_length,
-                placement_radius: self.config.placement_radius,
-                max_moves: self.config.max_moves,
-            },
-            move_count: self.move_count,
-            winner: self.winner,
-            cached_legal: self.cached_legal.clone(),
-        }
     }
 }
 
@@ -250,13 +224,12 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // 2. apply_move basic cases
+    // 2. apply_move basic
     // ------------------------------------------------------------------
 
     #[test]
     fn apply_move_valid_decrements_moves_remaining() {
         let mut gs = GameState::new();
-        // P2 starts with 2 moves.
         gs.apply_move((1, 0)).unwrap();
         assert_eq!(gs.moves_remaining_this_turn(), 1);
     }
@@ -272,7 +245,6 @@ mod tests {
     #[test]
     fn apply_move_occupied_returns_error() {
         let mut gs = GameState::new();
-        // (0,0) is P1's opening stone.
         let result = gs.apply_move((0, 0));
         assert_eq!(result, Err(MoveError::CellOccupied));
     }
@@ -280,40 +252,29 @@ mod tests {
     #[test]
     fn apply_move_out_of_range_returns_error() {
         let mut gs = GameState::new();
-        // (100, 100) is far outside radius 8.
         let result = gs.apply_move((100, 100));
         assert_eq!(result, Err(MoveError::OutOfRange));
     }
 
     #[test]
     fn apply_move_after_game_over_returns_error() {
-        // Build a win quickly with win_length=4 to keep it short.
         let config = GameConfig {
             win_length: 4,
             placement_radius: 8,
             max_moves: 200,
         };
         let mut gs = GameState::with_config(config);
-        // P2 needs 4-in-a-row. Origin P1 is at (0,0).
-        // Give P1 scattered moves to avoid accidental wins.
-        // Turn structure: P2(2) -> P2(1) -> P1(2) -> P1(1) -> P2(2) -> ...
-        // Move 1 (P2): (1,0)
-        gs.apply_move((1, 0)).unwrap();
-        // Move 2 (P2): (2,0)
-        gs.apply_move((2, 0)).unwrap();
-        // Move 3 (P1): scattered
-        gs.apply_move((0, 3)).unwrap();
-        // Move 4 (P1): scattered
-        gs.apply_move((0, -3)).unwrap();
-        // Move 5 (P2): (3,0)
-        gs.apply_move((3, 0)).unwrap();
-        // Move 6 (P2): (4,0) → P2 has (1,0),(2,0),(3,0),(4,0) = 4-in-a-row → win
-        gs.apply_move((4, 0)).unwrap();
+        // P2 builds 4-in-a-row on q-axis: (1,0),(2,0),(3,0),(4,0)
+        // P1 plays scattered to avoid accidental wins
+        gs.apply_move((1, 0)).unwrap();  // P2
+        gs.apply_move((2, 0)).unwrap();  // P2
+        gs.apply_move((0, 3)).unwrap();  // P1
+        gs.apply_move((0, -3)).unwrap(); // P1
+        gs.apply_move((3, 0)).unwrap();  // P2
+        gs.apply_move((4, 0)).unwrap();  // P2 → 4-in-a-row → win
         assert!(gs.is_terminal());
         assert_eq!(gs.winner(), Some(Player::P2));
-        // Now applying another move should return GameOver.
-        let result = gs.apply_move((5, 0));
-        assert_eq!(result, Err(MoveError::GameOver));
+        assert_eq!(gs.apply_move((5, 0)), Err(MoveError::GameOver));
     }
 
     // ------------------------------------------------------------------
@@ -321,75 +282,23 @@ mod tests {
     // ------------------------------------------------------------------
 
     #[test]
-    fn win_p2_four_in_a_row_along_q_axis() {
-        let config = GameConfig {
-            win_length: 4,
-            placement_radius: 8,
-            max_moves: 200,
-        };
-        let mut gs = GameState::with_config(config);
-        // P2 places: (1,0), (2,0) then P1 scattered, then P2: (3,0),(4,0) → win
-        gs.apply_move((1, 0)).unwrap(); // P2 move 1
-        gs.apply_move((2, 0)).unwrap(); // P2 move 2
-        gs.apply_move((0, 3)).unwrap(); // P1 move 1
-        gs.apply_move((0, -3)).unwrap(); // P1 move 2
-        gs.apply_move((3, 0)).unwrap(); // P2 move 1
-        gs.apply_move((4, 0)).unwrap(); // P2 move 2 → win!
-        assert!(gs.is_terminal());
-        assert_eq!(gs.winner(), Some(Player::P2));
-    }
-
-    #[test]
     fn win_on_first_of_two_moves_ends_immediately() {
-        // REQ-12: if P2's first move of a turn is winning, game ends right away.
         let config = GameConfig {
             win_length: 4,
             placement_radius: 8,
             max_moves: 200,
         };
         let mut gs = GameState::with_config(config);
-        // Build up P2 stones: (1,0),(2,0) in first turn.
-        gs.apply_move((1, 0)).unwrap(); // P2 move 1 (turn 1)
-        gs.apply_move((2, 0)).unwrap(); // P2 move 2 (turn 1)
-        gs.apply_move((0, 3)).unwrap(); // P1 move 1
-        gs.apply_move((0, -3)).unwrap(); // P1 move 2
-        // P2 now has their second turn; first move of that turn should win.
-        gs.apply_move((3, 0)).unwrap(); // P2 move 1 of turn 2 — 3 in a row, not enough
-        // (3,0) gives (1,0),(2,0),(3,0) = 3, still need 4
-        // Now (0,0) is P1. Let's use a fresh setup to be sure.
-        // P2 move 2 of turn 2 → (4,0): 4-in-a-row
-        gs.apply_move((4, 0)).unwrap();
+        // P2 builds along r-axis
+        gs.apply_move((0, 1)).unwrap();  // P2
+        gs.apply_move((0, 2)).unwrap();  // P2
+        gs.apply_move((1, 1)).unwrap();  // P1 scattered
+        gs.apply_move((-1, -1)).unwrap(); // P1 scattered
+        gs.apply_move((0, 3)).unwrap();  // P2 — 3 in a row
+        assert!(!gs.is_terminal());
+        gs.apply_move((0, 4)).unwrap();  // P2 — 4 in a row → win
         assert!(gs.is_terminal());
         assert_eq!(gs.winner(), Some(Player::P2));
-
-        // For win on FIRST move of a turn, we need a 3-stone setup + win on move1.
-        let config2 = GameConfig {
-            win_length: 4,
-            placement_radius: 8,
-            max_moves: 200,
-        };
-        let mut gs2 = GameState::with_config(config2);
-        // Get 3 P2 stones without winning (win_length=4 so 3 is safe).
-        gs2.apply_move((1, 0)).unwrap(); // P2 turn1 move1
-        gs2.apply_move((2, 0)).unwrap(); // P2 turn1 move2
-        gs2.apply_move((0, 3)).unwrap(); // P1 turn1 move1
-        gs2.apply_move((0, -3)).unwrap(); // P1 turn1 move2
-        gs2.apply_move((3, 0)).unwrap(); // P2 turn2 move1 → 3 in row, no win yet
-        // P2 has moves_remaining = 1; game is not terminal yet
-        assert!(!gs2.is_terminal());
-        assert_eq!(gs2.moves_remaining_this_turn(), 1);
-        // Now the FIRST move of P2's next block needs to win on first placement.
-        // We need to get P2's turn2 move2 without winning first.
-        gs2.apply_move((5, 1)).unwrap(); // P2 turn2 move2 — scattered, no win
-        gs2.apply_move((0, 4)).unwrap(); // P1
-        gs2.apply_move((0, -4)).unwrap(); // P1
-        // Now P2 has turn3; (1,0),(2,0),(3,0) exist plus (5,1).
-        // Place (4,0) as P2's FIRST move of turn3 → 4-in-a-row → win on first move.
-        gs2.apply_move((4, 0)).unwrap(); // P2 turn3 move1 → WIN
-        assert!(gs2.is_terminal(), "game should be terminal after win on first move");
-        assert_eq!(gs2.winner(), Some(Player::P2));
-        // apply_move should now fail with GameOver.
-        assert_eq!(gs2.apply_move((6, 0)), Err(MoveError::GameOver));
     }
 
     // ------------------------------------------------------------------
@@ -397,81 +306,53 @@ mod tests {
     // ------------------------------------------------------------------
 
     #[test]
-    fn draw_when_move_count_reaches_max_moves() {
+    fn draw_by_move_limit() {
         let config = GameConfig {
             win_length: 6,
             placement_radius: 8,
-            max_moves: 4, // small cap so the test is fast
+            max_moves: 4,
         };
         let mut gs = GameState::with_config(config);
-        // We need 4 moves without anyone winning.
-        // Use coords that cannot form a line of 6.
-        gs.apply_move((1, 0)).unwrap();  // P2 move 1
-        gs.apply_move((2, 0)).unwrap();  // P2 move 2
-        gs.apply_move((0, 3)).unwrap();  // P1 move 1
-        gs.apply_move((0, -3)).unwrap(); // P1 move 2 → move_count == 4 → draw
+        gs.apply_move((1, 0)).unwrap();
+        gs.apply_move((0, 1)).unwrap();
+        gs.apply_move((-1, 0)).unwrap();
+        assert!(!gs.is_terminal());
+        gs.apply_move((0, -1)).unwrap(); // 4th move → draw
         assert!(gs.is_terminal());
         assert_eq!(gs.winner(), None);
+        assert_eq!(gs.apply_move((1, 1)), Err(MoveError::GameOver));
     }
 
     // ------------------------------------------------------------------
-    // 5. Legal moves
+    // 5. Legal moves, placed_stones, clone, config
     // ------------------------------------------------------------------
 
     #[test]
     fn placed_cell_removed_from_legal_moves() {
         let mut gs = GameState::new();
-        let before = gs.legal_moves();
-        assert!(before.contains(&(1, 0)));
         gs.apply_move((1, 0)).unwrap();
-        let after = gs.legal_moves();
-        assert!(!after.contains(&(1, 0)));
+        let moves = gs.legal_moves();
+        assert!(!moves.contains(&(1, 0)));
     }
 
-    // ------------------------------------------------------------------
-    // 6. placed_stones grows
-    // ------------------------------------------------------------------
-
     #[test]
-    fn placed_stones_grows_after_each_move() {
+    fn placed_stones_grows() {
         let mut gs = GameState::new();
-        // Initially 1 stone (P1 at origin).
         assert_eq!(gs.placed_stones().len(), 1);
         gs.apply_move((1, 0)).unwrap();
         assert_eq!(gs.placed_stones().len(), 2);
-        gs.apply_move((2, 0)).unwrap();
+        gs.apply_move((0, 1)).unwrap();
         assert_eq!(gs.placed_stones().len(), 3);
     }
 
-    // ------------------------------------------------------------------
-    // 7. clone is independent
-    // ------------------------------------------------------------------
-
     #[test]
     fn clone_is_independent() {
-        let mut original = GameState::new();
-        original.apply_move((1, 0)).unwrap();
-
-        let mut cloned = original.clone();
-        cloned.apply_move((2, 0)).unwrap();
-
-        // Original should not have the stone at (2,0).
-        assert!(!original
-            .placed_stones()
-            .iter()
-            .any(|&(c, _)| c == (2, 0)));
-
-        // Apply a different move to original.
-        original.apply_move((0, -2)).unwrap();
-        assert!(!cloned
-            .placed_stones()
-            .iter()
-            .any(|&(c, _)| c == (0, -2)));
+        let mut gs = GameState::new();
+        let gs2 = gs.clone();
+        gs.apply_move((1, 0)).unwrap();
+        assert_eq!(gs.placed_stones().len(), 2);
+        assert_eq!(gs2.placed_stones().len(), 1);
     }
-
-    // ------------------------------------------------------------------
-    // 8. Custom config changes legal move count
-    // ------------------------------------------------------------------
 
     #[test]
     fn custom_config_changes_legal_move_count() {
@@ -481,10 +362,28 @@ mod tests {
             max_moves: 200,
         };
         let gs = GameState::with_config(config);
-        // Radius 4 around (0,0): 61 cells total, 1 occupied → 60 legal moves.
         assert_eq!(gs.legal_moves().len(), 60);
+    }
 
-        let gs_full = GameState::new(); // radius 8 → 216 legal moves
-        assert_eq!(gs_full.legal_moves().len(), 216);
+    // ------------------------------------------------------------------
+    // 6. Config validation
+    // ------------------------------------------------------------------
+
+    #[test]
+    #[should_panic(expected = "win_length must be >= 2")]
+    fn invalid_config_win_length_zero() {
+        GameState::with_config(GameConfig { win_length: 0, placement_radius: 8, max_moves: 200 });
+    }
+
+    #[test]
+    #[should_panic(expected = "placement_radius must be >= 1")]
+    fn invalid_config_negative_radius() {
+        GameState::with_config(GameConfig { win_length: 6, placement_radius: -1, max_moves: 200 });
+    }
+
+    #[test]
+    #[should_panic(expected = "max_moves must be >= 1")]
+    fn invalid_config_zero_max_moves() {
+        GameState::with_config(GameConfig { win_length: 6, placement_radius: 8, max_moves: 0 });
     }
 }

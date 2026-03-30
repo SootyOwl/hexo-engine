@@ -220,7 +220,34 @@ fn legal_moves_all_in_range() {
 }
 
 // ---------------------------------------------------------------------------
-// 6. fuzz_random_games_no_panics
+// 6. win_on_final_move_is_win_not_draw
+//
+// A winning move at exactly move_count == max_moves should be a win, not draw.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn win_on_final_move_is_win_not_draw() {
+    // max_moves = 6, win_length = 4. P2 wins on the 6th move.
+    let config = GameConfig {
+        win_length: 4,
+        placement_radius: 8,
+        max_moves: 6,
+    };
+    let mut gs = GameState::with_config(config);
+    // P2 builds along r-axis
+    gs.apply_move((0, 1)).unwrap();  // P2 move 1
+    gs.apply_move((0, 2)).unwrap();  // P2 move 2
+    gs.apply_move((1, 1)).unwrap();  // P1 move 3 (scattered)
+    gs.apply_move((-1, -1)).unwrap(); // P1 move 4 (scattered)
+    gs.apply_move((0, 3)).unwrap();  // P2 move 5 — 3 in a row
+    // Move 6 = max_moves. P2 wins with 4-in-a-row. Should be win, not draw.
+    gs.apply_move((0, 4)).unwrap();  // P2 move 6 — 4 in a row!
+    assert!(gs.is_terminal());
+    assert_eq!(gs.winner(), Some(Player::P2), "win should take precedence over draw");
+}
+
+// ---------------------------------------------------------------------------
+// 7. fuzz_random_games_no_panics
 //
 // 500 random 4-in-a-row games (radius 4), deterministic seeding.
 // Assert no panics.
@@ -256,6 +283,19 @@ fn fuzz_random_games_no_panics() {
             let mv = pick_move(&moves, seed ^ (step << 32));
             gs.apply_move(mv).expect("legal move must not fail");
             step += 1;
+        }
+        // Invariant: terminal games must have a winner or be a draw
+        if gs.is_terminal() {
+            let stones = gs.placed_stones().len();
+            assert!(
+                stones >= 2,
+                "seed {seed}: terminal game has only {stones} stones"
+            );
+            assert_eq!(
+                gs.move_count() as usize,
+                stones - 1, // minus P1's opening stone
+                "seed {seed}: move_count doesn't match placed stones"
+            );
         }
     }
 }

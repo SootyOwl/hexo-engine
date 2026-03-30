@@ -1,5 +1,19 @@
 use crate::types::Coord;
 
+/// Returns all (dq, dr) offsets within hex-distance ≤ `radius` of the origin.
+/// Used for legal move generation and cache updates.
+pub fn hex_offsets(radius: i32) -> Vec<Coord> {
+    let mut offsets = Vec::new();
+    for dq in -radius..=radius {
+        for dr in -radius..=radius {
+            if dq.abs().max(dr.abs()).max((dq + dr).abs()) <= radius {
+                offsets.push((dq, dr));
+            }
+        }
+    }
+    offsets
+}
+
 /// Returns the hex distance between two axial coordinates.
 /// Calculated as `max(|dq|, |dr|, |dq + dr|)`.
 pub fn hex_distance(a: Coord, b: Coord) -> i32 {

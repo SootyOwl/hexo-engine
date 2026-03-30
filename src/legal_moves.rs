@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 
 use crate::board::Board;
+use crate::hex::hex_offsets;
 use crate::types::Coord;
 
 /// Returns all legal move positions for a board state.
@@ -8,22 +9,9 @@ use crate::types::Coord;
 /// A legal move is any empty cell within hex-distance ≤ `radius` of any
 /// existing stone. The result is sorted lexicographically by (q, r) ascending.
 pub fn legal_moves(board: &Board, radius: i32) -> Vec<Coord> {
-    // Pre-compute the hex-circle offsets once (they're the same for every stone).
-    let offsets: Vec<Coord> = {
-        let mut v = Vec::new();
-        for dq in -radius..=radius {
-            for dr in -radius..=radius {
-                if dq.abs().max(dr.abs()).max((dq + dr).abs()) <= radius {
-                    v.push((dq, dr));
-                }
-            }
-        }
-        v
-    };
-
+    let offsets = hex_offsets(radius);
     let stones = board.stones();
-    let estimated_capacity = offsets.len() * stones.len();
-    let mut candidates: HashSet<Coord> = HashSet::with_capacity(estimated_capacity);
+    let mut candidates: HashSet<Coord> = HashSet::with_capacity(offsets.len());
 
     for &stone in stones.keys() {
         for &(dq, dr) in &offsets {
