@@ -79,24 +79,27 @@ impl GameState {
             return Err(MoveError::GameOver);
         }
 
-        // 2. Within placement radius of any existing stone?
-        let legal = legal_moves(&self.board, self.config.placement_radius);
-        if !legal.contains(&coord) {
-            // Distinguish occupied vs out-of-range.
-            if self.board.get(coord).is_some() {
-                return Err(MoveError::CellOccupied);
-            }
+        // 2. Check occupancy.
+        if self.board.get(coord).is_some() {
+            return Err(MoveError::CellOccupied);
+        }
+
+        // 3. Within placement radius of any existing stone?
+        let in_range = self.board.stones().keys().any(|&stone| {
+            crate::hex::hex_distance(stone, coord) <= self.config.placement_radius
+        });
+        if !in_range {
             return Err(MoveError::OutOfRange);
         }
 
-        // 3. Place stone (should succeed because legal_moves only includes empty cells).
+        // 4. Place stone.
         let player = self
             .turn
             .current_player()
             .expect("turn has current player when not terminal");
         self.board
             .place(coord, player)
-            .map_err(|_| MoveError::CellOccupied)?;
+            .expect("cell was verified empty");
 
         // 4. Increment move count.
         self.move_count += 1;
