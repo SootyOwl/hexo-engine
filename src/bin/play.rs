@@ -13,18 +13,17 @@ use ratatui::widgets::{Block, Paragraph};
 use hexo_rs::game::{GameConfig, MoveError};
 use hexo_rs::{Coord, GameState, Player};
 
-/// Cell dimensions (characters).
+/// Cell: 4 wide × 2 tall, half-block characters.
 ///
-/// Each hex is 6 wide × 3 tall, rendered with half-block characters:
+///   ▄▄        row 0  (top cap, inset by 1)
+///  ▐X ▌       row 1  (sides + content)
+///   ▀▀        row 2  (bottom cap, inset by 1... wait, that's 3 rows)
 ///
-///    ▄▄▄▄        row 0  (narrower top)
-///   ▐ XX ▌       row 1  (full-width middle)
-///    ▀▀▀▀        row 2  (narrower bottom)
-///
-/// Axial → screen (top-left corner):
-///   sx = cx + q * W + r * (W / 2)
-///   sy = cy + r * H
-const W: i32 = 6;
+/// Actually 4 wide × 3 tall for a nice hex shape:
+///  ▄▄
+/// ▐  ▌
+///  ▀▀
+const W: i32 = 4;
 const H: i32 = 3;
 const STATUS_H: u16 = 5;
 
@@ -33,7 +32,6 @@ struct App {
     cursor: Option<Coord>,
     message: String,
     config: GameConfig,
-    /// Top-left of the (0,0) hex, set each frame during render.
     origin_x: i32,
     origin_y: i32,
 }
@@ -56,40 +54,32 @@ impl App {
         self.message = "New game started.".into();
     }
 
-    /// Convert screen pixel (col, row) → axial (q, r).
-    ///
-    /// Uses cube-coordinate rounding for accurate hex hit-testing.
     fn screen_to_axial(&self, col: u16, row: u16) -> Coord {
-        // Centre of the (0,0) hex in screen space.
         let ccx = self.origin_x as f64 + W as f64 / 2.0;
         let ccy = self.origin_y as f64 + H as f64 / 2.0;
 
         let dx = col as f64 - ccx;
         let dy = row as f64 - ccy;
 
-        // Fractional axial coords (inverse of the forward mapping).
         let rf = dy / H as f64;
         let qf = (dx - rf * W as f64 / 2.0) / W as f64;
 
-        // Cube-coordinate rounding: convert axial → cube, round, fix constraint.
-        let cx = qf;
-        let cz = rf;
-        let cy = -cx - cz;
+        // Cube-coordinate rounding.
+        let cube_x = qf;
+        let cube_z = rf;
+        let cube_y = -cube_x - cube_z;
 
-        let mut rx = cx.round();
-        let ry = cy.round();
-        let mut rz = cz.round();
+        let mut rx = cube_x.round();
+        let ry = cube_y.round();
+        let mut rz = cube_z.round();
 
-        let ex = (rx - cx).abs();
-        let ey = (ry - cy).abs();
-        let ez = (rz - cz).abs();
+        let ex = (rx - cube_x).abs();
+        let ey = (ry - cube_y).abs();
+        let ez = (rz - cube_z).abs();
 
         if ex > ey && ex > ez {
             rx = -ry - rz;
-        } else if ey > ez {
-            // ry not needed for output, but fix for correctness
-            let _ = -rx - rz;
-        } else {
+        } else if ey <= ez {
             rz = -rx - ry;
         }
 
@@ -160,36 +150,48 @@ fn in_board(sx: i32, sy: i32, area: Rect) -> bool {
         && sy + H - 1 < (area.y + area.height) as i32
 }
 
-/// Draw a half-block hex cell:
-///
-///   ▄▄▄▄        (fg = color, narrower top)
-///  ▐ XX ▌       (fg = color, full-width sides + content)
-///   ▀▀▀▀        (fg = color, narrower bottom)
-fn draw_hex(frame: &mut Frame, sx: i32, sy: i32, content: &str, color: Color, bold: bool) {
-    let border = Style::default().fg(color);
+/// Minimum distance from `coord` to any placed stone.
+fn min_stone_dist(coord: Coord, stones: &[(Coord, Player)]) -> i32 {
+    stones
+        .iter()
+        .map(|&(c, _)| hexo_rs::hex::hex_distance(coord, c))
+        .min()
+        .unwrap_or(i32::MAX)
+}
 
-    // Row 0 — top: space + 4 lower-half-blocks + space
+/// Map a hex distance to a style that fades with distance.
+/// Uses DarkGray color with varying modifiers — works on both light and dark terminals.
+fn fade_style(dist: i32, max_dist: i32) -> Option<Style> {
+    if dist > max_dist {
+        return None;
+    }
+    let t = (dist - 1).max(0) as f64 / (max_dist - 1).max(1) as f64; // 0.0 (close) .. 1.0 (far)
+    if t < 0.33 {
+        // Close: normal brightness
+        Some(Style::default().fg(Color::Gray))
+    } else if t < 0.66 {
+        // Mid: darker
+        Some(Style::default().fg(Color::DarkGray))
+    } else {
+        // Far: dim
+        Some(Style::default().fg(Color::DarkGray).dim())
+    }
+}
+
+/// Draw a 4×3 half-block hex with explicit style.
+fn draw_hex_styled(frame: &mut Frame, sx: i32, sy: i32, ch: &str, style: Style) {
     frame.render_widget(
-        Span::styled(" \u{2584}\u{2584}\u{2584}\u{2584} ", border),
+        Span::styled(" \u{2584}\u{2584} ", style),
         Rect::new(sx as u16, sy as u16, W as u16, 1),
     );
-
-    // Row 1 — middle: left-half-block + content + right-half-block
-    let cs = if bold {
-        Style::default().fg(color).bold()
-    } else {
-        border
-    };
     let line = Line::from(vec![
-        Span::styled("\u{2590}", border),  // ▐
-        Span::styled(content, cs),
-        Span::styled("\u{258c}", border),  // ▌
+        Span::styled("\u{2590}", style),  // ▐
+        Span::styled(ch, style),
+        Span::styled("\u{258c}", style),  // ▌
     ]);
     frame.render_widget(line, Rect::new(sx as u16, (sy + 1) as u16, W as u16, 1));
-
-    // Row 2 — bottom: space + 4 upper-half-blocks + space
     frame.render_widget(
-        Span::styled(" \u{2580}\u{2580}\u{2580}\u{2580} ", border),
+        Span::styled(" \u{2580}\u{2580} ", style),
         Rect::new(sx as u16, (sy + 2) as u16, W as u16, 1),
     );
 }
@@ -200,7 +202,6 @@ fn render(frame: &mut Frame, app: &mut App) {
     let [board_area, status_area] =
         Layout::vertical([Constraint::Fill(1), Constraint::Length(STATUS_H)]).areas(area);
 
-    // The (0,0) hex is centred in the board area.
     let ox = board_area.x as i32 + board_area.width as i32 / 2 - W / 2;
     let oy = board_area.y as i32 + board_area.height as i32 / 2 - H / 2;
     app.origin_x = ox;
@@ -208,21 +209,19 @@ fn render(frame: &mut Frame, app: &mut App) {
 
     let stones = app.game.placed_stones();
     let legal = app.game.legal_moves_set();
+    let radius = app.config.placement_radius;
 
-    // 1. Empty hex outlines for nearby legal moves.
+    // 1. Empty hex outlines with distance-based fade.
     if !app.game.is_terminal() {
         for &(q, r) in legal.iter() {
             let (sx, sy) = axial_to_screen(q, r, ox, oy);
             if !in_board(sx, sy, board_area) {
                 continue;
             }
-            let near = stones
-                .iter()
-                .any(|&(c, _)| hexo_rs::hex::hex_distance((q, r), c) <= 2);
-            if !near {
-                continue;
+            let dist = min_stone_dist((q, r), &stones);
+            if let Some(style) = fade_style(dist, radius) {
+                draw_hex_styled(frame, sx, sy, "  ", style);
             }
-            draw_hex(frame, sx, sy, "    ", Color::Indexed(236), false);
         }
     }
 
@@ -232,11 +231,11 @@ fn render(frame: &mut Frame, app: &mut App) {
         if !in_board(sx, sy, board_area) {
             continue;
         }
-        let (label, color) = match player {
-            Player::P1 => (" XX ", Color::Cyan),
-            Player::P2 => (" OO ", Color::Magenta),
+        let (ch, style) = match player {
+            Player::P1 => ("X ", Style::default().fg(Color::Cyan).bold()),
+            Player::P2 => ("O ", Style::default().fg(Color::Magenta).bold()),
         };
-        draw_hex(frame, sx, sy, label, color, true);
+        draw_hex_styled(frame, sx, sy, ch, style);
     }
 
     // 3. Cursor highlight.
@@ -247,20 +246,19 @@ fn render(frame: &mut Frame, app: &mut App) {
             let is_legal = legal.contains(&(q, r));
 
             if is_stone {
-                // Bright brackets on the middle row.
                 let hl = Style::default().fg(Color::Yellow).bold();
                 frame.render_widget(
-                    Span::styled("\u{25b8}", hl), // ▸
+                    Span::styled("\u{25b8}", hl),
                     Rect::new(sx as u16, (sy + 1) as u16, 1, 1),
                 );
                 frame.render_widget(
-                    Span::styled("\u{25c2}", hl), // ◂
+                    Span::styled("\u{25c2}", hl),
                     Rect::new((sx + W - 1) as u16, (sy + 1) as u16, 1, 1),
                 );
             } else if is_legal {
-                draw_hex(frame, sx, sy, " \u{b7}\u{b7} ", Color::Yellow, true);
+                draw_hex_styled(frame, sx, sy, "\u{b7}\u{b7}", Style::default().fg(Color::Yellow).bold());
             } else {
-                draw_hex(frame, sx, sy, "    ", Color::Indexed(240), false);
+                draw_hex_styled(frame, sx, sy, "  ", Style::default().fg(Color::DarkGray).dim());
             }
         }
     }
@@ -269,7 +267,7 @@ fn render(frame: &mut Frame, app: &mut App) {
     let player_info = if let Some(p) = app.game.current_player() {
         let remaining = app.game.moves_remaining_this_turn();
         format!(
-            " {} to move \u{2502} {remaining} moves left \u{2502} {} stones ",
+            " {} to move \u{2502} {remaining} left \u{2502} {} stones ",
             sym(p),
             app.game.placed_stones().len()
         )
@@ -283,7 +281,7 @@ fn render(frame: &mut Frame, app: &mut App) {
     let status = Paragraph::new(vec![
         Line::from(app.message.as_str()),
         Line::from(player_info),
-        Line::from(" q: quit \u{2502} r: restart \u{2502} click: place stone "),
+        Line::from(" q: quit \u{2502} r: restart \u{2502} click: place "),
     ])
     .block(Block::bordered().title(" HeXO "));
 
