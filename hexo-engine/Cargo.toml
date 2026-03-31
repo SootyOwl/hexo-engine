@@ -2,6 +2,13 @@
 name = "hexo-engine"
 version = "0.1.0"
 edition = "2024"
+authors = ["SootyOwl"]
+description = "Game engine for HeXO — infinite hex tic-tac-toe on an unbounded hexagonal grid"
+license = "MIT"
+repository = "https://github.com/SootyOwl/hexo-engine"
+readme = "../README.md"
+keywords = ["hexagonal", "board-game", "tic-tac-toe", "game-engine"]
+categories = ["games", "game-development"]
 
 [features]
 tui = ["crossterm", "ratatui"]
