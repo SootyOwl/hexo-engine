@@ -7,7 +7,7 @@ description = "Gumbel AlphaZero MCTS for HeXO with GNN graph construction and Py
 license = "MIT"
 repository = "https://github.com/SootyOwl/hexo-engine"
 readme = "../README.md"
-keywords = ["mcts", "alphazero", "gumbel", "hexagonal", "reinforcement-learning"]
+keywords = ["mcts", "alphazero", "gumbel", "hexagonal", "game-ai"]
 categories = ["algorithms", "science"]
 
 [lib]
