@@ -74,6 +74,21 @@ cargo run --bin play -p hexo-engine --features tui
 
 Controls: click to place, `t` for theme toggle, `r` to restart, `q` to quit.
 
+## Performance
+
+Benchmarked on the default `FULL_HEXO` configuration (6-in-a-row, radius 8, 200-move limit):
+
+| Operation | 50 stones | 100 stones |
+|---|---|---|
+| `apply_move` | 5.1 us | — |
+| `clone` | 490 ns | 771 ns |
+| `legal_moves` (allocates + sorts) | 21 us | 35 us |
+| `legal_moves_set` (cached ref) | 0 ns | 0 ns |
+
+The MCTS hot path (clone + apply_move) runs in ~5 us. `legal_moves_set()` returns a reference to the incrementally-maintained cache with no allocation.
+
+Run benchmarks with `cargo bench -p hexo-engine`.
+
 ## Coordinates
 
 HeXO uses axial hex coordinates `(q, r)` with 6 neighbor directions. Hex distance is `max(|dq|, |dr|, |dq + dr|)`.
