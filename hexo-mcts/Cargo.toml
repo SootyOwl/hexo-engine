@@ -18,7 +18,7 @@ crate-type = ["cdylib", "rlib"]
 python = ["pyo3"]
 
 [dependencies]
-hexo-engine = { path = "../hexo-engine" }
+hexo-engine = { version = "0.1.0", path = "../hexo-engine" }
 pyo3 = { version = "0.28", optional = true }
 rand = "0.9"
 rand_chacha = "0.9"
