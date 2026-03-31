@@ -16,10 +16,17 @@ crate-type = ["cdylib", "rlib"]
 
 [features]
 python = ["pyo3"]
+torch = ["tch", "serde_json"]
 
 [dependencies]
 hexo-engine = { version = "0.1.0", path = "../hexo-engine" }
 pyo3 = { version = "0.28", optional = true }
+tch = { version = "0.18", optional = true }
+serde_json = { version = "1", optional = true }
 rand = "0.9"
 rand_chacha = "0.9"
 rayon = "1.10"
+
+[[bin]]
+name = "self_play"
+required-features = ["torch"]

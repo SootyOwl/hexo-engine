@@ -1,4 +1,6 @@
 pub mod graph;
+#[cfg(feature = "torch")]
+pub mod inference;
 pub mod mcts;
 #[cfg(feature = "python")]
 mod python;

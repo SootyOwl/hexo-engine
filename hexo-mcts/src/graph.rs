@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 
 use hexo_engine::hex::hex_distance;
+use hexo_engine::symmetry::D6_TRANSFORMS;
 use hexo_engine::types::{Coord, HEX_DIRS, Player};
 use hexo_engine::GameState;
 
@@ -32,7 +33,9 @@ pub struct GraphData {
     pub num_nodes: usize,
 }
 
-/// Build graph arrays from a GameState.
+/// Build graph arrays from pre-sorted stones and legal moves plus global features.
+///
+/// `stones` and `legal` must already be sorted by coord tuple (q, r).
 ///
 /// Node ordering:
 ///   - Placed stones first, sorted by (q, r)
@@ -45,32 +48,26 @@ pub struct GraphData {
 ///   [5]   Normalised q (relative to stone centroid)
 ///   [6]   Normalised r (relative to stone centroid)
 ///   [7]   Inverse distance to nearest stone (0 for stones themselves)
-pub fn game_to_graph_raw(game: &GameState) -> GraphData {
-    // Collect nodes: stones sorted, then legal moves sorted
-    let mut stones = game.placed_stones();
-    stones.sort_by_key(|&(coord, _)| coord);
-    let legal = game.legal_moves(); // already sorted by engine
+fn build_graph(
+    stones: &[(Coord, Player)],
+    legal: &[Coord],
+    player_feat: f32,
+    moves_feat: f32,
+) -> GraphData {
     let n_stones = stones.len();
     let n_legal = legal.len();
     let n = n_stones + n_legal;
 
     // Coords (flattened N×2)
     let mut coords = Vec::with_capacity(n * 2);
-    for &(coord, _) in &stones {
+    for &(coord, _) in stones {
         coords.push(coord.0);
         coords.push(coord.1);
     }
-    for &(q, r) in &legal {
+    for &(q, r) in legal {
         coords.push(q);
         coords.push(r);
     }
-
-    // Global features
-    let player_feat: f32 = match game.current_player() {
-        Some(Player::P1) => 1.0,
-        _ => -1.0,
-    };
-    let moves_feat: f32 = game.moves_remaining_this_turn() as f32 / 2.0;
 
     // Stone centroid and spread
     let (centroid_q, centroid_r, spread) = if n_stones > 0 {
@@ -187,6 +184,63 @@ pub fn game_to_graph_raw(game: &GameState) -> GraphData {
         coords,
         num_nodes: n,
     }
+}
+
+/// Build graph arrays from a GameState.
+///
+/// Extracts stones, legal moves, and global features from the game state,
+/// then delegates to `build_graph`.
+pub fn game_to_graph_raw(game: &GameState) -> GraphData {
+    let mut stones = game.placed_stones();
+    stones.sort_by_key(|&(coord, _)| coord);
+    let legal = game.legal_moves(); // already sorted by engine
+
+    let player_feat: f32 = match game.current_player() {
+        Some(Player::P1) => 1.0,
+        _ => -1.0,
+    };
+    let moves_feat: f32 = game.moves_remaining_this_turn() as f32 / 2.0;
+
+    build_graph(&stones, &legal, player_feat, moves_feat)
+}
+
+/// Apply all 11 non-identity D6 transforms to produce augmented graphs.
+///
+/// Returns Vec of (GraphData, permutation) where permutation[i] gives the
+/// index in the ORIGINAL legal moves array that maps to position i in the
+/// augmented (re-sorted) legal moves.
+pub fn augment_graph(
+    stones: &[(Coord, Player)],
+    legal: &[Coord],
+    player_feat: f32,
+    moves_feat: f32,
+) -> Vec<(GraphData, Vec<usize>)> {
+    // Skip transform 0 (identity)
+    D6_TRANSFORMS[1..]
+        .iter()
+        .map(|transform| {
+            // Transform and sort stones
+            let mut t_stones: Vec<(Coord, Player)> = stones
+                .iter()
+                .map(|&(c, p)| (transform(c), p))
+                .collect();
+            t_stones.sort_by_key(|&(c, _)| c);
+
+            // Transform legal moves, keeping track of original indices
+            let mut indexed_legal: Vec<(Coord, usize)> = legal
+                .iter()
+                .enumerate()
+                .map(|(i, &c)| (transform(c), i))
+                .collect();
+            indexed_legal.sort_by_key(|&(c, _)| c);
+
+            let t_legal: Vec<Coord> = indexed_legal.iter().map(|&(c, _)| c).collect();
+            let permutation: Vec<usize> = indexed_legal.iter().map(|&(_, i)| i).collect();
+
+            let graph = build_graph(&t_stones, &t_legal, player_feat, moves_feat);
+            (graph, permutation)
+        })
+        .collect()
 }
 
 /// Build graph arrays for a batch of game states in parallel using rayon.
@@ -319,5 +373,56 @@ mod tests {
         let game = small_game();
         let g = game_to_graph_raw(&game);
         assert_eq!(g.neighbor_index.len(), g.num_nodes * 6);
+    }
+
+    #[test]
+    fn augment_produces_11_graphs() {
+        let game = small_game();
+        let mut stones = game.placed_stones();
+        stones.sort_by_key(|&(c, _)| c);
+        let legal = game.legal_moves();
+        let results = augment_graph(&stones, &legal, -1.0, 1.0);
+        assert_eq!(results.len(), 11);
+    }
+
+    #[test]
+    fn augmented_graphs_have_same_node_count() {
+        let game = small_game();
+        let mut stones = game.placed_stones();
+        stones.sort_by_key(|&(c, _)| c);
+        let legal = game.legal_moves();
+        let original = game_to_graph_raw(&game);
+        let augmented = augment_graph(&stones, &legal, -1.0, 1.0);
+        for (g, _perm) in &augmented {
+            assert_eq!(g.num_nodes, original.num_nodes);
+            assert_eq!(g.features.len(), original.features.len());
+        }
+    }
+
+    #[test]
+    fn permutation_has_correct_length() {
+        let game = small_game();
+        let mut stones = game.placed_stones();
+        stones.sort_by_key(|&(c, _)| c);
+        let legal = game.legal_moves();
+        let augmented = augment_graph(&stones, &legal, -1.0, 1.0);
+        for (_g, perm) in &augmented {
+            assert_eq!(perm.len(), legal.len());
+        }
+    }
+
+    #[test]
+    fn permutation_is_a_valid_bijection() {
+        let game = small_game();
+        let mut stones = game.placed_stones();
+        stones.sort_by_key(|&(c, _)| c);
+        let legal = game.legal_moves();
+        let augmented = augment_graph(&stones, &legal, -1.0, 1.0);
+        for (_g, perm) in &augmented {
+            let mut sorted = perm.clone();
+            sorted.sort();
+            sorted.dedup();
+            assert_eq!(sorted.len(), legal.len());
+        }
     }
 }
