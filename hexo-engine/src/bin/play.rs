@@ -10,8 +10,8 @@ use crossterm::terminal::{
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Paragraph};
 
-use hexo_rs::game::{GameConfig, MoveError};
-use hexo_rs::{Coord, GameState, Player};
+use hexo_engine::game::{GameConfig, MoveError};
+use hexo_engine::{Coord, GameState, Player};
 
 const FILLED: &str = "\u{2b22}"; // ⬢
 const EMPTY: &str = "\u{2b21}";  // ⬡
@@ -154,7 +154,7 @@ fn in_board(sx: i32, sy: i32, area: Rect) -> bool {
 fn min_stone_dist(coord: Coord, stones: &[(Coord, Player)]) -> i32 {
     stones
         .iter()
-        .map(|&(c, _)| hexo_rs::hex::hex_distance(coord, c))
+        .map(|&(c, _)| hexo_engine::hex::hex_distance(coord, c))
         .min()
         .unwrap_or(i32::MAX)
 }

@@ -1,0 +1,16 @@
+[package]
+name = "hexo-mcts"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "hexo_rs"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+python = ["pyo3"]
+
+[dependencies]
+hexo-engine = { path = "../hexo-engine" }
+pyo3 = { version = "0.28", optional = true }
+rand = "0.9"

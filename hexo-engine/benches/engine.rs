@@ -1,6 +1,6 @@
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
-use hexo_rs::game::GameConfig;
-use hexo_rs::GameState;
+use hexo_engine::game::GameConfig;
+use hexo_engine::GameState;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 

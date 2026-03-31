@@ -2,8 +2,6 @@ pub mod board;
 pub mod game;
 pub mod hex;
 pub mod legal_moves;
-#[cfg(feature = "python")]
-mod python;
 pub mod turn;
 pub mod types;
 pub mod win;

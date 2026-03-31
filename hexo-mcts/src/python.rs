@@ -2,8 +2,8 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
-use crate::game::{GameConfig, GameState, MoveError};
-use crate::types::Player;
+use hexo_engine::game::{GameConfig, GameState, MoveError};
+use hexo_engine::types::Player;
 
 fn player_str(p: Player) -> &'static str {
     match p {
@@ -12,7 +12,7 @@ fn player_str(p: Player) -> &'static str {
     }
 }
 
-#[pyclass(name = "GameConfig")]
+#[pyclass(name = "GameConfig", skip_from_py_object)]
 #[derive(Clone)]
 struct PyGameConfig {
     inner: GameConfig,
