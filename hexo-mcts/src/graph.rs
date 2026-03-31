@@ -21,6 +21,11 @@ pub struct GraphData {
     pub legal_mask: Vec<bool>,
     /// Stone mask (true for placed-stone nodes).
     pub stone_mask: Vec<bool>,
+    /// Neighbor indices per node: N×6, flattened row-major.
+    /// For each node, 6 entries giving the index of each hex neighbor.
+    /// -1 (as i64) for missing neighbors (boundary nodes).
+    /// Neighbor order matches HEX_DIRS: (1,0),(-1,0),(0,1),(0,-1),(1,-1),(-1,1)
+    pub neighbor_index: Vec<i64>,
     /// Coordinates, flattened: N×2 row-major (q, r).
     pub coords: Vec<i32>,
     /// Number of nodes.
@@ -149,6 +154,19 @@ pub fn game_to_graph_raw(game: &GameState) -> GraphData {
         }
     }
 
+    // Neighbor index (N×6, -1 for missing)
+    let mut neighbor_index = Vec::with_capacity(n * 6);
+    for i in 0..n {
+        let q = coords[i * 2];
+        let r = coords[i * 2 + 1];
+        for &(dq, dr) in &HEX_DIRS {
+            match coord_to_idx.get(&(q + dq, r + dr)) {
+                Some(&j) => neighbor_index.push(j as i64),
+                None => neighbor_index.push(-1),
+            }
+        }
+    }
+
     // Masks
     let mut legal_mask = vec![false; n];
     let mut stone_mask = vec![false; n];
@@ -165,6 +183,7 @@ pub fn game_to_graph_raw(game: &GameState) -> GraphData {
         edge_dst,
         legal_mask,
         stone_mask,
+        neighbor_index,
         coords,
         num_nodes: n,
     }
@@ -278,5 +297,27 @@ mod tests {
         let game = small_game();
         let g = game_to_graph_raw(&game);
         assert_eq!(g.features[7], 0.0); // stone node's inv distance
+    }
+
+    #[test]
+    fn neighbor_index_correct_for_origin() {
+        let game = small_game();
+        let g = game_to_graph_raw(&game);
+        // Node 0 is the stone at (0,0). Check its 6 neighbors are present
+        // (all should be legal moves adjacent to origin)
+        let ni = &g.neighbor_index[0..6];
+        // At least some neighbors should be valid (>= 0)
+        assert!(ni.iter().any(|&idx| idx >= 0));
+        // None should be out of bounds
+        for &idx in ni {
+            assert!(idx == -1 || (idx >= 0 && (idx as usize) < g.num_nodes));
+        }
+    }
+
+    #[test]
+    fn neighbor_index_has_correct_length() {
+        let game = small_game();
+        let g = game_to_graph_raw(&game);
+        assert_eq!(g.neighbor_index.len(), g.num_nodes * 6);
     }
 }

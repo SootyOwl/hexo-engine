@@ -294,6 +294,7 @@ fn py_game_to_graph_raw(py: Python<'_>, game: &PyGameState) -> PyResult<Py<PyAny
     dict.set_item("edge_dst", g.edge_dst)?;
     dict.set_item("legal_mask", g.legal_mask)?;
     dict.set_item("stone_mask", g.stone_mask)?;
+    dict.set_item("neighbor_index", g.neighbor_index)?;
     dict.set_item("coords", g.coords)?;
     dict.set_item("num_nodes", g.num_nodes)?;
     Ok(dict.into())
@@ -322,6 +323,7 @@ fn py_game_to_graph_batch(py: Python<'_>, games: Vec<Py<PyGameState>>) -> PyResu
             dict.set_item("edge_dst", g.edge_dst)?;
             dict.set_item("legal_mask", g.legal_mask)?;
             dict.set_item("stone_mask", g.stone_mask)?;
+            dict.set_item("neighbor_index", g.neighbor_index)?;
             dict.set_item("coords", g.coords)?;
             dict.set_item("num_nodes", g.num_nodes)?;
             Ok(dict.into())
