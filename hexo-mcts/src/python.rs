@@ -577,7 +577,7 @@ fn py_native_self_play(
         _ => return Err(PyValueError::new_err(format!("Unknown device: {device}"))),
     };
 
-    let model = TorchModel::load(model_path, tch_device, false)
+    let model = TorchModel::load(model_path, tch_device)
         .map_err(|e| PyValueError::new_err(format!("Failed to load model: {e}")))?;
 
     let mut rng = match seed {

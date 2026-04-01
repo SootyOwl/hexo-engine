@@ -16,13 +16,14 @@ crate-type = ["cdylib", "rlib"]
 
 [features]
 python = ["pyo3"]
-torch = ["tch", "serde_json"]
+torch = ["tch", "serde_json", "ctrlc"]
 
 [dependencies]
 hexo-engine = { version = "0.1.0", path = "../hexo-engine" }
 pyo3 = { version = "0.28", optional = true }
-tch = { version = "0.18", optional = true }
+tch = { git = "https://github.com/LaurentMazare/tch-rs", branch = "main", optional = true }
 serde_json = { version = "1", optional = true }
+ctrlc = { version = "3", optional = true }
 rand = "0.9"
 rand_chacha = "0.9"
 rayon = "1.10"

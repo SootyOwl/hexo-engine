@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 
-use tch::{CModule, Device, Kind, Tensor, nn::VarStore};
+use tch::{CModule, Device, Kind, Tensor};
 
 use hexo_engine::types::{Coord, HEX_DIRS, Player};
 use hexo_engine::hex::hex_distance;
@@ -17,14 +17,26 @@ use hexo_engine::GameState;
 pub struct TorchModel {
     model: CModule,
     device: Device,
-    use_fp16: bool,
+    bf16: bool,
 }
 
 impl TorchModel {
     /// Load a TorchScript model from a file.
-    pub fn load(path: &str, device: Device, use_fp16: bool) -> Result<Self, tch::TchError> {
+    ///
+    /// Auto-detects bf16 models by checking the first parameter's dtype.
+    pub fn load(path: &str, device: Device) -> Result<Self, tch::TchError> {
         let model = CModule::load_on_device(path, device)?;
-        Ok(TorchModel { model, device, use_fp16 })
+        // Detect bf16 by checking the first named parameter's dtype
+        let bf16 = model
+            .named_parameters()
+            .map(|params: Vec<(String, Tensor)>| {
+                params.first().map(|(_, t)| t.kind() == Kind::BFloat16).unwrap_or(false)
+            })
+            .unwrap_or(false);
+        if bf16 {
+            eprintln!("Model loaded in bfloat16 mode");
+        }
+        Ok(TorchModel { model, device, bf16 })
     }
 
     /// Evaluate a batch of game states.
@@ -44,8 +56,6 @@ impl TorchModel {
         // Concatenate into batched tensors
         let mut total_nodes = 0usize;
         let mut total_edges = 0usize;
-        let node_counts: Vec<usize> = graphs.iter().map(|g| g.num_nodes).collect();
-        let edge_counts: Vec<usize> = graphs.iter().map(|g| g.num_edges).collect();
         for g in &graphs {
             total_nodes += g.num_nodes;
             total_edges += g.num_edges;
@@ -77,10 +87,13 @@ impl TorchModel {
             node_offset += g.num_nodes as i64;
         }
 
-        // Create tensors on device
-        let x = Tensor::from_slice(&all_features)
+        // Create tensors on device (convert to bf16 if model is bf16)
+        let mut x = Tensor::from_slice(&all_features)
             .reshape([total_nodes as i64, 8])
             .to_device(self.device);
+        if self.bf16 {
+            x = x.to_kind(Kind::BFloat16);
+        }
         let edge_index = Tensor::from_slice2(&[&all_edge_src, &all_edge_dst])
             .to_device(self.device);
         let legal_mask = Tensor::from_slice(
@@ -92,80 +105,69 @@ impl TorchModel {
         let batch_tensor = Tensor::from_slice(&all_batch).to_device(self.device);
         let num_graphs = n as i64;
 
-        // Run model
+        // Run model via IValue interface (num_graphs is int, not Tensor)
         let _guard = tch::no_grad_guard();
-        let output = self.model.forward_ts(&[
-            x,
-            edge_index,
-            legal_mask,
-            stone_mask,
-            batch_tensor,
-            Tensor::from(num_graphs),
-        ]).expect("model forward failed");
-
-        // The ScriptableHeXONet returns a tuple (all_logits, legal_counts, values)
-        // When called via forward_ts, we get a single tensor... actually CModule
-        // returns the tuple elements. Let me use method_ts instead.
-        // Actually, tch-rs forward_ts should handle tuples. Let's parse.
-        // CModule.forward_ts returns a single Tensor if the model returns a tuple,
-        // we need to use forward_is (IValue) instead.
-
-        // Re-do with IValue interface
-        let result = self.model.forward_is(&[
-            tch::IValue::Tensor(
-                Tensor::from_slice(&all_features)
-                    .reshape([total_nodes as i64, 8])
-                    .to_device(self.device),
-            ),
-            tch::IValue::Tensor(
-                Tensor::from_slice2(&[&all_edge_src, &all_edge_dst])
-                    .to_device(self.device),
-            ),
-            tch::IValue::Tensor(
-                Tensor::from_slice(
-                    &all_legal_mask.iter().map(|&b| b as i8).collect::<Vec<i8>>(),
-                ).to_kind(Kind::Bool).to_device(self.device),
-            ),
-            tch::IValue::Tensor(
-                Tensor::from_slice(
-                    &all_stone_mask.iter().map(|&b| b as i8).collect::<Vec<i8>>(),
-                ).to_kind(Kind::Bool).to_device(self.device),
-            ),
-            tch::IValue::Tensor(
-                Tensor::from_slice(&all_batch).to_device(self.device),
-            ),
+        let result = match self.model.forward_is(&[
+            tch::IValue::Tensor(x),
+            tch::IValue::Tensor(edge_index),
+            tch::IValue::Tensor(legal_mask),
+            tch::IValue::Tensor(stone_mask),
+            tch::IValue::Tensor(batch_tensor),
             tch::IValue::Int(num_graphs),
-        ]).expect("model forward failed");
+        ]) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("Model forward failed: {e}");
+                let dummy_logits = states.iter().map(|_| HashMap::new()).collect();
+                return (dummy_logits, vec![0.0; n]);
+            }
+        };
 
-        // Parse tuple result
+        // Parse tuple result — return dummy on unexpected format
         let (all_logits_tensor, legal_counts_tensor, values_tensor) = match result {
             tch::IValue::Tuple(ref parts) if parts.len() == 3 => {
-                let logits = match &parts[0] {
-                    tch::IValue::Tensor(t) => t.shallow_clone(),
-                    _ => panic!("expected tensor for logits"),
-                };
-                let counts = match &parts[1] {
-                    tch::IValue::Tensor(t) => t.shallow_clone(),
-                    _ => panic!("expected tensor for counts"),
-                };
-                let values = match &parts[2] {
-                    tch::IValue::Tensor(t) => t.shallow_clone(),
-                    _ => panic!("expected tensor for values"),
-                };
-                (logits, counts, values)
+                match (&parts[0], &parts[1], &parts[2]) {
+                    (tch::IValue::Tensor(l), tch::IValue::Tensor(c), tch::IValue::Tensor(v)) => {
+                        (l.shallow_clone(), c.shallow_clone(), v.shallow_clone())
+                    }
+                    _ => {
+                        eprintln!("Unexpected tensor types in model output");
+                        let dummy = states.iter().map(|_| HashMap::new()).collect();
+                        return (dummy, vec![0.0; n]);
+                    }
+                }
             }
-            _ => panic!("unexpected model output format"),
+            _ => {
+                eprintln!("Unexpected model output format");
+                let dummy = states.iter().map(|_| HashMap::new()).collect();
+                return (dummy, vec![0.0; n]);
+            }
         };
 
         // Extract values
-        let values_vec: Vec<f64> = Vec::<f64>::try_from(values_tensor.to_device(Device::Cpu))
-            .expect("values to vec");
+        let values_vec: Vec<f64> = match Vec::<f64>::try_from(values_tensor.to_device(Device::Cpu)) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("Failed to extract values: {e}");
+                return (states.iter().map(|_| HashMap::new()).collect(), vec![0.0; n]);
+            }
+        };
 
         // Extract logits per graph
-        let counts_vec: Vec<i64> = Vec::<i64>::try_from(legal_counts_tensor.to_device(Device::Cpu))
-            .expect("counts to vec");
-        let all_logits_vec: Vec<f64> = Vec::<f64>::try_from(all_logits_tensor.to_device(Device::Cpu))
-            .expect("logits to vec");
+        let counts_vec: Vec<i64> = match Vec::<i64>::try_from(legal_counts_tensor.to_device(Device::Cpu)) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("Failed to extract counts: {e}");
+                return (states.iter().map(|_| HashMap::new()).collect(), vec![0.0; n]);
+            }
+        };
+        let all_logits_vec: Vec<f64> = match Vec::<f64>::try_from(all_logits_tensor.to_device(Device::Cpu)) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("Failed to extract logits: {e}");
+                return (states.iter().map(|_| HashMap::new()).collect(), vec![0.0; n]);
+            }
+        };
 
         let mut logits_maps = Vec::with_capacity(n);
         let mut offset = 0usize;
