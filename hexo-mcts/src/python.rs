@@ -372,6 +372,37 @@ fn py_augment_graph(py: Python<'_>, game: &PyGameState) -> PyResult<Vec<(Py<PyAn
         .collect()
 }
 
+/// Call the Python eval_fn with a batch of GameStates.
+/// Must be called while holding the GIL.
+/// Returns Err on Python exceptions (including KeyboardInterrupt).
+fn call_python_eval(
+    py: Python<'_>,
+    eval_fn: &Py<PyAny>,
+    states: &[GameState],
+) -> Result<(Vec<HashMap<Coord, f64>>, Vec<f64>), String> {
+    let py_states: Vec<PyGameState> = states
+        .iter()
+        .map(|s| PyGameState { inner: s.clone() })
+        .collect();
+
+    let result = eval_fn.call1(py, (py_states,))
+        .map_err(|e| format!("{e}"))?;
+
+    let (logits_per_state, values_raw): (Vec<Vec<f64>>, Vec<f64>) = result.extract(py)
+        .map_err(|e| format!("eval parse error: {e}"))?;
+
+    let logits_maps: Vec<HashMap<Coord, f64>> = states
+        .iter()
+        .zip(logits_per_state)
+        .map(|(state, logits)| {
+            let moves = state.legal_moves();
+            moves.into_iter().zip(logits).collect()
+        })
+        .collect();
+
+    Ok((logits_maps, values_raw))
+}
+
 /// Play N complete self-play games, returning trajectories.
 ///
 /// Each game is played move-by-move using Gumbel MCTS. All games share
@@ -404,140 +435,198 @@ fn py_batched_self_play(
     exploration_moves: usize,
     seed: Option<u64>,
 ) -> PyResult<Vec<Vec<(PyGameState, (i32, i32), Vec<f64>, &'static str)>>> {
+    use std::sync::mpsc;
+    use std::time::Duration;
     use rand::{Rng, SeedableRng};
     use rand_chacha::ChaCha8Rng;
+    use crate::mcts::batcher::{BatcherConfig, EvalRequest, EvalResponse, batcher_loop};
 
-    let mut rng = match seed {
+    let mcts_cfg = mcts_config.inner.clone();
+    let game_cfg = game_config.inner;
+
+    // Per-game deterministic seeds
+    let mut master_rng = match seed {
         Some(s) => ChaCha8Rng::seed_from_u64(s),
         None => ChaCha8Rng::from_os_rng(),
     };
+    let game_seeds: Vec<u64> = (0..n_games).map(|_| master_rng.random()).collect();
 
-    let mut eval_error: Option<PyErr> = None;
+    // Release the GIL for the parallel section.
+    // Game threads do pure Rust MCTS; the batcher re-acquires the GIL per batch.
+    // An abort flag lets the batcher signal game threads to stop on error
+    // (e.g. KeyboardInterrupt).
+    use std::sync::atomic::{AtomicBool, Ordering};
 
-    let mut eval = |states: &[GameState]| -> (Vec<HashMap<Coord, f64>>, Vec<f64>) {
-        let py_states: Vec<PyGameState> = states
-            .iter()
-            .map(|s| PyGameState { inner: s.clone() })
-            .collect();
+    let result: Result<Vec<Vec<(GameState, Coord, Vec<f64>, Player)>>, String> =
+        py.detach(|| {
+            // Channel created inside detach so Receiver doesn't cross the Ungil boundary
+            let (request_tx, request_rx) = mpsc::sync_channel::<EvalRequest>(n_games);
+            let abort = AtomicBool::new(false);
+            std::thread::scope(|scope| {
+                // Spawn one thread per game
+                let mut handles = Vec::with_capacity(n_games);
+                let abort_ref = &abort;
+                for i in 0..n_games {
+                    let tx = request_tx.clone();
+                    let cfg = mcts_cfg.clone();
+                    let gcfg = game_cfg;
+                    let game_seed = game_seeds[i];
 
-        let result = match eval_fn.call1(py, (py_states,)) {
-            Ok(r) => r,
-            Err(e) => {
-                eval_error = Some(e);
-                let dummy = states.iter().map(|_| HashMap::new()).collect();
-                return (dummy, vec![0.0; states.len()]);
-            }
-        };
+                    let handle = scope.spawn(move || {
+                        let mut rng = ChaCha8Rng::seed_from_u64(game_seed);
+                        let mut game = GameState::with_config(gcfg);
+                        let mut trajectory: Vec<(GameState, Coord, Vec<f64>, Player)> = Vec::new();
+                        let mut move_count = 0usize;
 
-        let parsed: Result<(Vec<Vec<f64>>, Vec<f64>), _> = result.extract(py);
-        let (logits_per_state, values_raw) = match parsed {
-            Ok(v) => v,
-            Err(e) => {
-                eval_error = Some(e.into());
-                let dummy = states.iter().map(|_| HashMap::new()).collect();
-                return (dummy, vec![0.0; states.len()]);
-            }
-        };
+                        // Per-game eval closure: sends to batcher, blocks for response.
+                        // Returns dummy data if the batcher has shut down (abort).
+                        let mut eval_fn = |states: &[GameState]|
+                            -> (Vec<HashMap<Coord, f64>>, Vec<f64>)
+                        {
+                            if abort_ref.load(Ordering::Relaxed) {
+                                let dummy = states.iter().map(|_| HashMap::new()).collect();
+                                return (dummy, vec![0.0; states.len()]);
+                            }
+                            let (resp_tx, resp_rx) = mpsc::sync_channel::<EvalResponse>(1);
+                            let req = EvalRequest {
+                                states: states.to_vec(),
+                                response_tx: resp_tx,
+                            };
+                            match tx.send(req) {
+                                Ok(()) => {}
+                                Err(_) => {
+                                    // Batcher has exited (abort or finished)
+                                    let dummy = states.iter().map(|_| HashMap::new()).collect();
+                                    return (dummy, vec![0.0; states.len()]);
+                                }
+                            }
+                            match resp_rx.recv() {
+                                Ok(resp) => (resp.logits, resp.values),
+                                Err(_) => {
+                                    let dummy = states.iter().map(|_| HashMap::new()).collect();
+                                    (dummy, vec![0.0; states.len()])
+                                }
+                            }
+                        };
 
-        let logits_maps: Vec<HashMap<Coord, f64>> = states
-            .iter()
-            .zip(logits_per_state)
-            .map(|(state, logits)| {
-                let moves = state.legal_moves();
-                moves.into_iter().zip(logits).collect()
+                        while !game.is_terminal() && !abort_ref.load(Ordering::Relaxed) {
+                            let snapshot = game.clone();
+                            let current_player = game.current_player()
+                                .expect("non-terminal has current player");
+
+                            let mcts_result = match gumbel_mcts::gumbel_mcts(
+                                &game, &cfg, &mut rng, &mut eval_fn,
+                            ) {
+                                Ok(r) => r,
+                                Err(_) => break, // terminal or no legal moves
+                            };
+
+                            // If aborted during MCTS, don't push garbage to trajectory
+                            if abort_ref.load(Ordering::Relaxed) {
+                                break;
+                            }
+
+                            let action = if move_count < exploration_moves {
+                                // Sample from improved policy
+                                let policy = &mcts_result.improved_policy;
+                                let total: f64 = policy.iter().sum();
+                                if total > 0.0 {
+                                    let r: f64 = rng.random::<f64>() * total;
+                                    let mut cumsum = 0.0;
+                                    let mut chosen_idx = 0;
+                                    for (k, &p) in policy.iter().enumerate() {
+                                        cumsum += p;
+                                        if cumsum >= r {
+                                            chosen_idx = k;
+                                            break;
+                                        }
+                                    }
+                                    mcts_result.coords[chosen_idx]
+                                } else {
+                                    mcts_result.action
+                                }
+                            } else {
+                                mcts_result.action
+                            };
+
+                            trajectory.push((
+                                snapshot,
+                                action,
+                                mcts_result.improved_policy,
+                                current_player,
+                            ));
+
+                            game.apply_move(action).expect("valid action from MCTS");
+                            move_count += 1;
+                        }
+
+                        trajectory
+                    });
+                    handles.push(handle);
+                }
+
+                // Drop our sender so the batcher can detect when all games finish
+                drop(request_tx);
+
+                // Run the batcher on this thread (the main thread within allow_threads).
+                // Re-acquires the GIL for each batch eval via Python::with_gil.
+                let batcher_config = BatcherConfig {
+                    max_batch_size: n_games * mcts_cfg.m_actions,
+                    timeout: Duration::from_millis(10),
+                };
+
+                let eval_fn_ref = &eval_fn;
+                let batcher_result = batcher_loop(&request_rx, &batcher_config, &mut |states: &[GameState]| {
+                    Python::attach(|py| {
+                        call_python_eval(py, eval_fn_ref, states)
+                    })
+                });
+
+                // If batcher failed (e.g. KeyboardInterrupt), signal game threads to stop
+                if batcher_result.is_err() {
+                    abort.store(true, Ordering::Relaxed);
+                }
+
+                // Collect results from all game threads (they will exit quickly if aborted)
+                let mut all_trajectories = Vec::with_capacity(n_games);
+                for handle in handles {
+                    match handle.join() {
+                        Ok(traj) => all_trajectories.push(traj),
+                        Err(_) => {} // thread panicked, skip it
+                    }
+                }
+
+                // Propagate batcher error (e.g. KeyboardInterrupt)
+                if let Err(e) = batcher_result {
+                    return Err(e);
+                }
+
+                Ok(all_trajectories)
+            })
+        });
+
+    let raw_trajectories = result.map_err(|e| {
+        if e.contains("KeyboardInterrupt") {
+            pyo3::exceptions::PyKeyboardInterrupt::new_err(e)
+        } else {
+            PyValueError::new_err(e)
+        }
+    })?;
+
+    // Convert Rust types to Python types (on the main thread with GIL held)
+    let py_trajectories: Vec<Vec<(PyGameState, (i32, i32), Vec<f64>, &'static str)>> =
+        raw_trajectories
+            .into_iter()
+            .map(|traj| {
+                traj.into_iter()
+                    .map(|(state, action, policy, player)| {
+                        (PyGameState { inner: state }, action, policy, player_str(player))
+                    })
+                    .collect()
             })
             .collect();
 
-        (logits_maps, values_raw)
-    };
-
-    use crate::mcts::batched::batched_gumbel_mcts;
-
-    // Track N games playing simultaneously
-    let mut games: Vec<GameState> = (0..n_games)
-        .map(|_| GameState::with_config(game_config.inner))
-        .collect();
-    let mut trajectories: Vec<Vec<(PyGameState, (i32, i32), Vec<f64>, &'static str)>> =
-        (0..n_games).map(|_| Vec::new()).collect();
-    let mut move_counts: Vec<usize> = vec![0; n_games];
-    let mut active: Vec<bool> = vec![true; n_games]; // games still in progress
-
-    // Play move-by-move in lockstep: batch MCTS for all active games
-    loop {
-        // Collect active (non-terminal) game states
-        let active_indices: Vec<usize> = (0..n_games)
-            .filter(|&i| active[i] && !games[i].is_terminal())
-            .collect();
-
-        if active_indices.is_empty() {
-            break;
-        }
-
-        let active_states: Vec<GameState> = active_indices.iter().map(|&i| games[i].clone()).collect();
-
-        // Run batched MCTS — one eval_fn call per halving round covers ALL games
-        let results = batched_gumbel_mcts(&active_states, &mcts_config.inner, &mut rng, &mut eval);
-
-        // Check for eval errors (eval is still borrowed, check via results)
-        let mcts_results = match results {
-            Ok(r) => r,
-            Err(_) => break, // eval error — stop all games
-        };
-
-        // Apply results to each active game
-        for (result_idx, &game_idx) in active_indices.iter().enumerate() {
-            let mcts_result = &mcts_results[result_idx];
-            let snapshot = PyGameState { inner: games[game_idx].clone() };
-            let current_player = games[game_idx].current_player().map(player_str).unwrap_or("?");
-
-            let action = if move_counts[game_idx] < exploration_moves {
-                // Sample from improved policy for exploration
-                let policy = &mcts_result.improved_policy;
-                let total: f64 = policy.iter().sum();
-                if total > 0.0 {
-                    let r: f64 = rng.random::<f64>() * total;
-                    let mut cumsum = 0.0;
-                    let mut chosen_idx = 0;
-                    for (i, &p) in policy.iter().enumerate() {
-                        cumsum += p;
-                        if cumsum >= r {
-                            chosen_idx = i;
-                            break;
-                        }
-                    }
-                    mcts_result.coords[chosen_idx]
-                } else {
-                    mcts_result.action
-                }
-            } else {
-                mcts_result.action
-            };
-
-            trajectories[game_idx].push((
-                snapshot,
-                action,
-                mcts_result.improved_policy.clone(),
-                current_player,
-            ));
-
-            games[game_idx].apply_move(action).expect("valid action from MCTS");
-            move_counts[game_idx] += 1;
-        }
-
-        // Mark finished games
-        for i in 0..n_games {
-            if active[i] && games[i].is_terminal() {
-                active[i] = false;
-            }
-        }
-    }
-
-    drop(eval);
-    if let Some(e) = eval_error {
-        return Err(e);
-    }
-
-    Ok(trajectories)
+    Ok(py_trajectories)
 }
 
 /// Play N self-play games using Rust-native TorchScript inference.

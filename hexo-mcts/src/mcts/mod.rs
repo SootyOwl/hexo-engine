@@ -1,3 +1,4 @@
+pub mod batcher;
 pub mod backup;
 pub mod batched;
 pub mod gumbel_mcts;
