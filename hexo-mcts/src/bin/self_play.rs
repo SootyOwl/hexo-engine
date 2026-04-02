@@ -255,7 +255,9 @@ fn main() {
         let json: Vec<serde_json::Value> = all_games.iter()
             .map(|(t, w)| game_to_json(t, w))
             .collect();
-        fs::write(&output_path, serde_json::to_string(&json).unwrap())
+        let tmp_path = format!("{}.tmp", output_path);
+        fs::write(&tmp_path, serde_json::to_string(&json).unwrap())
+            .and_then(|_| fs::rename(&tmp_path, &output_path))
             .expect("Failed to write output");
 
         eprintln!(
@@ -309,8 +311,12 @@ fn main() {
                         if local_batch.len() >= n_games {
                             let batch_idx = batch_counter.fetch_add(1, Ordering::Relaxed);
                             let batch_path = format!("{}/batch_{:06}.json", dir, batch_idx);
+                            let tmp_path = format!("{}/batch_{:06}.json.tmp", dir, batch_idx);
                             if let Ok(json) = serde_json::to_string(&local_batch) {
-                                if let Err(e) = fs::write(&batch_path, json) {
+                                // Atomic write: temp file then rename
+                                if let Err(e) = fs::write(&tmp_path, &json)
+                                    .and_then(|_| fs::rename(&tmp_path, &batch_path))
+                                {
                                     eprintln!("Thread {ti}: failed to write batch: {e}");
                                 }
                             }
@@ -345,8 +351,11 @@ fn main() {
                     if !local_batch.is_empty() {
                         let batch_idx = batch_counter.fetch_add(1, Ordering::Relaxed);
                         let batch_path = format!("{}/batch_{:06}.json", dir, batch_idx);
+                        let tmp_path = format!("{}/batch_{:06}.json.tmp", dir, batch_idx);
                         if let Ok(json) = serde_json::to_string(&local_batch) {
-                            fs::write(&batch_path, json).ok();
+                            fs::write(&tmp_path, &json)
+                                .and_then(|_| fs::rename(&tmp_path, &batch_path))
+                                .ok();
                         }
                     }
                 });
