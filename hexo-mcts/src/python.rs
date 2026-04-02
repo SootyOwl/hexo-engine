@@ -331,6 +331,75 @@ fn py_game_to_graph_batch(py: Python<'_>, games: Vec<Py<PyGameState>>) -> PyResu
         .collect()
 }
 
+/// Build axis-window graph arrays from a game state (Rust-accelerated).
+///
+/// Returns a dict with keys: features, edge_src, edge_dst, edge_attr, legal_mask,
+/// stone_mask, coords, num_nodes — all as flat Python lists ready for torch.tensor().
+#[pyfunction(name = "game_to_axis_graph_raw")]
+fn py_game_to_axis_graph_raw(py: Python<'_>, game: &PyGameState) -> PyResult<Py<PyAny>> {
+    if game.inner.is_terminal() {
+        return Err(PyValueError::new_err(
+            "Cannot construct graph for a terminal game state.",
+        ));
+    }
+
+    let g = crate::axis_graph::game_to_axis_graph_raw(&game.inner);
+
+    let dict = pyo3::types::PyDict::new(py);
+    dict.set_item("features", g.features)?;
+    dict.set_item("edge_src", g.edge_src)?;
+    dict.set_item("edge_dst", g.edge_dst)?;
+    dict.set_item("edge_attr", g.edge_attr)?;
+    dict.set_item("legal_mask", g.legal_mask)?;
+    dict.set_item("stone_mask", g.stone_mask)?;
+    dict.set_item("coords", g.coords)?;
+    dict.set_item("num_nodes", g.num_nodes)?;
+    Ok(dict.into())
+}
+
+/// Build axis-window graph arrays for a batch of game states in parallel.
+///
+/// Returns a list of dicts, one per state. Uses rayon for parallel construction.
+#[pyfunction(name = "game_to_axis_graph_batch")]
+fn py_game_to_axis_graph_batch(
+    py: Python<'_>,
+    games: Vec<Py<PyGameState>>,
+) -> PyResult<Vec<Py<PyAny>>> {
+    // Extract inner GameStates while we hold the GIL
+    let states: Vec<GameState> = games
+        .iter()
+        .enumerate()
+        .map(|(i, g)| {
+            let gs = g.borrow(py);
+            if gs.inner.is_terminal() {
+                return Err(PyValueError::new_err(format!(
+                    "Cannot construct graph for a terminal game state (game index {i}).",
+                )));
+            }
+            Ok(gs.inner.clone())
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+
+    // Parallel graph construction (no GIL needed — pure Rust)
+    let graphs = crate::axis_graph::game_to_axis_graph_batch(&states);
+
+    graphs
+        .into_iter()
+        .map(|g| {
+            let dict = pyo3::types::PyDict::new(py);
+            dict.set_item("features", g.features)?;
+            dict.set_item("edge_src", g.edge_src)?;
+            dict.set_item("edge_dst", g.edge_dst)?;
+            dict.set_item("edge_attr", g.edge_attr)?;
+            dict.set_item("legal_mask", g.legal_mask)?;
+            dict.set_item("stone_mask", g.stone_mask)?;
+            dict.set_item("coords", g.coords)?;
+            dict.set_item("num_nodes", g.num_nodes)?;
+            Ok(dict.into())
+        })
+        .collect()
+}
+
 /// Produce 11 D6-augmented graph variants from a game state.
 ///
 /// Returns list of (graph_dict, permutation) tuples.
@@ -644,7 +713,7 @@ fn py_batched_self_play(
 ///     seed: optional RNG seed
 #[cfg(feature = "torch")]
 #[pyfunction(name = "native_self_play")]
-#[pyo3(signature = (game_config, model_path, mcts_config, n_games, exploration_moves=0, device="cuda", seed=None))]
+#[pyo3(signature = (game_config, model_path, mcts_config, n_games, exploration_moves=0, device="cuda", seed=None, graph_type="hex"))]
 fn py_native_self_play(
     _py: Python<'_>,
     game_config: &PyGameConfig,
@@ -654,10 +723,11 @@ fn py_native_self_play(
     exploration_moves: usize,
     device: &str,
     seed: Option<u64>,
+    graph_type: &str,
 ) -> PyResult<Vec<Vec<(PyGameState, (i32, i32), Vec<f64>, &'static str)>>> {
     use rand::{Rng, SeedableRng};
     use rand_chacha::ChaCha8Rng;
-    use crate::inference::TorchModel;
+    use crate::inference::{GraphType, TorchModel};
     use crate::mcts::batched::batched_gumbel_mcts;
 
     let tch_device = match device {
@@ -666,7 +736,13 @@ fn py_native_self_play(
         _ => return Err(PyValueError::new_err(format!("Unknown device: {device}"))),
     };
 
-    let model = TorchModel::load(model_path, tch_device)
+    let gt = match graph_type {
+        "axis" => GraphType::Axis,
+        "hex" => GraphType::Hex,
+        _ => return Err(PyValueError::new_err(format!("Unknown graph_type: {graph_type}"))),
+    };
+
+    let model = TorchModel::load_with_graph_type(model_path, tch_device, gt)
         .map_err(|e| PyValueError::new_err(format!("Failed to load model: {e}")))?;
 
     let mut rng = match seed {
@@ -755,6 +831,8 @@ fn hexo_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_gumbel_mcts, m)?)?;
     m.add_function(wrap_pyfunction!(py_game_to_graph_raw, m)?)?;
     m.add_function(wrap_pyfunction!(py_game_to_graph_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(py_game_to_axis_graph_raw, m)?)?;
+    m.add_function(wrap_pyfunction!(py_game_to_axis_graph_batch, m)?)?;
     m.add_function(wrap_pyfunction!(py_augment_graph, m)?)?;
     m.add_function(wrap_pyfunction!(py_batched_self_play, m)?)?;
     #[cfg(feature = "torch")]

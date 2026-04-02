@@ -1,3 +1,4 @@
+pub mod axis_graph;
 pub mod graph;
 #[cfg(feature = "torch")]
 pub mod inference;

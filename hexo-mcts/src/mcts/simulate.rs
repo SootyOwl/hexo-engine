@@ -56,13 +56,12 @@ pub fn select_leaf(
         path_actions.push(action);
         path_players.push(child.current_player);
 
-        if !child.is_expanded() {
-            // Reached a leaf
-            let is_terminal = child
-                .game_state
-                .as_ref()
-                .is_some_and(|g| g.is_terminal());
+        let is_terminal = child
+            .game_state
+            .as_ref()
+            .is_some_and(|g| g.is_terminal());
 
+        if !child.is_expanded() || is_terminal {
             let terminal_value = if is_terminal {
                 let game = child.game_state.as_ref().unwrap();
                 Some(match game.winner() {

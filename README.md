@@ -61,8 +61,10 @@ Gumbel AlphaZero MCTS implementation with graph construction for GNN evaluation.
 
 - **Gumbel MCTS** with Sequential Halving (Danihelka et al., 2022)
 - **Batched neural network evaluation** via a pluggable `eval_fn`
-- **Graph construction**: converts game states to node/edge tensors (8-dim node features, hex adjacency edges, legal/stone masks)
-- **PyO3 bindings** (optional `python` feature) for integration with Python ML pipelines
+- **Two graph builders**:
+  - `graph.rs` — hex-adjacency edges (distance 1), 8-dim node features
+  - `axis_graph.rs` — axis-window edges (up to `win_length - 1` along the 3 win axes), 5-dim edge features, global dummy node, stop-at-opponent traversal
+- **PyO3 bindings** (optional `python` feature): `game_to_graph_raw`, `game_to_graph_batch`, `game_to_axis_graph_raw`, `game_to_axis_graph_batch`, `augment_graph`, `gumbel_mcts`, `batched_self_play`
 
 ## Interactive TUI
 

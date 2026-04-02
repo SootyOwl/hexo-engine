@@ -6,17 +6,19 @@
 //!      completed games to output dir. Reloads model when it changes.
 //!
 //! Each thread loads its own model instance to avoid libtorch contention.
-//! Games are written to disk as soon as each batch completes.
+//! In continuous mode, games are streamed as JSONL to a shared output file.
 
 use std::collections::HashMap;
 use std::fs;
+use std::io::{BufWriter, Write};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use hexo_engine::game::{GameConfig, GameState};
 use hexo_engine::types::Coord;
-use hexo_rs::inference::TorchModel;
+use hexo_rs::inference::{GraphType, TorchModel};
 use hexo_rs::mcts::MCTSConfig;
 
 use rand::{Rng, SeedableRng};
@@ -135,6 +137,7 @@ fn main() {
     let mut n_threads: usize = 0;
     let mut omp_threads: usize = 0;
     let mut continuous = false;
+    let mut graph_type_str = "hex".to_string();
 
     let mut i = 1;
     while i < args.len() {
@@ -154,6 +157,7 @@ fn main() {
             "--threads" => { n_threads = args[i + 1].parse().unwrap(); i += 2; }
             "--omp" => { omp_threads = args[i + 1].parse().unwrap(); i += 2; }
             "--continuous" => { continuous = true; i += 1; }
+            "--graph-type" => { graph_type_str = args[i + 1].clone(); i += 2; }
             _ => { eprintln!("Unknown arg: {}", args[i]); i += 1; }
         }
     }
@@ -200,6 +204,11 @@ fn main() {
         }).expect("Failed to set Ctrl+C handler");
     }
 
+    let graph_type = match graph_type_str.as_str() {
+        "axis" => GraphType::Axis,
+        _ => GraphType::Hex,
+    };
+
     let game_config = GameConfig { win_length, placement_radius: radius, max_moves };
     let mcts_config = Arc::new(MCTSConfig {
         n_simulations: n_sims,
@@ -226,7 +235,7 @@ fn main() {
                     let model_path = &model_path;
                     let mcts_config = &mcts_config;
                     s.spawn(move || {
-                        let model = match TorchModel::load(model_path, tch_device) {
+                        let model = match TorchModel::load_with_graph_type(model_path, tch_device, graph_type) {
                             Ok(m) => m,
                             Err(e) => {
                                 eprintln!("Thread {ti}: failed to load model: {e}");
@@ -267,28 +276,33 @@ fn main() {
             n_games as f64 / elapsed.as_secs_f64(),
         );
     } else {
-        // --- Continuous mode: threads play games independently, write batches ---
+        // --- Continuous mode: threads play games, append JSONL to shared file ---
         let dir = output_dir.unwrap_or_else(|| "self_play_output".to_string());
         fs::create_dir_all(&dir).expect("Failed to create output directory");
 
+        let jsonl_path = format!("{}/games.jsonl", dir);
+        let jsonl_file = fs::File::create(&jsonl_path)
+            .expect("Failed to create games.jsonl");
+        let shared_writer = Arc::new(Mutex::new(BufWriter::new(jsonl_file)));
+
         eprintln!(
-            "Continuous self-play: threads={}, omp={}, batch_size={}, output={}",
-            n_threads, omp_threads, n_games, dir,
+            "Continuous self-play: threads={}, omp={}, output={}",
+            n_threads, omp_threads, jsonl_path,
         );
 
-        let batch_counter = Arc::new(AtomicU64::new(0));
+        let game_counter = Arc::new(AtomicU64::new(0));
 
         std::thread::scope(|s| {
             for ti in 0..n_threads {
                 let running = running.clone();
-                let batch_counter = batch_counter.clone();
+                let game_counter = game_counter.clone();
+                let shared_writer = shared_writer.clone();
                 let model_path = &model_path;
                 let mcts_config = &mcts_config;
-                let dir = &dir;
 
                 s.spawn(move || {
                     // Each thread loads its own model — no contention
-                    let mut model = match TorchModel::load(model_path, tch_device) {
+                    let mut model = match TorchModel::load_with_graph_type(model_path, tch_device, graph_type) {
                         Ok(m) => m,
                         Err(e) => {
                             eprintln!("Thread {ti}: failed to load model: {e}");
@@ -297,39 +311,31 @@ fn main() {
                     };
                     let mut model_mtime = file_mtime(model_path);
                     let mut rng = make_rng(seed, ti as u64, 0);
-                    let mut local_batch: Vec<serde_json::Value> = Vec::new();
 
                     while running.load(Ordering::Relaxed) {
                         // Play one game (skip failures)
                         if let Some((trajectory, winner)) = play_one_game(
                             &model, game_config, mcts_config, exploration, &mut rng,
                         ) {
-                            local_batch.push(game_to_json(&trajectory, winner));
-                        }
-
-                        // Flush batch when we have enough games
-                        if local_batch.len() >= n_games {
-                            let batch_idx = batch_counter.fetch_add(1, Ordering::Relaxed);
-                            let batch_path = format!("{}/batch_{:06}.json", dir, batch_idx);
-                            let tmp_path = format!("{}/batch_{:06}.json.tmp", dir, batch_idx);
-                            if let Ok(json) = serde_json::to_string(&local_batch) {
-                                // Atomic write: temp file then rename
-                                if let Err(e) = fs::write(&tmp_path, &json)
-                                    .and_then(|_| fs::rename(&tmp_path, &batch_path))
+                            let json_val = game_to_json(&trajectory, winner);
+                            if let Ok(line) = serde_json::to_string(&json_val) {
+                                let mut writer = shared_writer.lock().unwrap();
+                                if let Err(e) = writeln!(writer, "{}", line)
+                                    .and_then(|_| writer.flush())
                                 {
-                                    eprintln!("Thread {ti}: failed to write batch: {e}");
+                                    eprintln!("Thread {ti}: failed to write game: {e}");
                                 }
                             }
-                            if ti == 0 {
-                                eprintln!("Batch {}: {} games written", batch_idx, local_batch.len());
+                            let count = game_counter.fetch_add(1, Ordering::Relaxed) + 1;
+                            if ti == 0 && count % 10 == 0 {
+                                eprintln!("{} games written", count);
                             }
-                            local_batch.clear();
                         }
 
                         // Check for model update (every game, cheap stat call)
                         let current_mtime = file_mtime(model_path);
                         if current_mtime != model_mtime {
-                            match TorchModel::load(model_path, tch_device) {
+                            match TorchModel::load_with_graph_type(model_path, tch_device, graph_type) {
                                 Ok(new_model) => {
                                     model = new_model;
                                     model_mtime = current_mtime;
@@ -346,24 +352,12 @@ fn main() {
                             }
                         }
                     }
-
-                    // Flush remaining games
-                    if !local_batch.is_empty() {
-                        let batch_idx = batch_counter.fetch_add(1, Ordering::Relaxed);
-                        let batch_path = format!("{}/batch_{:06}.json", dir, batch_idx);
-                        let tmp_path = format!("{}/batch_{:06}.json.tmp", dir, batch_idx);
-                        if let Ok(json) = serde_json::to_string(&local_batch) {
-                            fs::write(&tmp_path, &json)
-                                .and_then(|_| fs::rename(&tmp_path, &batch_path))
-                                .ok();
-                        }
-                    }
                 });
             }
         });
 
-        let total_batches = batch_counter.load(Ordering::Relaxed);
-        eprintln!("Stopped after {} batches.", total_batches);
+        let total_games = game_counter.load(Ordering::Relaxed);
+        eprintln!("Stopped after {} games.", total_games);
     }
 }
 

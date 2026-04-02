@@ -13,11 +13,21 @@ use hexo_engine::types::{Coord, HEX_DIRS, Player};
 use hexo_engine::hex::hex_distance;
 use hexo_engine::GameState;
 
+use crate::axis_graph::game_to_axis_graph_raw;
+
+/// Graph type for model inference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraphType {
+    Hex,
+    Axis,
+}
+
 /// A loaded TorchScript model for inference.
 pub struct TorchModel {
     model: CModule,
     device: Device,
     bf16: bool,
+    graph_type: GraphType,
 }
 
 impl TorchModel {
@@ -25,6 +35,15 @@ impl TorchModel {
     ///
     /// Auto-detects bf16 models by checking the first parameter's dtype.
     pub fn load(path: &str, device: Device) -> Result<Self, tch::TchError> {
+        Self::load_with_graph_type(path, device, GraphType::Hex)
+    }
+
+    /// Load a TorchScript model with an explicit graph type.
+    pub fn load_with_graph_type(
+        path: &str,
+        device: Device,
+        graph_type: GraphType,
+    ) -> Result<Self, tch::TchError> {
         let model = CModule::load_on_device(path, device)?;
         // Detect bf16 by checking the first named parameter's dtype
         let bf16 = model
@@ -36,7 +55,8 @@ impl TorchModel {
         if bf16 {
             eprintln!("Model loaded in bfloat16 mode");
         }
-        Ok(TorchModel { model, device, bf16 })
+        eprintln!("Model graph_type: {:?}", graph_type);
+        Ok(TorchModel { model, device, bf16, graph_type })
     }
 
     /// Evaluate a batch of game states.
@@ -51,7 +71,10 @@ impl TorchModel {
         }
 
         // Build batched graph tensors
-        let graphs: Vec<GraphTensors> = states.iter().map(|s| build_graph_tensors(s)).collect();
+        let graphs: Vec<GraphTensors> = match self.graph_type {
+            GraphType::Hex => states.iter().map(|s| build_graph_tensors(s)).collect(),
+            GraphType::Axis => states.iter().map(|s| build_axis_graph_tensors(s)).collect(),
+        };
 
         // Concatenate into batched tensors
         let mut total_nodes = 0usize;
@@ -65,6 +88,7 @@ impl TorchModel {
         let mut all_features: Vec<f32> = Vec::with_capacity(total_nodes * 8);
         let mut all_edge_src: Vec<i64> = Vec::with_capacity(total_edges);
         let mut all_edge_dst: Vec<i64> = Vec::with_capacity(total_edges);
+        let mut all_edge_attr: Vec<f32> = Vec::new();
         let mut all_legal_mask: Vec<bool> = Vec::with_capacity(total_nodes);
         let mut all_stone_mask: Vec<bool> = Vec::with_capacity(total_nodes);
         let mut all_batch: Vec<i64> = Vec::with_capacity(total_nodes);
@@ -78,6 +102,10 @@ impl TorchModel {
             }
             for &d in &g.edge_dst {
                 all_edge_dst.push(d + node_offset);
+            }
+            // Batch edge_attr (axis graphs only)
+            if let Some(ref ea) = g.edge_attr {
+                all_edge_attr.extend_from_slice(ea);
             }
             all_legal_mask.extend_from_slice(&g.legal_mask);
             all_stone_mask.extend_from_slice(&g.stone_mask);
@@ -105,16 +133,35 @@ impl TorchModel {
         let batch_tensor = Tensor::from_slice(&all_batch).to_device(self.device);
         let num_graphs = n as i64;
 
-        // Run model via IValue interface (num_graphs is int, not Tensor)
-        let _guard = tch::no_grad_guard();
-        let result = match self.model.forward_is(&[
+        // Build IValue list — axis models get edge_attr as 7th argument
+        let mut ivalues = vec![
             tch::IValue::Tensor(x),
             tch::IValue::Tensor(edge_index),
             tch::IValue::Tensor(legal_mask),
             tch::IValue::Tensor(stone_mask),
             tch::IValue::Tensor(batch_tensor),
             tch::IValue::Int(num_graphs),
-        ]) {
+        ];
+        match self.graph_type {
+            GraphType::Axis => {
+                let mut edge_attr_tensor = Tensor::from_slice(&all_edge_attr)
+                    .reshape([total_edges as i64, 5])
+                    .to_device(self.device);
+                if self.bf16 {
+                    edge_attr_tensor = edge_attr_tensor.to_kind(Kind::BFloat16);
+                }
+                ivalues.push(tch::IValue::Tensor(edge_attr_tensor));
+            }
+            GraphType::Hex => {
+                // Pass empty tensor sentinel for hex (TorchScript default arg)
+                let empty = Tensor::zeros([0], (Kind::Float, self.device));
+                ivalues.push(tch::IValue::Tensor(empty));
+            }
+        }
+
+        // Run model via IValue interface (num_graphs is int, not Tensor)
+        let _guard = tch::no_grad_guard();
+        let result = match self.model.forward_is(&ivalues) {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("Model forward failed: {e}");
@@ -193,6 +240,7 @@ struct GraphTensors {
     features: Vec<f32>,    // N*8 flat
     edge_src: Vec<i64>,
     edge_dst: Vec<i64>,
+    edge_attr: Option<Vec<f32>>,  // E*5 flat, only for axis graphs
     legal_mask: Vec<bool>,
     stone_mask: Vec<bool>,
     legal_coords: Vec<Coord>,
@@ -309,10 +357,38 @@ fn build_graph_tensors(game: &GameState) -> GraphTensors {
         features,
         edge_src,
         edge_dst,
+        edge_attr: None,
         legal_mask,
         stone_mask,
         legal_coords: legal,
         num_nodes: n,
+        num_edges,
+    }
+}
+
+/// Build graph tensors from a game state using axis-window graph construction.
+fn build_axis_graph_tensors(game: &GameState) -> GraphTensors {
+    let axis_data = game_to_axis_graph_raw(game);
+
+    // Extract legal_coords from coords + legal_mask
+    let legal_coords: Vec<Coord> = axis_data.legal_mask
+        .iter()
+        .enumerate()
+        .filter(|&(_, &is_legal)| is_legal)
+        .map(|(i, _)| (axis_data.coords[i * 2], axis_data.coords[i * 2 + 1]))
+        .collect();
+
+    let num_edges = axis_data.edge_src.len();
+
+    GraphTensors {
+        features: axis_data.features,
+        edge_src: axis_data.edge_src,
+        edge_dst: axis_data.edge_dst,
+        edge_attr: Some(axis_data.edge_attr),
+        legal_mask: axis_data.legal_mask,
+        stone_mask: axis_data.stone_mask,
+        legal_coords,
+        num_nodes: axis_data.num_nodes,
         num_edges,
     }
 }
