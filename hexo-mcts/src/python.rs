@@ -491,8 +491,9 @@ fn call_python_eval(
 ///     seed: optional RNG seed
 ///
 /// Returns:
-///     list of games, where each game is:
-///       list of (state_snapshot, action, improved_policy, current_player)
+///     list of (trajectory, winner) tuples, where:
+///       trajectory: list of (state_snapshot, action, improved_policy, current_player)
+///       winner: "P1", "P2", or None (draw)
 #[pyfunction(name = "batched_self_play")]
 #[pyo3(signature = (game_config, eval_fn, mcts_config, n_games, exploration_moves=0, seed=None))]
 fn py_batched_self_play(
@@ -503,7 +504,7 @@ fn py_batched_self_play(
     n_games: usize,
     exploration_moves: usize,
     seed: Option<u64>,
-) -> PyResult<Vec<Vec<(PyGameState, (i32, i32), Vec<f64>, &'static str)>>> {
+) -> PyResult<Vec<(Vec<(PyGameState, (i32, i32), Vec<f64>, &'static str)>, Option<&'static str>)>> {
     use std::sync::mpsc;
     use std::time::Duration;
     use rand::{Rng, SeedableRng};
@@ -526,7 +527,7 @@ fn py_batched_self_play(
     // (e.g. KeyboardInterrupt).
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    let result: Result<Vec<Vec<(GameState, Coord, Vec<f64>, Player)>>, String> =
+    let result: Result<Vec<(Vec<(GameState, Coord, Vec<f64>, Player)>, Option<Player>)>, String> =
         py.detach(|| {
             // Channel created inside detach so Receiver doesn't cross the Ungil boundary
             let (request_tx, request_rx) = mpsc::sync_channel::<EvalRequest>(n_games);
@@ -629,7 +630,8 @@ fn py_batched_self_play(
                             move_count += 1;
                         }
 
-                        trajectory
+                        let winner = game.winner();
+                        (trajectory, winner)
                     });
                     handles.push(handle);
                 }
@@ -683,15 +685,17 @@ fn py_batched_self_play(
     })?;
 
     // Convert Rust types to Python types (on the main thread with GIL held)
-    let py_trajectories: Vec<Vec<(PyGameState, (i32, i32), Vec<f64>, &'static str)>> =
+    let py_trajectories: Vec<(Vec<(PyGameState, (i32, i32), Vec<f64>, &'static str)>, Option<&'static str>)> =
         raw_trajectories
             .into_iter()
-            .map(|traj| {
-                traj.into_iter()
+            .map(|(traj, winner)| {
+                let py_traj = traj.into_iter()
                     .map(|(state, action, policy, player)| {
                         (PyGameState { inner: state }, action, policy, player_str(player))
                     })
-                    .collect()
+                    .collect();
+                let py_winner = winner.map(|w| player_str(w));
+                (py_traj, py_winner)
             })
             .collect();
 

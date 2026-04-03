@@ -326,3 +326,33 @@ class TestFuzz:
             assert game.move_count() <= cfg.max_moves
             w = game.winner()
             assert w in (None, "P1", "P2")
+
+
+# ------------------------------------------------------------------
+# batched_self_play — winner return
+# ------------------------------------------------------------------
+
+class TestBatchedSelfPlayWinner:
+    def test_batched_self_play_returns_winner(self):
+        """batched_self_play trajectories should include winner."""
+        cfg = hexo_rs.GameConfig(win_length=4, placement_radius=4, max_moves=50)
+        mcts_cfg = hexo_rs.MCTSConfig(n_simulations=2, m_actions=4, c_visit=50, c_scale=1.0)
+
+        def dummy_eval(states):
+            logits = []
+            values = []
+            for s in states:
+                moves = s.legal_moves()
+                n = len(moves)
+                logits.append([0.0] * n)
+                values.append(0.0)
+            return (logits, values)
+
+        results = hexo_rs.batched_self_play(cfg, dummy_eval, mcts_cfg, 2, 0, seed=42)
+        assert len(results) == 2
+
+        for game_traj, winner in results:
+            assert winner in ("P1", "P2", None), f"unexpected winner: {winner}"
+            assert len(game_traj) > 0
+            step = game_traj[0]
+            assert len(step) == 4

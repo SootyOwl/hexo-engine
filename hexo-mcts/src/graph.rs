@@ -151,6 +151,12 @@ fn build_graph(
         }
     }
 
+    // Self-loops (one per node) — pre-baked so GNN layers don't allocate them per-forward-call
+    for i in 0..n {
+        edge_src.push(i as i64);
+        edge_dst.push(i as i64);
+    }
+
     // Neighbor index (N×6, -1 for missing)
     let mut neighbor_index = Vec::with_capacity(n * 6);
     for i in 0..n {
@@ -409,6 +415,24 @@ mod tests {
         for (_g, perm) in &augmented {
             assert_eq!(perm.len(), legal.len());
         }
+    }
+
+    #[test]
+    fn self_loops_present() {
+        let stones = vec![((0, 0), Player::P1)];
+        let legal = vec![(1, 0), (0, 1)];
+        let graph = build_graph(&stones, &legal, 1.0, 0.5);
+
+        let n = graph.num_nodes;
+        assert_eq!(n, 3);
+
+        let mut self_loop_count = 0;
+        for k in 0..graph.edge_src.len() {
+            if graph.edge_src[k] == graph.edge_dst[k] {
+                self_loop_count += 1;
+            }
+        }
+        assert_eq!(self_loop_count, n, "expected one self-loop per node");
     }
 
     #[test]

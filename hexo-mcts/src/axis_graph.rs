@@ -444,6 +444,7 @@ mod tests {
             .edge_src
             .iter()
             .zip(&hex_g.edge_dst)
+            .filter(|(s, d)| s != d) // exclude self-loops (pre-baked in hex graph)
             .map(|(s, d)| {
                 let si = *s as usize;
                 let di = *d as usize;

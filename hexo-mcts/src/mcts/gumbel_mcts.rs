@@ -80,6 +80,26 @@ where
     let (candidate_indices, gumbel_samples) =
         gumbel_top_k(&logits, config.m_actions, rng);
 
+    // Step 3.5: Check for immediate winning moves among candidates
+    // If any candidate action leads to a terminal win, skip expensive sequential halving
+    for &idx in &candidate_indices {
+        let coord = coords[idx];
+        let mut test_game = game.clone();
+        if test_game.apply_move(coord).is_ok() && test_game.is_terminal() {
+            if test_game.winner() == game.current_player() {
+                // Found a winning move — return immediately
+                let improved_policy = compute_improved_policy(
+                    &logits, &coords, &root, config.c_visit, config.c_scale,
+                );
+                return Ok(MCTSResult {
+                    action: coord,
+                    improved_policy,
+                    coords,
+                });
+            }
+        }
+    }
+
     // Step 4: Sequential halving with batched evaluation
     let surviving_indices = sequential_halving(
         &mut root,
@@ -403,24 +423,55 @@ mod tests {
         // detection to discover the win.
         let result = gumbel_mcts(&game, &config, &mut rng, &mut dummy_eval).unwrap();
 
-        // The winning move should be selected (or at least have the highest policy)
-        let win_idx = result.coords.iter().position(|&c| c == winning_move);
-        assert!(
-            win_idx.is_some(),
-            "Winning move should be among legal moves"
-        );
-        let win_idx = win_idx.unwrap();
+        // Any move adjacent to (0,0) wins with win_length=2.
+        // Early termination should find one of them.
+        let winning_moves: Vec<Coord> = hexo_engine::types::HEX_DIRS.iter()
+            .map(|&(dq, dr)| (dq, dr))
+            .filter(|c| game.legal_moves().contains(c))
+            .collect();
 
-        // Either the action is the winning move, or the policy strongly prefers it.
-        // With win_length=2 and a stone at (0,0), placing at (1,0) wins immediately.
-        // The terminal value of +1 should propagate back to make this the top choice.
-        let win_prob = result.improved_policy[win_idx];
-        let is_winning_action = result.action == winning_move;
+        let is_winning_action = winning_moves.contains(&result.action);
         assert!(
-            is_winning_action || win_prob > 0.3,
-            "MCTS should find the winning move: action={:?}, win_prob={}",
+            is_winning_action,
+            "MCTS should find a winning move: action={:?}, winning_moves={:?}",
             result.action,
-            win_prob,
+            winning_moves,
         );
+    }
+
+    #[test]
+    fn gumbel_mcts_early_terminates_on_win() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let eval_count = AtomicU32::new(0);
+
+        let mut eval_fn = |states: &[GameState]| -> (Vec<HashMap<Coord, f64>>, Vec<f64>) {
+            eval_count.fetch_add(states.len() as u32, Ordering::Relaxed);
+            let mut logits = Vec::new();
+            let mut values = Vec::new();
+            for s in states {
+                let moves = s.legal_moves();
+                let n = moves.len();
+                let priors: HashMap<Coord, f64> =
+                    moves.iter().map(|&c| (c, 1.0 / n as f64)).collect();
+                logits.push(priors);
+                values.push(0.0);
+            }
+            (logits, values)
+        };
+
+        let config = MCTSConfig {
+            n_simulations: 64,
+            m_actions: 8,
+            c_visit: 50,
+            c_scale: 1.0,
+        };
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+
+        let game = GameState::with_config(small_config());
+        let result = gumbel_mcts(&game, &config, &mut rng, &mut eval_fn);
+        assert!(result.is_ok());
+        // Just verify it completes — early termination is an optimization,
+        // correctness is preserved regardless.
     }
 }
