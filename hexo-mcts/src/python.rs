@@ -488,6 +488,8 @@ fn call_python_eval(
 ///     mcts_config: hexo_rs.MCTSConfig
 ///     n_games: number of games to play
 ///     exploration_moves: first N moves use stochastic action selection
+///     playout_cap_fraction: fraction of moves using reduced sim budget (0.0 = disabled)
+///     playout_cap_divisor: reduced budget = n_simulations / divisor (1 = disabled)
 ///     seed: optional RNG seed
 ///
 /// Returns:
@@ -495,7 +497,7 @@ fn call_python_eval(
 ///       trajectory: list of (state_snapshot, action, improved_policy, current_player)
 ///       winner: "P1", "P2", or None (draw)
 #[pyfunction(name = "batched_self_play")]
-#[pyo3(signature = (game_config, eval_fn, mcts_config, n_games, exploration_moves=0, seed=None))]
+#[pyo3(signature = (game_config, eval_fn, mcts_config, n_games, exploration_moves=0, playout_cap_fraction=0.0, playout_cap_divisor=1, seed=None))]
 fn py_batched_self_play(
     py: Python<'_>,
     game_config: &PyGameConfig,
@@ -503,6 +505,8 @@ fn py_batched_self_play(
     mcts_config: &PyMCTSConfig,
     n_games: usize,
     exploration_moves: usize,
+    playout_cap_fraction: f64,
+    playout_cap_divisor: u32,
     seed: Option<u64>,
 ) -> PyResult<Vec<(Vec<(PyGameState, (i32, i32), Vec<f64>, &'static str)>, Option<&'static str>)>> {
     use std::sync::mpsc;
@@ -584,8 +588,21 @@ fn py_batched_self_play(
                             let current_player = game.current_player()
                                 .expect("non-terminal has current player");
 
+                            // Per-move playout cap: use reduced budget with probability playout_cap_fraction
+                            let effective_cfg = if playout_cap_fraction > 0.0
+                                && playout_cap_divisor > 1
+                                && rng.random::<f64>() < playout_cap_fraction
+                            {
+                                MCTSConfig {
+                                    n_simulations: (cfg.n_simulations / playout_cap_divisor).max(1),
+                                    ..cfg.clone()
+                                }
+                            } else {
+                                cfg.clone()
+                            };
+
                             let mcts_result = match gumbel_mcts::gumbel_mcts(
-                                &game, &cfg, &mut rng, &mut eval_fn,
+                                &game, &effective_cfg, &mut rng, &mut eval_fn,
                             ) {
                                 Ok(r) => r,
                                 Err(_) => break, // terminal or no legal moves
@@ -827,6 +844,44 @@ fn py_native_self_play(
     Ok(trajectories)
 }
 
+/// Collate multiple game states into flat batch tensors for direct model consumption.
+///
+/// Bypasses PyG Batch.from_data_list() by returning pre-collated flat arrays
+/// ready for torch.tensor() conversion.
+///
+/// Returns a tuple: (features, edge_src, edge_dst, legal_mask, stone_mask, batch, num_graphs, legal_counts)
+#[pyfunction(name = "game_states_to_batch")]
+fn py_game_states_to_batch(
+    py: Python<'_>,
+    states: Vec<Py<PyGameState>>,
+) -> PyResult<(
+    Vec<f32>,   // features (flat)
+    Vec<i64>,   // edge_index_src
+    Vec<i64>,   // edge_index_dst
+    Vec<bool>,  // legal_mask
+    Vec<bool>,  // stone_mask
+    Vec<i64>,   // batch vector
+    usize,      // num_graphs
+    Vec<usize>, // legal_counts
+)> {
+    use crate::batch_tensors::collate_graphs;
+    use crate::graph::game_to_graph_raw;
+
+    let inner_states: Vec<_> = states.iter().map(|s| s.borrow(py).inner.clone()).collect();
+    let graphs: Vec<_> = inner_states.iter().map(|s| game_to_graph_raw(s)).collect();
+    let bt = collate_graphs(&graphs);
+    Ok((
+        bt.features,
+        bt.edge_index_src,
+        bt.edge_index_dst,
+        bt.legal_mask,
+        bt.stone_mask,
+        bt.batch,
+        bt.num_graphs,
+        bt.legal_counts,
+    ))
+}
+
 #[pymodule]
 fn hexo_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyGameConfig>()?;
@@ -835,6 +890,7 @@ fn hexo_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_gumbel_mcts, m)?)?;
     m.add_function(wrap_pyfunction!(py_game_to_graph_raw, m)?)?;
     m.add_function(wrap_pyfunction!(py_game_to_graph_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(py_game_states_to_batch, m)?)?;
     m.add_function(wrap_pyfunction!(py_game_to_axis_graph_raw, m)?)?;
     m.add_function(wrap_pyfunction!(py_game_to_axis_graph_batch, m)?)?;
     m.add_function(wrap_pyfunction!(py_augment_graph, m)?)?;
