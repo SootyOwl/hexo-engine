@@ -18,11 +18,56 @@ use std::time::SystemTime;
 
 use hexo_engine::game::{GameConfig, GameState};
 use hexo_engine::types::Coord;
+use hexo_rs::axis_graph::game_to_axis_graph_raw;
+use hexo_rs::graph::game_to_graph_raw;
 use hexo_rs::inference::{GraphType, TorchModel};
 use hexo_rs::mcts::MCTSConfig;
 
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
+
+/// Per-position data collected during self-play.
+struct PositionData {
+    /// Improved policy from MCTS (one float per legal move).
+    policy: Vec<f64>,
+    /// Current player at this position ("P1" or "P2").
+    player: &'static str,
+    /// Pre-built graph data (hex or axis) serialized as JSON.
+    graph_json: serde_json::Value,
+}
+
+/// Completed game data.
+struct GameResult {
+    positions: Vec<PositionData>,
+    winner: &'static str,
+}
+
+/// Serialize graph data to a JSON dict matching Python's `_raw_to_data` expectations.
+fn graph_data_to_json(g: &hexo_rs::graph::GraphData) -> serde_json::Value {
+    serde_json::json!({
+        "features": g.features,
+        "edge_src": g.edge_src,
+        "edge_dst": g.edge_dst,
+        "legal_mask": g.legal_mask,
+        "stone_mask": g.stone_mask,
+        "coords": g.coords,
+        "num_nodes": g.num_nodes,
+    })
+}
+
+/// Serialize axis graph data to a JSON dict matching Python's `_raw_to_axis_data` expectations.
+fn axis_graph_data_to_json(g: &hexo_rs::axis_graph::AxisGraphData) -> serde_json::Value {
+    serde_json::json!({
+        "features": g.features,
+        "edge_src": g.edge_src,
+        "edge_dst": g.edge_dst,
+        "edge_attr": g.edge_attr,
+        "legal_mask": g.legal_mask,
+        "stone_mask": g.stone_mask,
+        "coords": g.coords,
+        "num_nodes": g.num_nodes,
+    })
+}
 
 /// Play one complete game. Returns None if MCTS fails (e.g. model error).
 fn play_one_game(
@@ -30,12 +75,13 @@ fn play_one_game(
     game_config: GameConfig,
     mcts_config: &MCTSConfig,
     exploration: usize,
+    graph_type: GraphType,
     rng: &mut ChaCha8Rng,
-) -> Option<(Vec<((i32, i32), Vec<f64>, &'static str)>, &'static str)> {
+) -> Option<GameResult> {
     use hexo_rs::mcts::gumbel_mcts::gumbel_mcts;
 
     let mut game = GameState::with_config(game_config);
-    let mut trajectory = Vec::new();
+    let mut positions = Vec::new();
     let mut move_count = 0;
 
     let mut eval = |states: &[GameState]| -> (Vec<HashMap<Coord, f64>>, Vec<f64>) {
@@ -47,6 +93,12 @@ fn play_one_game(
             Some(hexo_engine::types::Player::P1) => "P1",
             Some(hexo_engine::types::Player::P2) => "P2",
             None => "?",
+        };
+
+        // Build graph from current position BEFORE making the move
+        let graph_json = match graph_type {
+            GraphType::Axis => axis_graph_data_to_json(&game_to_axis_graph_raw(&game)),
+            GraphType::Hex => graph_data_to_json(&game_to_graph_raw(&game)),
         };
 
         let result = match gumbel_mcts(&game, mcts_config, rng, &mut eval) {
@@ -76,7 +128,12 @@ fn play_one_game(
             result.action
         };
 
-        trajectory.push((action, result.improved_policy, current_player));
+        positions.push(PositionData {
+            policy: result.improved_policy,
+            player: current_player,
+            graph_json,
+        });
+
         if let Err(e) = game.apply_move(action) {
             eprintln!("Invalid move from MCTS: {e:?}, dropping game");
             return None;
@@ -90,28 +147,30 @@ fn play_one_game(
         None => "draw",
     };
 
-    Some((trajectory, winner))
+    Some(GameResult { positions, winner })
 }
 
-/// Serialize one game to JSON value.
-fn game_to_json(
-    trajectory: &[((i32, i32), Vec<f64>, &str)],
-    winner: &str,
-) -> serde_json::Value {
-    let moves: Vec<serde_json::Value> = trajectory
+/// Serialize one game to JSON: pre-built graph data with value targets.
+fn game_to_json(result: &GameResult) -> serde_json::Value {
+    let examples: Vec<serde_json::Value> = result.positions
         .iter()
-        .map(|(action, policy, cp)| {
-            serde_json::json!({
-                "action": [action.0, action.1],
-                "policy": policy,
-                "player": cp,
-            })
+        .map(|pos| {
+            let value: f64 = if result.winner == "draw" {
+                0.0
+            } else if result.winner == pos.player {
+                1.0
+            } else {
+                -1.0
+            };
+            let mut ex = pos.graph_json.clone();
+            ex.as_object_mut().unwrap().insert("policy".to_string(), serde_json::json!(pos.policy));
+            ex.as_object_mut().unwrap().insert("value".to_string(), serde_json::json!(value));
+            ex
         })
         .collect();
     serde_json::json!({
-        "winner": winner,
-        "moves": moves,
-        "length": trajectory.len(),
+        "length": result.positions.len(),
+        "examples": examples,
     })
 }
 
@@ -138,6 +197,7 @@ fn main() {
     let mut omp_threads: usize = 0;
     let mut continuous = false;
     let mut graph_type_str = "hex".to_string();
+    let mut jsonl_filename = "games.jsonl".to_string();
 
     let mut i = 1;
     while i < args.len() {
@@ -158,6 +218,7 @@ fn main() {
             "--omp" => { omp_threads = args[i + 1].parse().unwrap(); i += 2; }
             "--continuous" => { continuous = true; i += 1; }
             "--graph-type" => { graph_type_str = args[i + 1].clone(); i += 2; }
+            "--jsonl-filename" => { jsonl_filename = args[i + 1].clone(); i += 2; }
             _ => { eprintln!("Unknown arg: {}", args[i]); i += 1; }
         }
     }
@@ -246,7 +307,7 @@ fn main() {
                         let mut results = Vec::with_capacity(count);
                         for _ in 0..count {
                             if let Some(game) = play_one_game(
-                                &model, game_config, mcts_config, exploration, &mut rng,
+                                &model, game_config, mcts_config, exploration, graph_type, &mut rng,
                             ) {
                                 results.push(game);
                             }
@@ -259,10 +320,10 @@ fn main() {
         });
 
         let elapsed = start.elapsed();
-        let total_moves: usize = all_games.iter().map(|(t, _)| t.len()).sum();
+        let total_moves: usize = all_games.iter().map(|g| g.positions.len()).sum();
 
         let json: Vec<serde_json::Value> = all_games.iter()
-            .map(|(t, w)| game_to_json(t, w))
+            .map(|g| game_to_json(g))
             .collect();
         let tmp_path = format!("{}.tmp", output_path);
         fs::write(&tmp_path, serde_json::to_string(&json).unwrap())
@@ -280,7 +341,7 @@ fn main() {
         let dir = output_dir.unwrap_or_else(|| "self_play_output".to_string());
         fs::create_dir_all(&dir).expect("Failed to create output directory");
 
-        let jsonl_path = format!("{}/games.jsonl", dir);
+        let jsonl_path = format!("{}/{}", dir, jsonl_filename);
         let jsonl_file = fs::File::create(&jsonl_path)
             .expect("Failed to create games.jsonl");
         let shared_writer = Arc::new(Mutex::new(BufWriter::new(jsonl_file)));
@@ -314,10 +375,10 @@ fn main() {
 
                     while running.load(Ordering::Relaxed) {
                         // Play one game (skip failures)
-                        if let Some((trajectory, winner)) = play_one_game(
-                            &model, game_config, mcts_config, exploration, &mut rng,
+                        if let Some(result) = play_one_game(
+                            &model, game_config, mcts_config, exploration, graph_type, &mut rng,
                         ) {
-                            let json_val = game_to_json(&trajectory, winner);
+                            let json_val = game_to_json(&result);
                             if let Ok(line) = serde_json::to_string(&json_val) {
                                 let mut writer = shared_writer.lock().unwrap();
                                 if let Err(e) = writeln!(writer, "{}", line)
@@ -371,5 +432,111 @@ fn make_rng(seed: Option<u64>, thread_idx: u64, batch_idx: u64) -> ChaCha8Rng {
     match seed {
         Some(s) => ChaCha8Rng::seed_from_u64(s.wrapping_add(thread_idx * 1000 + batch_idx)),
         None => ChaCha8Rng::from_os_rng(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hex_graph_json_has_expected_keys() {
+        let game = GameState::with_config(GameConfig {
+            win_length: 4,
+            placement_radius: 4,
+            max_moves: 50,
+        });
+        let g = game_to_graph_raw(&game);
+        let json = graph_data_to_json(&g);
+        let obj = json.as_object().unwrap();
+        assert!(obj.contains_key("features"));
+        assert!(obj.contains_key("edge_src"));
+        assert!(obj.contains_key("edge_dst"));
+        assert!(obj.contains_key("legal_mask"));
+        assert!(obj.contains_key("stone_mask"));
+        assert!(obj.contains_key("coords"));
+        assert!(obj.contains_key("num_nodes"));
+        // Should NOT have edge_attr (hex graph)
+        assert!(!obj.contains_key("edge_attr"));
+
+        let n = obj["num_nodes"].as_u64().unwrap() as usize;
+        assert_eq!(obj["features"].as_array().unwrap().len(), n * 8);
+        assert_eq!(obj["legal_mask"].as_array().unwrap().len(), n);
+        assert_eq!(obj["stone_mask"].as_array().unwrap().len(), n);
+        assert_eq!(obj["coords"].as_array().unwrap().len(), n * 2);
+    }
+
+    #[test]
+    fn axis_graph_json_has_edge_attr() {
+        let game = GameState::with_config(GameConfig {
+            win_length: 4,
+            placement_radius: 4,
+            max_moves: 50,
+        });
+        let g = game_to_axis_graph_raw(&game);
+        let json = axis_graph_data_to_json(&g);
+        let obj = json.as_object().unwrap();
+        assert!(obj.contains_key("edge_attr"));
+        let e = obj["edge_src"].as_array().unwrap().len();
+        assert_eq!(obj["edge_attr"].as_array().unwrap().len(), e * 5);
+    }
+
+    #[test]
+    fn game_to_json_value_targets() {
+        // Simulate a 2-position game where P1 wins
+        let game = GameState::with_config(GameConfig {
+            win_length: 4,
+            placement_radius: 4,
+            max_moves: 50,
+        });
+        let g = game_to_graph_raw(&game);
+
+        let result = GameResult {
+            positions: vec![
+                PositionData {
+                    policy: vec![0.5, 0.5],
+                    player: "P1",
+                    graph_json: graph_data_to_json(&g),
+                },
+                PositionData {
+                    policy: vec![0.3, 0.7],
+                    player: "P2",
+                    graph_json: graph_data_to_json(&g),
+                },
+            ],
+            winner: "P1",
+        };
+
+        let json = game_to_json(&result);
+        let examples = json["examples"].as_array().unwrap();
+        assert_eq!(examples.len(), 2);
+        assert_eq!(examples[0]["value"].as_f64().unwrap(), 1.0);  // P1 wins, P1's turn
+        assert_eq!(examples[1]["value"].as_f64().unwrap(), -1.0); // P1 wins, P2's turn
+        assert_eq!(json["length"].as_u64().unwrap(), 2);
+        // Each example should have graph keys + policy + value
+        assert!(examples[0].as_object().unwrap().contains_key("features"));
+        assert!(examples[0].as_object().unwrap().contains_key("policy"));
+    }
+
+    #[test]
+    fn game_to_json_draw_value() {
+        let game = GameState::with_config(GameConfig {
+            win_length: 4,
+            placement_radius: 4,
+            max_moves: 50,
+        });
+        let g = game_to_graph_raw(&game);
+
+        let result = GameResult {
+            positions: vec![PositionData {
+                policy: vec![1.0],
+                player: "P1",
+                graph_json: graph_data_to_json(&g),
+            }],
+            winner: "draw",
+        };
+
+        let json = game_to_json(&result);
+        assert_eq!(json["examples"][0]["value"].as_f64().unwrap(), 0.0);
     }
 }
