@@ -11,6 +11,7 @@ use hexo_engine::types::{Coord, HEX_DIRS, Player};
 use hexo_engine::GameState;
 
 /// Raw graph data ready to be wrapped into PyG Data on the Python side.
+#[derive(serde::Serialize)]
 pub struct GraphData {
     /// Node features, flattened: N×8 row-major.
     pub features: Vec<f32>,

@@ -441,6 +441,37 @@ fn py_augment_graph(py: Python<'_>, game: &PyGameState) -> PyResult<Vec<(Py<PyAn
         .collect()
 }
 
+/// Produce 11 D6-augmented axis-window graph variants from a game state.
+///
+/// Returns list of (graph_dict, permutation) tuples.
+/// permutation[i] = original legal move index that maps to augmented index i.
+#[pyfunction(name = "augment_axis_graph")]
+fn py_augment_axis_graph(py: Python<'_>, game: &PyGameState) -> PyResult<Vec<(Py<PyAny>, Vec<usize>)>> {
+    if game.inner.is_terminal() {
+        return Err(PyValueError::new_err(
+            "Cannot augment graph for a terminal game state.",
+        ));
+    }
+
+    let augmented = crate::axis_graph::augment_axis_graph(&game.inner);
+
+    augmented
+        .into_iter()
+        .map(|(g, perm)| {
+            let dict = pyo3::types::PyDict::new(py);
+            dict.set_item("features", g.features)?;
+            dict.set_item("edge_src", g.edge_src)?;
+            dict.set_item("edge_dst", g.edge_dst)?;
+            dict.set_item("edge_attr", g.edge_attr)?;
+            dict.set_item("legal_mask", g.legal_mask)?;
+            dict.set_item("stone_mask", g.stone_mask)?;
+            dict.set_item("coords", g.coords)?;
+            dict.set_item("num_nodes", g.num_nodes)?;
+            Ok((dict.into(), perm))
+        })
+        .collect()
+}
+
 /// Call the Python eval_fn with a batch of GameStates.
 /// Must be called while holding the GIL.
 /// Returns Err on Python exceptions (including KeyboardInterrupt).
@@ -894,6 +925,7 @@ fn hexo_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_game_to_axis_graph_raw, m)?)?;
     m.add_function(wrap_pyfunction!(py_game_to_axis_graph_batch, m)?)?;
     m.add_function(wrap_pyfunction!(py_augment_graph, m)?)?;
+    m.add_function(wrap_pyfunction!(py_augment_axis_graph, m)?)?;
     m.add_function(wrap_pyfunction!(py_batched_self_play, m)?)?;
     #[cfg(feature = "torch")]
     m.add_function(wrap_pyfunction!(py_native_self_play, m)?)?;

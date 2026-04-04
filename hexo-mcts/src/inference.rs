@@ -26,14 +26,16 @@ pub enum GraphType {
 pub struct TorchModel {
     model: CModule,
     device: Device,
-    bf16: bool,
+    /// If the model uses a reduced-precision dtype (bf16 or fp16),
+    /// input tensors are cast to match before the forward pass.
+    float_kind: Kind,
     graph_type: GraphType,
 }
 
 impl TorchModel {
     /// Load a TorchScript model from a file.
     ///
-    /// Auto-detects bf16 models by checking the first parameter's dtype.
+    /// Auto-detects reduced-precision models by checking the first parameter's dtype.
     pub fn load(path: &str, device: Device) -> Result<Self, tch::TchError> {
         Self::load_with_graph_type(path, device, GraphType::Hex)
     }
@@ -45,18 +47,27 @@ impl TorchModel {
         graph_type: GraphType,
     ) -> Result<Self, tch::TchError> {
         let model = CModule::load_on_device(path, device)?;
-        // Detect bf16 by checking the first named parameter's dtype
-        let bf16 = model
+        let float_kind = model
             .named_parameters()
             .map(|params: Vec<(String, Tensor)>| {
-                params.first().map(|(_, t)| t.kind() == Kind::BFloat16).unwrap_or(false)
+                params.first().map(|(_, t)| t.kind()).unwrap_or(Kind::Float)
             })
-            .unwrap_or(false);
-        if bf16 {
-            eprintln!("Model loaded in bfloat16 mode");
+            .unwrap_or(Kind::Float);
+        match float_kind {
+            Kind::BFloat16 => eprintln!("Model loaded in bfloat16 mode"),
+            Kind::Half => eprintln!("Model loaded in float16 mode"),
+            _ => {}
         }
         eprintln!("Model graph_type: {:?}", graph_type);
-        Ok(TorchModel { model, device, bf16, graph_type })
+        Ok(TorchModel { model, device, float_kind, graph_type })
+    }
+
+    /// Build graph tensors for a batch of game states.
+    pub fn build_graphs(&self, states: &[GameState]) -> Vec<GraphTensors> {
+        match self.graph_type {
+            GraphType::Hex => states.iter().map(|s| build_graph_tensors(s)).collect(),
+            GraphType::Axis => states.iter().map(|s| build_axis_graph_tensors(s)).collect(),
+        }
     }
 
     /// Evaluate a batch of game states.
@@ -65,16 +76,16 @@ impl TorchModel {
     /// - logits_per_state[i] maps Coord → logit for state i
     /// - values[i] is the scalar value estimate
     pub fn evaluate(&self, states: &[GameState]) -> (Vec<HashMap<Coord, f64>>, Vec<f64>) {
-        let n = states.len();
+        let graphs = self.build_graphs(states);
+        self.forward_graphs(graphs)
+    }
+
+    /// Run model forward pass on pre-built graph tensors.
+    pub fn forward_graphs(&self, graphs: Vec<GraphTensors>) -> (Vec<HashMap<Coord, f64>>, Vec<f64>) {
+        let n = graphs.len();
         if n == 0 {
             return (vec![], vec![]);
         }
-
-        // Build batched graph tensors
-        let graphs: Vec<GraphTensors> = match self.graph_type {
-            GraphType::Hex => states.iter().map(|s| build_graph_tensors(s)).collect(),
-            GraphType::Axis => states.iter().map(|s| build_axis_graph_tensors(s)).collect(),
-        };
 
         // Concatenate into batched tensors
         let mut total_nodes = 0usize;
@@ -119,8 +130,8 @@ impl TorchModel {
         let mut x = Tensor::from_slice(&all_features)
             .reshape([total_nodes as i64, 8])
             .to_device(self.device);
-        if self.bf16 {
-            x = x.to_kind(Kind::BFloat16);
+        if self.float_kind != Kind::Float {
+            x = x.to_kind(self.float_kind);
         }
         let edge_index = Tensor::from_slice2(&[&all_edge_src, &all_edge_dst])
             .to_device(self.device);
@@ -147,8 +158,8 @@ impl TorchModel {
                 let mut edge_attr_tensor = Tensor::from_slice(&all_edge_attr)
                     .reshape([total_edges as i64, 5])
                     .to_device(self.device);
-                if self.bf16 {
-                    edge_attr_tensor = edge_attr_tensor.to_kind(Kind::BFloat16);
+                if self.float_kind != Kind::Float {
+                    edge_attr_tensor = edge_attr_tensor.to_kind(self.float_kind);
                 }
                 ivalues.push(tch::IValue::Tensor(edge_attr_tensor));
             }
@@ -165,7 +176,7 @@ impl TorchModel {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("Model forward failed: {e}");
-                let dummy_logits = states.iter().map(|_| HashMap::new()).collect();
+                let dummy_logits = (0..n).map(|_| HashMap::new()).collect();
                 return (dummy_logits, vec![0.0; n]);
             }
         };
@@ -179,14 +190,14 @@ impl TorchModel {
                     }
                     _ => {
                         eprintln!("Unexpected tensor types in model output");
-                        let dummy = states.iter().map(|_| HashMap::new()).collect();
+                        let dummy = (0..n).map(|_| HashMap::new()).collect();
                         return (dummy, vec![0.0; n]);
                     }
                 }
             }
             _ => {
                 eprintln!("Unexpected model output format");
-                let dummy = states.iter().map(|_| HashMap::new()).collect();
+                let dummy = (0..n).map(|_| HashMap::new()).collect();
                 return (dummy, vec![0.0; n]);
             }
         };
@@ -196,7 +207,7 @@ impl TorchModel {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("Failed to extract values: {e}");
-                return (states.iter().map(|_| HashMap::new()).collect(), vec![0.0; n]);
+                return ((0..n).map(|_| HashMap::new()).collect(), vec![0.0; n]);
             }
         };
 
@@ -205,14 +216,14 @@ impl TorchModel {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("Failed to extract counts: {e}");
-                return (states.iter().map(|_| HashMap::new()).collect(), vec![0.0; n]);
+                return ((0..n).map(|_| HashMap::new()).collect(), vec![0.0; n]);
             }
         };
         let all_logits_vec: Vec<f64> = match Vec::<f64>::try_from(all_logits_tensor.to_device(Device::Cpu)) {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("Failed to extract logits: {e}");
-                return (states.iter().map(|_| HashMap::new()).collect(), vec![0.0; n]);
+                return ((0..n).map(|_| HashMap::new()).collect(), vec![0.0; n]);
             }
         };
 
@@ -236,16 +247,72 @@ impl TorchModel {
 }
 
 /// Raw graph tensors for one game state.
-struct GraphTensors {
-    features: Vec<f32>,    // N*8 flat
-    edge_src: Vec<i64>,
-    edge_dst: Vec<i64>,
-    edge_attr: Option<Vec<f32>>,  // E*5 flat, only for axis graphs
-    legal_mask: Vec<bool>,
-    stone_mask: Vec<bool>,
-    legal_coords: Vec<Coord>,
-    num_nodes: usize,
-    num_edges: usize,
+pub struct GraphTensors {
+    pub features: Vec<f32>,    // N*8 flat
+    pub edge_src: Vec<i64>,
+    pub edge_dst: Vec<i64>,
+    pub edge_attr: Option<Vec<f32>>,  // E*5 flat, only for axis graphs
+    pub legal_mask: Vec<bool>,
+    pub stone_mask: Vec<bool>,
+    pub legal_coords: Vec<Coord>,
+    pub num_nodes: usize,
+    pub num_edges: usize,
+}
+
+impl GraphTensors {
+    /// Create from a hex graph reference (clones data).
+    pub fn from_hex(g: &crate::graph::GraphData) -> Self {
+        let legal_coords: Vec<Coord> = g.legal_mask.iter()
+            .enumerate()
+            .filter(|&(_, &is_legal)| is_legal)
+            .map(|(i, _)| (g.coords[i * 2], g.coords[i * 2 + 1]))
+            .collect();
+        let num_edges = g.edge_src.len();
+        GraphTensors {
+            features: g.features.clone(),
+            edge_src: g.edge_src.clone(),
+            edge_dst: g.edge_dst.clone(),
+            edge_attr: None,
+            legal_mask: g.legal_mask.clone(),
+            stone_mask: g.stone_mask.clone(),
+            legal_coords,
+            num_nodes: g.num_nodes,
+            num_edges,
+        }
+    }
+
+    /// Create from an axis graph reference (clones data).
+    pub fn from_axis(g: &crate::axis_graph::AxisGraphData) -> Self {
+        let legal_coords: Vec<Coord> = g.legal_mask.iter()
+            .enumerate()
+            .filter(|&(_, &is_legal)| is_legal)
+            .map(|(i, _)| (g.coords[i * 2], g.coords[i * 2 + 1]))
+            .collect();
+        let num_edges = g.edge_src.len();
+        GraphTensors {
+            features: g.features.clone(),
+            edge_src: g.edge_src.clone(),
+            edge_dst: g.edge_dst.clone(),
+            edge_attr: Some(g.edge_attr.clone()),
+            legal_mask: g.legal_mask.clone(),
+            stone_mask: g.stone_mask.clone(),
+            legal_coords,
+            num_nodes: g.num_nodes,
+            num_edges,
+        }
+    }
+}
+
+impl From<crate::graph::GraphData> for GraphTensors {
+    fn from(g: crate::graph::GraphData) -> Self {
+        Self::from_hex(&g)
+    }
+}
+
+impl From<crate::axis_graph::AxisGraphData> for GraphTensors {
+    fn from(g: crate::axis_graph::AxisGraphData) -> Self {
+        Self::from_axis(&g)
+    }
 }
 
 /// Build graph tensors from a game state (mirrors graph.rs::build_graph).

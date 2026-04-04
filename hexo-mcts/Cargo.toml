@@ -22,6 +22,7 @@ torch = ["tch", "serde_json", "ctrlc"]
 hexo-engine = { version = "0.1.0", path = "../hexo-engine" }
 pyo3 = { version = "0.28", optional = true }
 tch = { git = "https://github.com/LaurentMazare/tch-rs", branch = "main", optional = true }
+serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", optional = true }
 ctrlc = { version = "3", optional = true }
 rand = "0.9"
