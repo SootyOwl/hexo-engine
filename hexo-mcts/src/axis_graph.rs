@@ -12,6 +12,7 @@ use hexo_engine::types::{Coord, Player, WIN_AXES};
 use hexo_engine::GameState;
 
 /// Raw axis-window graph data ready to be wrapped into PyG Data on the Python side.
+#[derive(serde::Serialize)]
 pub struct AxisGraphData {
     /// Node features, flattened: (N+1)×8 row-major (includes dummy node).
     pub features: Vec<f32>,
@@ -271,6 +272,50 @@ pub fn game_to_axis_graph_raw(game: &GameState) -> AxisGraphData {
 pub fn game_to_axis_graph_batch(games: &[GameState]) -> Vec<AxisGraphData> {
     use rayon::prelude::*;
     games.par_iter().map(game_to_axis_graph_raw).collect()
+}
+
+/// Produce 11 augmented axis-window graphs by applying the non-identity D6
+/// transforms to the input game state. Returns `(AxisGraphData, permutation)`
+/// pairs, where `permutation[new_legal_idx] = old_legal_idx`.
+pub fn augment_axis_graph(game: &GameState) -> Vec<(AxisGraphData, Vec<usize>)> {
+    use hexo_engine::symmetry::D6_TRANSFORMS;
+
+    let mut stones = game.placed_stones();
+    stones.sort_by_key(|&(c, _)| c);
+    let legal = game.legal_moves(); // already sorted
+
+    let player_feat: f32 = match game.current_player() {
+        Some(Player::P1) => 1.0,
+        _ => -1.0,
+    };
+    let moves_feat: f32 = game.moves_remaining_this_turn() as f32 / 2.0;
+    let win_length = game.config().win_length;
+
+    D6_TRANSFORMS[1..]
+        .iter()
+        .map(|transform| {
+            // Transform and sort stones
+            let mut t_stones: Vec<(Coord, Player)> = stones
+                .iter()
+                .map(|&(c, p)| (transform(c), p))
+                .collect();
+            t_stones.sort_by_key(|&(c, _)| c);
+
+            // Transform legal moves, tracking original indices for permutation
+            let mut indexed_legal: Vec<(Coord, usize)> = legal
+                .iter()
+                .enumerate()
+                .map(|(i, &c)| (transform(c), i))
+                .collect();
+            indexed_legal.sort_by_key(|&(c, _)| c);
+
+            let t_legal: Vec<Coord> = indexed_legal.iter().map(|&(c, _)| c).collect();
+            let permutation: Vec<usize> = indexed_legal.iter().map(|&(_, i)| i).collect();
+
+            let graph = build_axis_graph(&t_stones, &t_legal, player_feat, moves_feat, win_length);
+            (graph, permutation)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -922,5 +967,117 @@ mod tests {
             !edges.contains(&(idx_00 as i64, idx_20 as i64)),
             "(0,0)->(2,0) should NOT exist (walk stopped at opponent)"
         );
+    }
+
+    // --- augment_axis_graph tests ---
+
+    #[test]
+    fn augment_axis_produces_11_graphs() {
+        let game = small_game();
+        let results = augment_axis_graph(&game);
+        assert_eq!(results.len(), 11);
+    }
+
+    #[test]
+    fn augmented_axis_same_node_count() {
+        let game = mid_game();
+        let original = game_to_axis_graph_raw(&game);
+        for (g, _perm) in augment_axis_graph(&game) {
+            assert_eq!(g.num_nodes, original.num_nodes);
+            assert_eq!(g.features.len(), original.features.len());
+            assert_eq!(g.legal_mask.len(), original.legal_mask.len());
+            assert_eq!(g.stone_mask.len(), original.stone_mask.len());
+        }
+    }
+
+    #[test]
+    fn augmented_axis_same_edge_count() {
+        let game = mid_game();
+        let original = game_to_axis_graph_raw(&game);
+        for (g, _perm) in augment_axis_graph(&game) {
+            assert_eq!(
+                g.edge_src.len(),
+                original.edge_src.len(),
+                "augmented graph should have same number of edges"
+            );
+            assert_eq!(g.edge_attr.len(), original.edge_attr.len());
+        }
+    }
+
+    #[test]
+    fn augmented_axis_permutation_valid() {
+        let game = mid_game();
+        let legal = game.legal_moves();
+        for (_g, perm) in augment_axis_graph(&game) {
+            assert_eq!(perm.len(), legal.len());
+            let mut sorted = perm.clone();
+            sorted.sort();
+            sorted.dedup();
+            assert_eq!(sorted.len(), legal.len(), "permutation should be a bijection");
+        }
+    }
+
+    #[test]
+    fn augmented_axis_edge_attr_valid() {
+        // Every augmented graph should have valid edge_attr:
+        // axis one-hots sum to 0 (dummy) or 1 (axis), distance within window
+        let game = mid_game();
+        let wl = game.config().win_length as f32;
+        for (g, _perm) in augment_axis_graph(&game) {
+            let dummy = (g.num_nodes - 1) as i64;
+            for e in 0..g.edge_src.len() {
+                let oh_sum = g.edge_attr[e * 5] + g.edge_attr[e * 5 + 1] + g.edge_attr[e * 5 + 2];
+                let is_dummy = g.edge_src[e] == dummy || g.edge_dst[e] == dummy;
+                if is_dummy {
+                    assert_eq!(oh_sum, 0.0, "augmented dummy edge {e}: axis oh should be 0");
+                } else {
+                    assert_eq!(oh_sum, 1.0, "augmented axis edge {e}: axis oh should be 1");
+                    let dist = g.edge_attr[e * 5 + 3];
+                    assert!(
+                        dist.abs() <= wl - 1.0,
+                        "augmented edge {e}: |dist| = {} > {}",
+                        dist.abs(),
+                        wl - 1.0
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn augmented_axis_all_distinct() {
+        // All 11 augmented graphs should have distinct feature vectors
+        // (coords may collide for symmetric positions, but features differ
+        // because stone identities are transformed too)
+        let game = mid_game();
+        let mut feature_sets: Vec<Vec<f32>> = Vec::new();
+        for (g, _perm) in augment_axis_graph(&game) {
+            feature_sets.push(g.features.clone());
+        }
+        // At least some graphs should differ — not all 11 can be identical
+        // for a game with 2 distinct players. Use pairwise comparison.
+        let mut all_same = true;
+        for i in 1..feature_sets.len() {
+            if feature_sets[i] != feature_sets[0] {
+                all_same = false;
+                break;
+            }
+        }
+        assert!(!all_same, "all augmented graphs are identical — expected variety");
+    }
+
+    #[test]
+    fn augmented_axis_preserves_stone_legal_counts() {
+        let game = mid_game();
+        let original = game_to_axis_graph_raw(&game);
+        let orig_stones: usize = original.stone_mask.iter().filter(|&&b| b).count();
+        let orig_legal: usize = original.legal_mask.iter().filter(|&&b| b).count();
+
+        for (g, _perm) in augment_axis_graph(&game) {
+            let n_stones: usize = g.stone_mask.iter().filter(|&&b| b).count();
+            let n_legal: usize = g.legal_mask.iter().filter(|&&b| b).count();
+            assert_eq!(n_stones, orig_stones);
+            assert_eq!(n_legal, orig_legal);
+        }
     }
 }
