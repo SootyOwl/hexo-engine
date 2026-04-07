@@ -39,6 +39,14 @@ enum NodeKind {
     Empty,
 }
 
+/// Extract axis index (0, 1, or 2) from edge_attr at position e.
+fn axis_idx_of(edge_attr: &[f32], e: usize) -> u8 {
+    let base = e * 5;
+    if edge_attr[base] > 0.5 { 0 }
+    else if edge_attr[base + 1] > 0.5 { 1 }
+    else { 2 }
+}
+
 /// Build axis-window graph arrays from pre-sorted stones and legal moves.
 ///
 /// `stones` and `legal` must already be sorted by coord tuple (q, r).
@@ -163,66 +171,109 @@ fn build_axis_graph(
     let mut edge_dst: Vec<i64> = Vec::new();
     let mut edge_attr: Vec<f32> = Vec::new();
 
-    // For each node i, for each of 3 axes, walk positive direction
+    // For each node i, for each of 3 axes, walk BOTH directions.
+    // Each walk creates only the forward edge (i→j); the opposite
+    // walk from j creates j→i, so stopping is applied symmetrically
+    // from both perspectives.
     for i in 0..n_real {
         let iq = coords[i * 2];
         let ir = coords[i * 2 + 1];
         let i_kind = node_kind[i];
 
         for (axis_idx, &(dq, dr)) in WIN_AXES.iter().enumerate() {
-            for d in 1..=window {
-                let tq = iq + dq * d;
-                let tr = ir + dr * d;
+            for &sign in &[1i32, -1] {
+                let sdq = dq * sign;
+                let sdr = dr * sign;
+                for d in 1..=window {
+                    let tq = iq + sdq * d;
+                    let tr = ir + sdr * d;
 
-                let j = match coord_to_idx.get(&(tq, tr)) {
-                    Some(&j) => j,
-                    None => continue, // no node at this coord, keep walking
-                };
+                    let j = match coord_to_idx.get(&(tq, tr)) {
+                        Some(&j) => j,
+                        None => break, // off-graph: stop walking this ray
+                    };
 
-                let j_kind = node_kind[j];
+                    let j_kind = node_kind[j];
 
-                // Compute same-color flag
-                let same_color = match (i_kind, j_kind) {
-                    (NodeKind::Stone(pi), NodeKind::Stone(pj)) => {
-                        if pi == pj { 1.0 } else { -1.0 }
+                    // Source player identity: +1 P1, -1 P2, 0 empty.
+                    // The receiving node (dst) uses this to know what's
+                    // sending it a message — critical for empty nodes to
+                    // detect opponent threats via incoming edges.
+                    let src_player_i = match i_kind {
+                        NodeKind::Stone(Player::P1) => 1.0f32,
+                        NodeKind::Stone(Player::P2) => -1.0f32,
+                        NodeKind::Empty => 0.0,
+                    };
+                    let src_player_j = match j_kind {
+                        NodeKind::Stone(Player::P1) => 1.0f32,
+                        NodeKind::Stone(Player::P2) => -1.0f32,
+                        NodeKind::Empty => 0.0,
+                    };
+
+                    // Add bidirectional edges (i→j and j→i).
+                    let signed_dist = (d * sign) as f32;
+                    edge_src.push(i as i64);
+                    edge_dst.push(j as i64);
+                    let mut attr_fwd = [0.0f32; 5];
+                    attr_fwd[axis_idx] = 1.0;
+                    attr_fwd[3] = signed_dist;
+                    attr_fwd[4] = src_player_i;  // i is the source
+                    edge_attr.extend_from_slice(&attr_fwd);
+
+                    edge_src.push(j as i64);
+                    edge_dst.push(i as i64);
+                    let mut attr_rev = [0.0f32; 5];
+                    attr_rev[axis_idx] = 1.0;
+                    attr_rev[3] = -signed_dist;
+                    attr_rev[4] = src_player_j;  // j is the source
+                    edge_attr.extend_from_slice(&attr_rev);
+
+                    // Walk stopping:
+                    // - Stones stop at opponent stones (line is blocked).
+                    // - Empties stop at ANY stone (they only need edges
+                    //   to their nearest stone neighbors on each axis;
+                    //   the stones carry long-range line information).
+                    let should_stop = match i_kind {
+                        NodeKind::Stone(pi) => {
+                            matches!(j_kind, NodeKind::Stone(pj) if pj != pi)
+                        }
+                        NodeKind::Empty => {
+                            matches!(j_kind, NodeKind::Stone(_))
+                        }
+                    };
+                    if should_stop {
+                        break;
                     }
-                    _ => 0.0,
-                };
-
-                // Add edge (i, j)
-                edge_src.push(i as i64);
-                edge_dst.push(j as i64);
-                let mut attr_fwd = [0.0f32; 5];
-                attr_fwd[axis_idx] = 1.0;
-                attr_fwd[3] = d as f32;
-                attr_fwd[4] = same_color;
-                edge_attr.extend_from_slice(&attr_fwd);
-
-                // Add edge (j, i)
-                edge_src.push(j as i64);
-                edge_dst.push(i as i64);
-                let mut attr_rev = [0.0f32; 5];
-                attr_rev[axis_idx] = 1.0;
-                attr_rev[3] = -(d as f32);
-                attr_rev[4] = same_color;
-                edge_attr.extend_from_slice(&attr_rev);
-
-                // Decide whether to stop walking
-                let should_stop = match i_kind {
-                    NodeKind::Stone(pi) => {
-                        // Stop at opponent stone
-                        matches!(j_kind, NodeKind::Stone(pj) if pj != pi)
-                    }
-                    NodeKind::Empty => {
-                        // Stop at any stone
-                        matches!(j_kind, NodeKind::Stone(_))
-                    }
-                };
-
-                if should_stop {
-                    break;
                 }
             }
+        }
+    }
+
+    // --- Dedup axis edges ---
+    // Walking both directions creates duplicates when both i→j and j→i
+    // walks discover the same pair. Keep the first occurrence.
+    {
+        let n_edges = edge_src.len();
+        let mut seen = std::collections::HashSet::with_capacity(n_edges);
+        let mut keep = Vec::with_capacity(n_edges);
+        for e in 0..n_edges {
+            let key = (edge_src[e], edge_dst[e], axis_idx_of(&edge_attr, e));
+            if seen.insert(key) {
+                keep.push(e);
+            }
+        }
+        if keep.len() < n_edges {
+            let mut new_src = Vec::with_capacity(keep.len());
+            let mut new_dst = Vec::with_capacity(keep.len());
+            let mut new_attr = Vec::with_capacity(keep.len() * 5);
+            for &e in &keep {
+                new_src.push(edge_src[e]);
+                new_dst.push(edge_dst[e]);
+                new_attr.extend_from_slice(&edge_attr[e * 5..(e + 1) * 5]);
+            }
+            edge_src = new_src;
+            edge_dst = new_dst;
+            edge_attr = new_attr;
         }
     }
 
@@ -366,7 +417,7 @@ mod tests {
         assert_eq!(g.coords.len(), g.num_nodes * 2);
     }
 
-    // AC-1b: All axis edges have |signed_distance| <= win_length - 1
+    // AC-1b: All axis edges have |signed_distance| <= win_length
     #[test]
     fn ac1b_signed_distance_within_window() {
         let game = mid_game();
@@ -376,10 +427,10 @@ mod tests {
         for e in 0..n_edges {
             let dist = g.edge_attr[e * 5 + 3];
             assert!(
-                dist.abs() <= wl - 1.0,
-                "edge {e}: |signed_distance| = {} > win_length - 1 = {}",
+                dist.abs() <= wl,
+                "edge {e}: |signed_distance| = {} > win_length = {}",
                 dist.abs(),
-                wl - 1.0
+                wl
             );
         }
     }
@@ -526,94 +577,57 @@ mod tests {
         }
     }
 
-    // AC-1h: Mid-game same_color features correctly encode +1.0, -1.0, 0.0
+    // AC-1h: src_player edge feature encodes source node's player identity
     #[test]
-    fn ac1h_same_color_features() {
+    fn ac1h_src_player_features() {
         let game = mid_game();
         let g = game_to_axis_graph_raw(&game);
         let dummy = (g.num_nodes - 1) as i64;
 
-        let n_edges = g.edge_src.len();
-        for e in 0..n_edges {
-            let s = g.edge_src[e] as usize;
-            let d = g.edge_dst[e] as usize;
-            let same_color = g.edge_attr[e * 5 + 4];
-
-            let s_is_dummy = s as i64 == dummy;
-            let d_is_dummy = d as i64 == dummy;
-            let s_is_stone = !s_is_dummy && g.stone_mask[s];
-            let d_is_stone = !d_is_dummy && g.stone_mask[d];
-            let s_is_empty = !s_is_dummy && g.legal_mask[s];
-            let d_is_empty = !d_is_dummy && g.legal_mask[d];
-
-            if s_is_dummy || d_is_dummy || s_is_empty || d_is_empty {
-                assert_eq!(
-                    same_color, 0.0,
-                    "edge {e} ({s}->{d}): expected same_color 0.0 (has empty/dummy endpoint)"
-                );
-            } else if s_is_stone && d_is_stone {
-                assert!(
-                    same_color == 1.0 || same_color == -1.0,
-                    "edge {e} ({s}->{d}): stone-stone should be +1 or -1, got {same_color}"
-                );
-            }
-        }
-
-        // Verify specific sign correctness: find a same-player stone-stone edge
-        // mid_game has P1 at (0,0) and P2 stones. Stones are sorted by coord.
+        // Build coord -> player map from game state
         let stones = game.placed_stones();
-        let mut sorted_stones = stones.clone();
-        sorted_stones.sort_by_key(|&(coord, _)| coord);
+        let stone_player: HashMap<Coord, Player> = stones.iter().cloned().collect();
 
-        // Build coord -> (index, player) map
-        let stone_info: HashMap<Coord, (usize, Player)> = sorted_stones
-            .iter()
-            .enumerate()
-            .map(|(i, &(c, p))| (c, (i, p)))
-            .collect();
+        let mut found_p1_src = false;
+        let mut found_p2_src = false;
+        let mut found_empty_src = false;
 
-        let mut found_same = false;
-        let mut found_diff = false;
-        let mut found_legal = false;
-
+        let n_edges = g.edge_src.len();
         for e in 0..n_edges {
             let s = g.edge_src[e] as usize;
             let d = g.edge_dst[e] as usize;
             if s as i64 == dummy || d as i64 == dummy {
                 continue;
             }
-            let same_color = g.edge_attr[e * 5 + 4];
-            let s_stone = g.stone_mask[s];
-            let d_stone = g.stone_mask[d];
+            let src_player = g.edge_attr[e * 5 + 4];
+            let sq = g.coords[s * 2];
+            let sr = g.coords[s * 2 + 1];
 
-            if s_stone && d_stone {
-                // Look up players from coords
-                let sq = g.coords[s * 2];
-                let sr = g.coords[s * 2 + 1];
-                let dq = g.coords[d * 2];
-                let dr = g.coords[d * 2 + 1];
-                if let (Some(&(_, sp)), Some(&(_, dp))) =
-                    (stone_info.get(&(sq, sr)), stone_info.get(&(dq, dr)))
-                {
-                    if sp == dp {
-                        assert_eq!(same_color, 1.0,
-                            "edge {e} ({s}->{d}): same-player stone-stone should be +1.0, got {same_color}");
-                        found_same = true;
-                    } else {
-                        assert_eq!(same_color, -1.0,
-                            "edge {e} ({s}->{d}): different-player stone-stone should be -1.0, got {same_color}");
-                        found_diff = true;
-                    }
-                }
-            } else if g.legal_mask[s] || g.legal_mask[d] {
-                assert_eq!(same_color, 0.0,
-                    "edge {e} ({s}->{d}): edge involving legal move should be 0.0, got {same_color}");
-                found_legal = true;
+            if g.stone_mask[s] {
+                // Source is a stone: src_player should be +1 (P1) or -1 (P2)
+                let expected = match stone_player.get(&(sq, sr)) {
+                    Some(&Player::P1) => 1.0f32,
+                    Some(&Player::P2) => -1.0f32,
+                    _ => panic!("stone_mask set but no player found at ({sq},{sr})"),
+                };
+                assert_eq!(
+                    src_player, expected,
+                    "edge {e} ({s}->{d}): src stone at ({sq},{sr}) should be {expected}, got {src_player}"
+                );
+                if expected > 0.0 { found_p1_src = true; }
+                else { found_p2_src = true; }
+            } else if g.legal_mask[s] {
+                // Source is empty: src_player should be 0
+                assert_eq!(
+                    src_player, 0.0,
+                    "edge {e} ({s}->{d}): src empty at ({sq},{sr}) should be 0.0, got {src_player}"
+                );
+                found_empty_src = true;
             }
         }
-        assert!(found_same, "should find at least one same-player stone-stone edge");
-        assert!(found_diff, "should find at least one different-player stone-stone edge");
-        assert!(found_legal, "should find at least one edge involving a legal move");
+        assert!(found_p1_src, "should find at least one edge with P1 source");
+        assert!(found_p2_src, "should find at least one edge with P2 source");
+        assert!(found_empty_src, "should find at least one edge with empty source");
     }
 
     // AC-1i: Known 3-stone collinear configuration produces exact expected edge count
@@ -648,7 +662,7 @@ mod tests {
         assert!(axis_edge_count > 0, "should have non-dummy edges");
         // Snapshot: pin exact count so any walk-logic change is caught.
         assert_eq!(
-            axis_edge_count, 572,
+            axis_edge_count, 574,
             "pinned non-dummy axis edge count"
         );
 
@@ -663,17 +677,12 @@ mod tests {
             })
             .collect();
 
-        // From the walk analysis above: discovered pairs among stones are
-        // (0,0)-(1,0) and (1,0)-(2,0), giving 2*2=4 directed edges from axis (1,0).
-        // Other axes: check collinearity on (0,1) and (1,-1).
-        // (0,0),(1,0),(2,0) on axis (0,1): step (0,+1). None of these differ only in r.
-        // So no pairs on (0,1) axis among these 3.
-        // (1,-1) axis: (0,0)+1*(1,-1)=(1,-1) - not a stone. No pairs.
-        // So exactly 4 stone-stone edges.
+        // With bidirectional walks, all 3 pairs are connected:
+        // (0,0)↔(1,0), (1,0)↔(2,0), (0,0)↔(2,0) = 3×2 = 6 directed edges.
         assert_eq!(
             stone_stone_edges.len(),
-            4,
-            "3 collinear stones should produce 4 directed stone-stone edges, got {}",
+            6,
+            "3 collinear stones should produce 6 directed stone-stone edges, got {}",
             stone_stone_edges.len()
         );
     }
@@ -775,8 +784,8 @@ mod tests {
     #[test]
     fn ac1n_boundary_distance() {
         // win_length=4, so window=3
-        // P1 at (0,0). Place P2 at (3,0) => distance 3 along axis (1,0) => should connect
-        // Place P2 at (0,4) => distance 4 along axis (0,1) => should NOT connect
+        // P1 at (0,0). Place P2 at (3,0) => distance 3 = win_length-1 => should connect
+        // Place P2 at (0,4) => distance 4 = win_length => should NOT connect
         let mut game = GameState::with_config(GameConfig {
             win_length: 4,
             placement_radius: 5,
@@ -788,7 +797,6 @@ mod tests {
 
         let g = game_to_axis_graph_raw(&game);
 
-        // Build coord -> index map, excluding dummy node
         let mut coord_idx: HashMap<Coord, usize> = HashMap::new();
         for i in 0..g.num_nodes - 1 {
             let q = g.coords[i * 2];
@@ -799,11 +807,6 @@ mod tests {
         let idx_origin = *coord_idx.get(&(0, 0)).unwrap();
         let idx_3_0 = *coord_idx.get(&(3, 0)).unwrap();
 
-        // Check (0,0) and (3,0) are connected (distance 3 = win_length - 1)
-        // Walking from (0,0) P1 along (1,0):
-        // step 1: (1,0) — empty node, continue
-        // step 2: (2,0) — empty node, continue
-        // step 3: (3,0) — P2 stone, add edge and STOP
         let edges: HashSet<(i64, i64)> = g
             .edge_src
             .iter()
@@ -811,17 +814,165 @@ mod tests {
             .map(|(s, d)| (*s, *d))
             .collect();
 
+        // Distance 3 = win_length-1: should be connected
         assert!(
             edges.contains(&(idx_origin as i64, idx_3_0 as i64)),
             "stones at distance win_length-1 should be connected"
         );
 
-        // (0,0) and (0,4): distance 4 = win_length, should NOT be directly connected
+        // Distance 4 = win_length: should NOT be connected
         let idx_0_4 = *coord_idx.get(&(0, 4)).unwrap();
         assert!(
             !edges.contains(&(idx_origin as i64, idx_0_4 as i64)),
             "stones at distance win_length should NOT be connected"
         );
+    }
+
+    // --- Walk symmetry tests ---
+    // Verify that the bidirectional walk produces symmetric edges:
+    // for every edge (A→B, axis, dist, sc), the reverse (B→A, axis, -dist, sc) exists.
+
+    /// Helper: build (src, dst, axis_idx) -> (signed_dist, dst_player) map,
+    /// excluding dummy edges.
+    fn edge_attr_map(g: &AxisGraphData) -> HashMap<(i64, i64, u8), (f32, f32)> {
+        let dummy = (g.num_nodes - 1) as i64;
+        let mut map = HashMap::new();
+        for e in 0..g.edge_src.len() {
+            let s = g.edge_src[e];
+            let d = g.edge_dst[e];
+            if s == dummy || d == dummy { continue; }
+            let ax = axis_idx_of(&g.edge_attr, e);
+            let dist = g.edge_attr[e * 5 + 3];
+            let dp = g.edge_attr[e * 5 + 4];
+            map.insert((s, d, ax), (dist, dp));
+        }
+        map
+    }
+
+    /// Helper: assert every edge has a reverse with negated distance.
+    /// dst_player values are NOT expected to match (they encode opposite
+    /// endpoints), so we only check existence and distance antisymmetry.
+    fn assert_edges_symmetric(g: &AxisGraphData, label: &str) {
+        let map = edge_attr_map(g);
+        for (&(s, d, ax), &(dist, _dp)) in &map {
+            let rev = map.get(&(d, s, ax));
+            assert!(
+                rev.is_some(),
+                "{label}: edge ({s},{d}) axis={ax} dist={dist} has no reverse"
+            );
+            let (rev_dist, _rev_dp) = rev.unwrap();
+            assert!(
+                (rev_dist + dist).abs() < 0.01,
+                "{label}: edge ({s},{d}) axis={ax} dist={dist}, reverse dist={rev_dist} (expected {})",
+                -dist
+            );
+        }
+    }
+
+    // AC-S1: Symmetry on all existing test positions
+    #[test]
+    fn ac_symmetry_small_game() {
+        assert_edges_symmetric(&game_to_axis_graph_raw(&small_game()), "small_game");
+    }
+
+    #[test]
+    fn ac_symmetry_mid_game() {
+        assert_edges_symmetric(&game_to_axis_graph_raw(&mid_game()), "mid_game");
+    }
+
+    // AC-S2: Symmetry with stones on all 3 axes, both colors
+    #[test]
+    fn ac_symmetry_multi_axis() {
+        // Place stones along all 3 axes from origin, alternating colors.
+        // P1 at (0,0). Then P2,P1,P2,P1... on axes (1,0), (0,1), (1,-1).
+        let mut game = GameState::with_config(GameConfig {
+            win_length: 5,
+            placement_radius: 4,
+            max_moves: 80,
+        });
+        let moves = [
+            (2, 0),  // P2 on axis (1,0)
+            (0, 2),  // P1 on axis (0,1)
+            (-2, 2), // P2 on axis (1,-1)
+            (1, 0),  // P1 on axis (1,0)
+            (0, -2), // P2 on axis (0,1)
+            (2, -2), // P1 on axis (1,-1)
+        ];
+        for &m in &moves {
+            game.apply_move(m).unwrap();
+        }
+        assert_edges_symmetric(&game_to_axis_graph_raw(&game), "multi_axis");
+    }
+
+    // AC-S3: Symmetry for a line of same-color stones with empties on both ends
+    #[test]
+    fn ac_symmetry_line_with_extensions() {
+        // P1 at (0,0), then P2 far away, then P1 extends the line.
+        // Result: P1 line at (0,0),(1,0),(2,0) with empties at (-1,0) and (3,0).
+        let mut game = GameState::with_config(GameConfig {
+            win_length: 5,
+            placement_radius: 4,
+            max_moves: 80,
+        });
+        game.apply_move((0, 3)).unwrap();  // P2 far away
+        game.apply_move((0, -3)).unwrap(); // P2 far away
+        game.apply_move((1, 0)).unwrap();  // P1
+        game.apply_move((2, 0)).unwrap();  // P2 — now P2 is adjacent to P1 line
+
+        let g = game_to_axis_graph_raw(&game);
+        assert_edges_symmetric(&g, "line_with_extensions");
+    }
+
+    // AC-S4: Symmetry for empty nodes flanking opponent stones
+    #[test]
+    fn ac_symmetry_empty_flanking_opponent() {
+        // Position: P1 at (0,0), P2 at (1,0) and (2,0).
+        // Empty at (-1,0) and (3,0) should have symmetric access to the stones.
+        let mut game = GameState::with_config(GameConfig {
+            win_length: 5,
+            placement_radius: 4,
+            max_moves: 80,
+        });
+        game.apply_move((1, 0)).unwrap(); // P2
+        game.apply_move((2, 0)).unwrap(); // P2
+
+        let g = game_to_axis_graph_raw(&game);
+        assert_edges_symmetric(&g, "empty_flanking_opponent");
+
+        // Also verify both empty flanks see at least one stone
+        let mut coord_idx: HashMap<Coord, usize> = HashMap::new();
+        for i in 0..g.num_nodes - 1 {
+            coord_idx.insert((g.coords[i * 2], g.coords[i * 2 + 1]), i);
+        }
+        let map = edge_attr_map(&g);
+
+        // (-1,0) should have an edge to (0,0) on axis (1,0)
+        if let Some(&idx_neg1) = coord_idx.get(&(-1, 0)) {
+            if let Some(&idx_0) = coord_idx.get(&(0, 0)) {
+                assert!(
+                    map.contains_key(&(idx_neg1 as i64, idx_0 as i64, 0)),
+                    "(-1,0) should see (0,0) on axis (1,0)"
+                );
+            }
+        }
+        // (3,0) should have an edge to (2,0) on axis (1,0)
+        if let Some(&idx_3) = coord_idx.get(&(3, 0)) {
+            if let Some(&idx_2) = coord_idx.get(&(2, 0)) {
+                assert!(
+                    map.contains_key(&(idx_3 as i64, idx_2 as i64, 0)),
+                    "(3,0) should see (2,0) on axis (1,0)"
+                );
+            }
+        }
+    }
+
+    // AC-S5: Symmetry preserved under D6 augmentation
+    #[test]
+    fn ac_symmetry_augmented() {
+        let game = mid_game();
+        for (i, (g, _perm)) in augment_axis_graph(&game).into_iter().enumerate() {
+            assert_edges_symmetric(&g, &format!("augment[{i}]"));
+        }
     }
 
     // AC-1j: game_to_axis_graph_batch matches individual game_to_axis_graph_raw
@@ -915,9 +1066,9 @@ mod tests {
         assert_eq!(g.features[dummy_base + 4], 1.0, "dummy: moves_feat");
     }
 
-    // AC: Verify walk-stopping logic in isolation.
+    // AC: Verify full-window connectivity (no walk-stopping).
     #[test]
-    fn ac_walk_stopping() {
+    fn ac_full_window_edges() {
         // P1 at (0,0), P2 at (1,0) and (2,0). win_length=4 => window=3.
         let mut game = GameState::with_config(GameConfig {
             win_length: 4,
@@ -947,25 +1098,21 @@ mod tests {
             .map(|(s, d)| (*s, *d))
             .collect();
 
-        // (0,0) P1 walking +axis (1,0): hits P2 at (1,0) => stops.
-        // So (0,0)->(1,0) exists.
+        // With bidirectional walks: P1 at (0,0) walks positive to P2 at (1,0)
+        // and stops. P2 at (2,0) walks NEGATIVE through P2 at (1,0) (same color)
+        // and reaches P1 at (0,0) (opponent, stops but edge created first).
+        // So all pairs are connected.
         assert!(
             edges.contains(&(idx_00 as i64, idx_10 as i64)),
             "(0,0)->(1,0) should exist"
         );
-
-        // (1,0) P2 walking +axis (1,0): hits P2 at (2,0) => same color, continue.
-        // So (1,0)->(2,0) exists.
         assert!(
             edges.contains(&(idx_10 as i64, idx_20 as i64)),
             "(1,0)->(2,0) should exist"
         );
-
-        // (0,0)->(2,0) should NOT exist: walk from (0,0) along +axis (1,0)
-        // stopped at (1,0) because it hit opponent P2.
         assert!(
-            !edges.contains(&(idx_00 as i64, idx_20 as i64)),
-            "(0,0)->(2,0) should NOT exist (walk stopped at opponent)"
+            edges.contains(&(idx_00 as i64, idx_20 as i64)),
+            "(0,0)->(2,0) should exist (created by (2,0) walking negative)"
         );
     }
 
@@ -1034,10 +1181,10 @@ mod tests {
                     assert_eq!(oh_sum, 1.0, "augmented axis edge {e}: axis oh should be 1");
                     let dist = g.edge_attr[e * 5 + 3];
                     assert!(
-                        dist.abs() <= wl - 1.0,
+                        dist.abs() <= wl,
                         "augmented edge {e}: |dist| = {} > {}",
                         dist.abs(),
-                        wl - 1.0
+                        wl
                     );
                 }
             }

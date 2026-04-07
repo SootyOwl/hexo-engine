@@ -120,16 +120,17 @@ where
         gumbel_top_k(&logits, config.m_actions, rng);
 
     // Step 3.5: Check for immediate winning moves among candidates
-    // If any candidate action leads to a terminal win, skip expensive sequential halving
+    // If any candidate action leads to a terminal win, skip expensive sequential halving.
+    // Return a one-hot improved policy on the winning move (the search hasn't
+    // visited any children yet, so compute_improved_policy would just return
+    // the raw softmax which is uninformative).
     for &idx in &candidate_indices {
         let coord = coords[idx];
         let mut test_game = game.clone();
         if test_game.apply_move(coord).is_ok() && test_game.is_terminal() {
             if test_game.winner() == game.current_player() {
-                // Found a winning move — return immediately
-                let improved_policy = compute_improved_policy(
-                    &logits, &coords, &root, config.c_visit, config.c_scale,
-                );
+                let mut improved_policy = vec![0.0; coords.len()];
+                improved_policy[idx] = 1.0;
                 return Ok(MCTSResult {
                     action: coord,
                     improved_policy,
@@ -566,6 +567,59 @@ mod tests {
             result.action,
             winning_moves,
         );
+    }
+
+    /// Regression: early-termination on a winning move must return a one-hot
+    /// improved policy, not the raw softmax (which was the old buggy behavior
+    /// when compute_improved_policy was called before any simulations ran).
+    #[test]
+    fn gumbel_mcts_winning_move_returns_one_hot_policy() {
+        let config_game = GameConfig {
+            win_length: 2,
+            placement_radius: 2,
+            max_moves: 80,
+        };
+        let mut game = GameState::with_config(config_game);
+        game.apply_move((2, 0)).unwrap();
+        game.apply_move((-2, 0)).unwrap();
+
+        let config = MCTSConfig {
+            n_simulations: 64,
+            m_actions: 16,
+            c_visit: 50,
+            c_scale: 1.0,
+        };
+
+        // Run multiple seeds to cover both early-exit and full-search paths
+        // (early exit triggers only when a winning move is among the Gumbel
+        // candidates, which depends on the random sample).
+        for seed in 0..20 {
+            let mut rng = ChaCha8Rng::seed_from_u64(seed);
+            let result = gumbel_mcts(&game, &config, &mut rng, &mut dummy_eval).unwrap();
+
+            // Find the winning action's index in the policy
+            let action_idx = result.coords.iter()
+                .position(|&c| c == result.action)
+                .expect("action must be in coords");
+
+            // The action must be a winning move
+            let mut test_game = game.clone();
+            test_game.apply_move(result.action).unwrap();
+            assert!(test_game.is_terminal(), "seed {seed}: action should win");
+
+            // Policy must be one-hot on the winning move
+            assert_eq!(
+                result.improved_policy[action_idx], 1.0,
+                "seed {seed}: winning move should have probability 1.0, got {}",
+                result.improved_policy[action_idx],
+            );
+            for (i, &p) in result.improved_policy.iter().enumerate() {
+                if i != action_idx {
+                    assert_eq!(p, 0.0,
+                        "seed {seed}: non-winning move {i} should have probability 0.0, got {p}");
+                }
+            }
+        }
     }
 
     /// REQ-0e-bis smoke test: with `dedup_skip`, running the same search
