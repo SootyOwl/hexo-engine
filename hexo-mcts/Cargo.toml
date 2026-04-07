@@ -17,6 +17,17 @@ crate-type = ["cdylib", "rlib"]
 [features]
 python = ["pyo3"]
 torch = ["tch", "serde_json", "ctrlc"]
+# Phase 0 DAG-MCTS measurement spike: instruments tree MCTS expansion with a
+# throwaway canonical-serialisation fingerprint to count would-be dedup hits.
+# Zero impact when disabled.
+dedup_count = ["dep:xxhash-rust", "dep:rustc-hash"]
+# Phase 0 REQ-0e-bis: wall-clock upper-bound prototype. Adds an in-search
+# eval cache keyed by canonical fingerprint; when a leaf state hits the
+# cache, the network forward pass is skipped and the cached
+# (policy_logits, value) pair is reused. This is NOT real DAG MCGS (no
+# recursive-Q backprop, no node sharing), so the wall-clock delta vs.
+# dedup_count alone is a strict upper bound on what full DAG MCGS can save.
+dedup_skip = ["dedup_count"]
 
 [dependencies]
 hexo-engine = { version = "0.1.0", path = "../hexo-engine" }
@@ -28,7 +39,17 @@ ctrlc = { version = "3", optional = true }
 rand = "0.9"
 rand_chacha = "0.9"
 rayon = "1.10"
+xxhash-rust = { version = "0.8", features = ["xxh3"], optional = true }
+rustc-hash = { version = "2", optional = true }
 
 [[bin]]
 name = "self_play"
 required-features = ["torch"]
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+rustc-hash = "2"
+
+[[bench]]
+name = "bench_dag_backprop"
+harness = false
