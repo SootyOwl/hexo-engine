@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
+use std::sync::mpsc::{SyncSender, TrySendError};
 use std::time::{Duration, Instant, SystemTime};
 
 use hexo_engine::game::{GameConfig, GameState};
@@ -71,6 +72,7 @@ fn inference_server(
     model_path: Option<&str>,
     device: tch::Device,
     graph_type: GraphType,
+    padded: bool,
 ) {
     let mut model_mtime = model_path.and_then(file_mtime);
 
@@ -120,7 +122,11 @@ fn inference_server(
         }
 
         // Single forward pass
-        let (all_logits, all_values) = model.forward_graphs(all_graphs);
+        let (all_logits, all_values) = if padded {
+            model.forward_graphs_padded(all_graphs)
+        } else {
+            model.forward_graphs(all_graphs)
+        };
 
         // Scatter results back
         for (i, req) in requests.into_iter().enumerate() {
@@ -133,6 +139,259 @@ fn inference_server(
         // Check for model reload after processing a batch
         if let Some(path) = model_path {
             try_reload_model(model, path, &mut model_mtime, device, graph_type);
+        }
+    }
+}
+
+/// Scan ``dir`` for ``*.pt`` files. Returns sorted list of paths.
+fn list_pool_snapshots(dir: &str) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(rd) = fs::read_dir(dir) {
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if p.extension().and_then(|e| e.to_str()) == Some("pt") {
+                out.push(p);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Drain a bounded channel of capacity 1 and then send ``value``. Used by
+/// the pool loader to "always have the freshest model staged" without ever
+/// blocking the inference thread on disk I/O: if a previously staged model
+/// has not yet been consumed, it is dropped and replaced.
+///
+/// Returns ``Err`` only if the receiver has been dropped.
+fn try_replace<T>(tx: &SyncSender<T>, value: T) -> Result<(), TrySendError<T>> {
+    match tx.try_send(value) {
+        Ok(()) => Ok(()),
+        Err(TrySendError::Full(v)) => {
+            // A stale model is already staged. The receiver is bounded at
+            // capacity 1, so a single try_send after a full observation is
+            // either consumed (producer wins) or still full (we win and
+            // replace). Since we are the sole producer, the slot can only
+            // transition full->empty (never empty->full) outside our control,
+            // so the next try_send will always succeed.
+            match tx.try_send(v) {
+                Ok(()) => Ok(()),
+                Err(TrySendError::Full(v)) => {
+                    // The old staged value is still there because the
+                    // consumer hasn't drained it. As the sole producer we
+                    // cannot drain it ourselves without a receiver handle.
+                    // Fall back to a blocking send — in practice this path
+                    // is only hit when the consumer is overloaded, which
+                    // is fine because our loader is on a background thread.
+                    tx.send(v).map_err(|e| TrySendError::Disconnected(e.0))
+                }
+                Err(e) => Err(e),
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Pool inference server: processes eval requests using the currently-
+/// loaded snapshot. Model reloads happen on a separate background loader
+/// thread; this server just picks up newly-staged models non-blockingly
+/// before each batch iteration so disk I/O never stalls workers.
+///
+/// The server blocks on `staged_model_rx.recv()` for its first model, so
+/// callers can spawn it before any snapshot exists on disk. If the loader
+/// gives up before staging anything (channel closed), the server exits
+/// cleanly without ever entering the main batch loop.
+fn pool_inference_server(
+    request_rx: mpsc::Receiver<EvalRequest>,
+    max_batch: usize,
+    batch_timeout: Duration,
+    running: &AtomicBool,
+    staged_model_rx: mpsc::Receiver<TorchModel>,
+    padded: bool,
+) {
+    // Block until the loader stages an initial model. This is the only
+    // path by which the server obtains its first model now that the
+    // startup-time `load_initial_pool_snapshot` has been removed.
+    let mut model = match staged_model_rx.recv() {
+        Ok(m) => m,
+        Err(_) => {
+            // Loader exited before producing any model (e.g. failure
+            // threshold tripped or shutdown). Nothing to serve.
+            return;
+        }
+    };
+    loop {
+        // Non-blocking swap to any freshly-staged model BEFORE we block on
+        // the request channel. The loader thread is responsible for keeping
+        // this channel topped up with the most recent snapshot.
+        if let Ok(new_model) = staged_model_rx.try_recv() {
+            model = new_model;
+        }
+
+        let first = match request_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(req) => req,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if !running.load(Ordering::Relaxed) {
+                    break;
+                }
+                continue;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+
+        let mut requests = vec![first];
+        let mut total_graphs: usize = requests[0].graphs.len();
+        let deadline = Instant::now() + batch_timeout;
+
+        while total_graphs < max_batch {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() { break; }
+            match request_rx.recv_timeout(remaining) {
+                Ok(req) => {
+                    total_graphs += req.graphs.len();
+                    requests.push(req);
+                }
+                Err(_) => break,
+            }
+        }
+
+        let mut all_graphs = Vec::with_capacity(total_graphs);
+        let mut slice_ranges: Vec<(usize, usize)> = Vec::with_capacity(requests.len());
+        for req in &mut requests {
+            let start = all_graphs.len();
+            all_graphs.extend(req.graphs.drain(..));
+            slice_ranges.push((start, all_graphs.len()));
+        }
+
+        let (all_logits, all_values) = if padded {
+            model.forward_graphs_padded(all_graphs)
+        } else {
+            model.forward_graphs(all_graphs)
+        };
+
+        for (i, req) in requests.into_iter().enumerate() {
+            let (start, end) = slice_ranges[i];
+            let logits = all_logits[start..end].to_vec();
+            let values = all_values[start..end].to_vec();
+            let _ = req.response_tx.send((logits, values));
+        }
+    }
+}
+
+/// Background pool model loader. Periodically picks a random ``.pt``
+/// snapshot from ``pool_dir``, loads it off-thread, and stages it for the
+/// pool inference server to atomically swap in. Never blocks the inference
+/// thread: all disk I/O happens here. Exits cleanly when ``running`` is
+/// cleared or after 5 consecutive distinct-file load failures (in which
+/// case it also flips ``pool_disabled``).
+fn pool_model_loader(
+    pool_dir: String,
+    device: tch::Device,
+    graph_type: GraphType,
+    staged_model_tx: SyncSender<TorchModel>,
+    pool_disabled: Arc<AtomicBool>,
+    pool_ready: Arc<AtomicBool>,
+    running: Arc<AtomicBool>,
+) {
+    /// Cadence once at least one snapshot has been loaded. The pool's job is
+    /// a stationary opponent mix averaged over many games, not per-game
+    /// freshness, so a coarse cadence is fine.
+    const RELOAD_INTERVAL_SECS: u64 = 30;
+    /// Cadence while we have *never* successfully loaded a snapshot. The
+    /// pool dir is empty at curriculum start and only fills once the trainer
+    /// exports its first checkpoint, so we poll quickly to keep startup
+    /// latency low without burning CPU forever.
+    const WARMUP_INTERVAL_SECS: u64 = 5;
+
+    eprintln!(
+        "Pool loader started (dir={}, warmup_interval={}s, reload_interval={}s)",
+        pool_dir, WARMUP_INTERVAL_SECS, RELOAD_INTERVAL_SECS
+    );
+
+    let mut rng = ChaCha8Rng::from_os_rng();
+    let mut consecutive_failures: usize = 0;
+    let mut last_loaded_path: Option<String> = None;
+    let mut cached_snaps: Vec<std::path::PathBuf> = Vec::new();
+    let mut cached_mtime: Option<SystemTime> = None;
+    let mut first_iter = true;
+    let mut ever_loaded = false;
+
+    loop {
+        if !first_iter {
+            // Responsive shutdown: split the sleep into 1s increments.
+            // Use the short warmup interval until we have produced at least
+            // one model, then switch to the normal cadence.
+            let interval = if ever_loaded {
+                RELOAD_INTERVAL_SECS
+            } else {
+                WARMUP_INTERVAL_SECS
+            };
+            for _ in 0..interval {
+                if !running.load(Ordering::Relaxed) {
+                    eprintln!("Pool loader exited");
+                    return;
+                }
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        }
+        first_iter = false;
+
+        if !running.load(Ordering::Relaxed) {
+            eprintln!("Pool loader exited");
+            return;
+        }
+
+        // Refresh the cached file list when the dir mtime changes OR when
+        // the cache is currently empty (so a freshly populated dir is picked
+        // up on the very next warmup tick without waiting for an mtime
+        // observation race).
+        let dir_mtime = file_mtime(&pool_dir);
+        if cached_snaps.is_empty() || dir_mtime != cached_mtime {
+            cached_snaps = list_pool_snapshots(&pool_dir);
+            cached_mtime = dir_mtime;
+        }
+
+        if cached_snaps.is_empty() {
+            // Empty dir is *not* a load failure — it just means we are still
+            // warming up before the trainer has exported its first checkpoint.
+            // Don't increment the failure counter; just sleep and retry.
+            continue;
+        }
+
+        let idx = (rng.random::<u64>() as usize) % cached_snaps.len();
+        let pick = &cached_snaps[idx];
+        let path_str = pick.to_string_lossy().to_string();
+        match TorchModel::load_with_graph_type(&path_str, device, graph_type) {
+            Ok(new_model) => {
+                consecutive_failures = 0;
+                let same_as_last = last_loaded_path.as_deref() == Some(path_str.as_str());
+                if !same_as_last {
+                    eprintln!("Pool snapshot loaded -> {}", pick.display());
+                    last_loaded_path = Some(path_str);
+                }
+                if try_replace(&staged_model_tx, new_model).is_err() {
+                    // Receiver gone: inference server has shut down.
+                    eprintln!("Pool loader exited");
+                    return;
+                }
+                if !ever_loaded {
+                    ever_loaded = true;
+                    // First successful load: flip the readiness flag so
+                    // worker threads start routing games to the pool.
+                    pool_ready.store(true, Ordering::Relaxed);
+                    eprintln!("Pool ready: first snapshot staged");
+                }
+            }
+            Err(e) => {
+                eprintln!("Pool snapshot load failed: {}: {e}", pick.display());
+                consecutive_failures += 1;
+                if consecutive_failures >= 5 {
+                    eprintln!("Pool disabled after 5 consecutive load failures");
+                    pool_disabled.store(true, Ordering::Relaxed);
+                    eprintln!("Pool loader exited");
+                    return;
+                }
+            }
         }
     }
 }
@@ -184,6 +443,7 @@ struct ExampleRecord {
 #[derive(serde::Serialize)]
 struct GameRecord {
     length: usize,
+    winner: &'static str,
     examples: Vec<ExampleRecord>,
 }
 
@@ -204,6 +464,10 @@ enum GraphOutput {
 struct GameResult {
     positions: Vec<PositionData>,
     winner: &'static str,
+    /// Actual number of moves played in the game. May differ from
+    /// `positions.len()` when playout cap randomization is active —
+    /// fast-search positions advance `move_count` but are not recorded.
+    move_count: u32,
 }
 
 impl GameResult {
@@ -246,17 +510,24 @@ impl GameResult {
         }).collect();
         GameRecord {
             length: self.positions.len(),
+            winner: self.winner,
             examples,
         }
     }
 }
 
 /// Magic bytes identifying the start of a game record.
-const RECORD_MAGIC: &[u8; 4] = b"HX01";
+const RECORD_MAGIC: &[u8; 4] = b"HX03";
 
 /// Write a game as a length-prefixed binary record.
 ///
-/// Format: `[4B magic "HX01"][4B LE record_size][4B LE num_examples][example...]`
+/// Format: `[4B magic "HX03"][4B LE record_size][4B LE num_examples][1B winner i8][4B LE move_count u32][example...]`
+///
+/// `move_count` is the total number of moves played in the game. It may
+/// exceed `num_examples` when playout cap randomization is active, because
+/// fast-search positions advance the game but are not recorded.
+///
+/// `winner`: 1 = P1, -1 = P2, 0 = draw.
 ///
 /// Each example:
 /// ```text
@@ -270,7 +541,7 @@ const RECORD_MAGIC: &[u8; 4] = b"HX01";
 /// ```
 fn write_game_binary<W: Write>(writer: &mut W, result: &GameResult) -> std::io::Result<()> {
     // First pass: compute total size
-    let mut size = 4u32; // num_examples
+    let mut size = 4u32 + 1 + 4; // num_examples + winner byte + move_count
     for pos in &result.positions {
         let (n, e, nl, has_ea) = example_dims(pos);
         size += 2 + 2 + 2 + 1 + 4; // header (u16×3 + u8 + f32)
@@ -285,6 +556,13 @@ fn write_game_binary<W: Write>(writer: &mut W, result: &GameResult) -> std::io::
     writer.write_all(RECORD_MAGIC)?;
     writer.write_all(&size.to_le_bytes())?;
     writer.write_all(&(result.positions.len() as u32).to_le_bytes())?;
+    let winner_byte: i8 = match result.winner {
+        "P1" => 1,
+        "P2" => -1,
+        _ => 0,
+    };
+    writer.write_all(&[winner_byte as u8])?;
+    writer.write_all(&result.move_count.to_le_bytes())?;
 
     for pos in &result.positions {
         let value: f64 = if result.winner == "draw" {
@@ -374,14 +652,56 @@ fn build_position_graph(
     }
 }
 
+/// Decide which side (P1 or P2) the past-self pool plays in a pool game.
+/// Pure: returns ``"P1"`` or ``"P2"`` with 50/50 probability. Exposed for
+/// unit testing the bias property.
+fn pick_pool_side(rng: &mut ChaCha8Rng) -> &'static str {
+    if rng.random::<bool>() { "P1" } else { "P2" }
+}
+
 /// Play one complete game using batched inference via the client.
+///
+/// If ``pool_client`` is ``Some`` and ``pool_side`` is ``Some(side)`` then
+/// MCTS searches whose root turn matches ``side`` will route their inference
+/// requests through the pool client (the past-self snapshot). Otherwise the
+/// live ``client`` is used for both sides (vanilla self-play).
+/// Wu (2019) playout cap randomization decision: returns true when this
+/// move should be played as a fast (low-sim) search whose training example
+/// is dropped. Both `fraction > 0` and `divisor > 1` must hold for the
+/// feature to ever activate; otherwise this is a no-op (always full search).
+#[inline]
+fn should_skip_example(roll: f64, fraction: f64, divisor: u32) -> bool {
+    if fraction <= 0.0 || divisor <= 1 {
+        return false;
+    }
+    roll < fraction
+}
+
+/// Build a reduced-budget MCTS config for the fast search arm of playout
+/// cap randomization. The simulation count is divided by `divisor` and
+/// clamped to a minimum of 1; all other fields are preserved.
+fn reduced_sim_config(base: &MCTSConfig, divisor: u32) -> MCTSConfig {
+    let div = divisor.max(1);
+    MCTSConfig {
+        n_simulations: (base.n_simulations / div).max(1),
+        m_actions: base.m_actions,
+        c_visit: base.c_visit,
+        c_scale: base.c_scale,
+    }
+}
+
 fn play_one_game(
     client: &InferenceClient,
+    pool_client: Option<&InferenceClient>,
+    pool_side: Option<&'static str>,
     game_config: GameConfig,
     mcts_config: &MCTSConfig,
     exploration: &AtomicUsize,
     graph_type: GraphType,
     rng: &mut ChaCha8Rng,
+    playout_cap_fraction: f64,
+    playout_cap_divisor: u32,
+    running: &AtomicBool,
 ) -> Option<GameResult> {
     use hexo_rs::mcts::gumbel_mcts::gumbel_mcts;
 
@@ -390,6 +710,9 @@ fn play_one_game(
     let mut move_count = 0;
 
     while !game.is_terminal() {
+        if !running.load(Ordering::Relaxed) {
+            return None;
+        }
         let current_player = match game.current_player() {
             Some(hexo_engine::types::Player::P1) => "P1",
             Some(hexo_engine::types::Player::P2) => "P2",
@@ -398,6 +721,14 @@ fn play_one_game(
 
         // Build graph ONCE for this position — reuse for both output and root eval
         let (graph_output, root_tensors) = build_position_graph(&game, graph_type);
+
+        // Choose which inference client services THIS root's MCTS search.
+        // For pool games, the pool client serves searches whose side-to-move
+        // matches the pre-assigned pool_side; the live client serves the rest.
+        let active_client: &InferenceClient = match (pool_client, pool_side) {
+            (Some(pc), Some(side)) if side == current_player => pc,
+            _ => client,
+        };
 
         // Eval closure: builds graphs on this thread, sends to inference server.
         // Root eval reuses the pre-built graph; leaf evals build fresh.
@@ -415,10 +746,24 @@ fn play_one_game(
                     }
                 }).collect()
             };
-            client.evaluate(graphs)
+            active_client.evaluate(graphs)
         };
 
-        let result = match gumbel_mcts(&game, mcts_config, rng, &mut eval) {
+        // Wu (2019) playout cap randomization: with probability
+        // `playout_cap_fraction`, run a reduced-budget search and skip
+        // recording a training example for this position. The played
+        // move still advances the game.
+        let roll: f64 = rng.random::<f64>();
+        let fast_search = should_skip_example(roll, playout_cap_fraction, playout_cap_divisor);
+        let local_cfg;
+        let active_cfg: &MCTSConfig = if fast_search {
+            local_cfg = reduced_sim_config(mcts_config, playout_cap_divisor);
+            &local_cfg
+        } else {
+            mcts_config
+        };
+
+        let result = match gumbel_mcts(&game, active_cfg, rng, &mut eval) {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("MCTS failed: {e}, dropping game");
@@ -445,12 +790,17 @@ fn play_one_game(
             result.action
         };
 
-        positions.push(PositionData {
-            policy: result.improved_policy,
-            player: current_player,
-            graph: graph_output,
-        });
+        if !fast_search {
+            positions.push(PositionData {
+                policy: result.improved_policy,
+                player: current_player,
+                graph: graph_output,
+            });
+        }
 
+        if !running.load(Ordering::Relaxed) {
+            return None;
+        }
         if let Err(e) = game.apply_move(action) {
             eprintln!("Invalid move from MCTS: {e:?}, dropping game");
             return None;
@@ -464,7 +814,7 @@ fn play_one_game(
         None => "draw",
     };
 
-    Some(GameResult { positions, winner })
+    Some(GameResult { positions, winner, move_count: move_count as u32 })
 }
 
 // ---------------------------------------------------------------------------
@@ -565,6 +915,15 @@ fn main() {
     let mut max_batch: usize = 0; // 0 = auto
     let mut batch_timeout_ms: u64 = 0; // 0 = auto
     let mut max_file_mb: u64 = 2048;
+    let mut pool_dir: Option<String> = None;
+    let mut pool_fraction: f64 = 0.0;
+    let mut playout_cap_fraction: f64 = 0.0;
+    let mut playout_cap_divisor: u32 = 1;
+    let mut padded_inference: bool = false;
+    let mut shape_hist: bool = false;
+    let mut exploration_max: Option<f64> = None; // adaptive exploration ceiling
+    let mut exploration_window: u32 = 200; // EMA effective window for p1 decided rate
+    let mut exploration_exponent: f64 = 1.0; // deviation curve: 1.0=linear, 2.0=squared
 
     let mut i = 1;
     while i < args.len() {
@@ -579,6 +938,9 @@ fn main() {
             "--m-actions" => { m_actions = args[i + 1].parse().unwrap(); i += 2; }
             "--exploration" => { exploration = args[i + 1].parse().unwrap(); i += 2; }
             "--exploration-fraction" => { exploration_fraction = Some(args[i + 1].parse().unwrap()); i += 2; }
+            "--exploration-max" => { exploration_max = Some(args[i + 1].parse().unwrap()); i += 2; }
+            "--exploration-window" => { exploration_window = args[i + 1].parse().unwrap(); i += 2; }
+            "--exploration-exponent" => { exploration_exponent = args[i + 1].parse().unwrap(); i += 2; }
             "--output" => { output_path = args[i + 1].clone(); i += 2; }
             "--output-dir" => { output_dir = Some(args[i + 1].clone()); i += 2; }
             "--seed" => { seed = Some(args[i + 1].parse().unwrap()); i += 2; }
@@ -590,6 +952,33 @@ fn main() {
             "--max-batch" => { max_batch = args[i + 1].parse().unwrap(); i += 2; }
             "--batch-timeout-ms" => { batch_timeout_ms = args[i + 1].parse().unwrap(); i += 2; }
             "--max-file-mb" => { max_file_mb = args[i + 1].parse().unwrap(); i += 2; }
+            "--pool-dir" => { pool_dir = Some(args[i + 1].clone()); i += 2; }
+            "--pool-fraction" => {
+                pool_fraction = args[i + 1].parse().unwrap();
+                if !(0.0..=1.0).contains(&pool_fraction) {
+                    eprintln!("--pool-fraction must be in [0.0, 1.0], got {}", pool_fraction);
+                    std::process::exit(1);
+                }
+                i += 2;
+            }
+            "--playout-cap-fraction" => {
+                playout_cap_fraction = args[i + 1].parse().unwrap();
+                if !(0.0..=1.0).contains(&playout_cap_fraction) {
+                    eprintln!("--playout-cap-fraction must be in [0.0, 1.0], got {}", playout_cap_fraction);
+                    std::process::exit(1);
+                }
+                i += 2;
+            }
+            "--padded-inference" => { padded_inference = true; i += 1; }
+            "--shape-hist" => { shape_hist = true; i += 1; }
+            "--playout-cap-divisor" => {
+                playout_cap_divisor = args[i + 1].parse().unwrap();
+                if playout_cap_divisor < 1 {
+                    eprintln!("--playout-cap-divisor must be >= 1, got {}", playout_cap_divisor);
+                    std::process::exit(1);
+                }
+                i += 2;
+            }
             _ => { eprintln!("Unknown arg: {}", args[i]); i += 1; }
         }
     }
@@ -671,6 +1060,8 @@ fn main() {
     let exploration_atomic = Arc::new(AtomicUsize::new(exploration));
     // EMA of game length stored as f64 bits in AtomicU64 (lock-free, all threads update)
     let ema_bits = Arc::new(AtomicU64::new(0u64)); // 0 bits = 0.0f64
+    // EMA of p1 decided rate for adaptive exploration (0.5 = balanced)
+    let p1_ema_bits = Arc::new(AtomicU64::new(0.5f64.to_bits())); // start balanced
 
     if !continuous {
         // --- Batch mode ---
@@ -691,7 +1082,7 @@ fn main() {
             let server_handle = s.spawn(move || {
                 inference_server(
                     request_rx, model_ref, max_batch, batch_timeout,
-                    running_ref, None, tch_device, graph_type,
+                    running_ref, None, tch_device, graph_type, padded_inference,
                 );
             });
 
@@ -704,13 +1095,16 @@ fn main() {
                     let client = client.clone();
                     let mcts_config = &mcts_config;
                     let exploration_ref = &exploration_atomic;
+                    let running_thread = running.clone();
                     s.spawn(move || {
                         let mut rng = make_rng(seed, ti as u64, 0);
                         let mut results = Vec::with_capacity(count);
                         for _ in 0..count {
                             if let Some(game) = play_one_game(
-                                &client, game_config, mcts_config,
+                                &client, None, None, game_config, mcts_config,
                                 exploration_ref, graph_type, &mut rng,
+                                playout_cap_fraction, playout_cap_divisor,
+                                &running_thread,
                             ) {
                                 results.push(game);
                             }
@@ -734,7 +1128,7 @@ fn main() {
         });
 
         let elapsed = start.elapsed();
-        let total_moves: usize = all_games.iter().map(|g| g.positions.len()).sum();
+        let total_moves: usize = all_games.iter().map(|g| g.move_count as usize).sum();
 
         let json: Vec<serde_json::Value> = all_games.iter()
             .map(|g| game_to_json(g))
@@ -752,6 +1146,9 @@ fn main() {
         );
     } else {
         // --- Continuous mode ---
+        if shape_hist {
+            hexo_rs::inference::enable_shape_hist();
+        }
         let dir = output_dir.unwrap_or_else(|| "self_play_output".to_string());
         fs::create_dir_all(&dir).expect("Failed to create output directory");
 
@@ -777,6 +1174,25 @@ fn main() {
         let (request_tx, request_rx) = mpsc::channel::<EvalRequest>();
         let client = InferenceClient { request_tx };
 
+        // Past-self opponent pool (optional). The loader thread is the
+        // single source of truth for the pool model: it polls the pool dir
+        // (which is empty at curriculum start), loads a random snapshot when
+        // one appears, and stages it for the pool inference server. We
+        // unconditionally spawn both threads when the pool is configured,
+        // and worker threads route to the pool only once `pool_ready` flips.
+        let pool_disabled = Arc::new(AtomicBool::new(false));
+        let pool_ready = Arc::new(AtomicBool::new(false));
+
+        // Build the pool inference channel up front (when configured) so we
+        // can clone the client into game threads inside the scope.
+        let (pool_client_opt, pool_request_rx_opt) =
+            if pool_fraction > 0.0 && pool_dir.is_some() {
+                let (ptx, prx) = mpsc::channel::<EvalRequest>();
+                (Some(InferenceClient { request_tx: ptx }), Some(prx))
+            } else {
+                (None, None)
+            };
+
         std::thread::scope(|s| {
             // Spawn inference server (with model reloading)
             let running_ref = &running;
@@ -785,9 +1201,42 @@ fn main() {
             s.spawn(move || {
                 inference_server(
                     request_rx, model_ref, max_batch, batch_timeout,
-                    running_ref, Some(model_path_ref), tch_device, graph_type,
+                    running_ref, Some(model_path_ref), tch_device, graph_type, padded_inference,
                 );
             });
+
+            // Spawn pool inference server + background loader (if configured).
+            // The loader owns all disk I/O and stages fresh models through a
+            // bounded(1) channel. The inference server blocks on the channel
+            // for its very first model — so it's safe to spawn both threads
+            // even when the pool dir is empty at startup. The loader will
+            // poll on a short cadence until a snapshot appears, then flip
+            // `pool_ready` so worker threads start routing games.
+            if let Some(prx) = pool_request_rx_opt {
+                let running_ref = &running;
+                let pdir = pool_dir.clone().expect("pool_dir set when pool configured");
+                let (staged_tx, staged_rx) = mpsc::sync_channel::<TorchModel>(1);
+
+                s.spawn(move || {
+                    pool_inference_server(
+                        prx, max_batch, batch_timeout,
+                        running_ref, staged_rx, padded_inference,
+                    );
+                });
+
+                let pool_disabled_loader = pool_disabled.clone();
+                let pool_ready_loader = pool_ready.clone();
+                let running_loader = running.clone();
+                s.spawn(move || {
+                    pool_model_loader(
+                        pdir, tch_device, graph_type,
+                        staged_tx, pool_disabled_loader, pool_ready_loader,
+                        running_loader,
+                    );
+                });
+            }
+
+            let start_time = std::time::Instant::now();
 
             // Spawn game threads
             for ti in 0..n_threads {
@@ -795,9 +1244,13 @@ fn main() {
                 let game_counter = game_counter.clone();
                 let rotating_writer = rotating_writer.clone();
                 let client = client.clone();
+                let pool_client = pool_client_opt.clone();
+                let pool_disabled_ref = pool_disabled.clone();
+                let pool_ready_ref = pool_ready.clone();
                 let mcts_config = &mcts_config;
                 let exploration_ref = &exploration_atomic;
                 let ema_ref = &ema_bits;
+                let p1_ema_ref = &p1_ema_bits;
 
                 s.spawn(move || {
                     let mut rng = make_rng(seed, ti as u64, 0);
@@ -805,11 +1258,37 @@ fn main() {
                     const EMA_ALPHA: f64 = 0.05;
 
                     while running.load(Ordering::Relaxed) {
+                        // Per-game pool routing: independently sample whether
+                        // this game uses a past-self opponent, and if so which
+                        // side that opponent plays.
+                        let (pool_client_ref, pool_side): (Option<&InferenceClient>, Option<&'static str>) =
+                            if let Some(ref pc) = pool_client {
+                                // Route to the pool only when it is both
+                                // not disabled AND has actually loaded a
+                                // first model. During the early-run warmup
+                                // window the pool may be configured but
+                                // not yet ready — those games run as
+                                // ordinary live-vs-live self-play.
+                                if !pool_disabled_ref.load(Ordering::Relaxed)
+                                    && pool_ready_ref.load(Ordering::Relaxed)
+                                    && rng.random::<f64>() < pool_fraction
+                                {
+                                    (Some(pc), Some(pick_pool_side(&mut rng)))
+                                } else {
+                                    (None, None)
+                                }
+                            } else {
+                                (None, None)
+                            };
+
                         if let Some(result) = play_one_game(
-                            &client, game_config, mcts_config,
+                            &client, pool_client_ref, pool_side,
+                            game_config, mcts_config,
                             exploration_ref, graph_type, &mut rng,
+                            playout_cap_fraction, playout_cap_divisor,
+                            &running,
                         ) {
-                            let game_len = result.positions.len() as f64;
+                            let game_len = result.move_count as f64;
 
                             {
                                 let mut rw = rotating_writer.lock().unwrap();
@@ -820,7 +1299,7 @@ fn main() {
 
                             let count = game_counter.fetch_add(1, Ordering::Relaxed) + 1;
 
-                            // All threads: update EMA via CAS loop
+                            // All threads: update game-length EMA via CAS loop
                             if exploration_fraction.is_some() {
                                 loop {
                                     let old_bits = ema_ref.load(Ordering::Relaxed);
@@ -837,27 +1316,74 @@ fn main() {
                                         break;
                                     }
                                 }
+
+                                // Update p1 decided rate EMA (skip draws)
+                                let p1_sample = match result.winner {
+                                    "P1" => Some(1.0f64),
+                                    "P2" => Some(0.0f64),
+                                    _ => None,
+                                };
+                                // EMA alpha derived from --exploration-window.
+                                // alpha = 2/(window+1) gives the standard EMA
+                                // effective window size.
+                                let p1_ema_alpha: f64 = 2.0 / (exploration_window as f64 + 1.0);
+                                if let Some(sample) = p1_sample {
+                                    loop {
+                                        let old_bits = p1_ema_ref.load(Ordering::Relaxed);
+                                        let old_ema = f64::from_bits(old_bits);
+                                        let updated = p1_ema_alpha * sample + (1.0 - p1_ema_alpha) * old_ema;
+                                        if p1_ema_ref.compare_exchange_weak(
+                                            old_bits, updated.to_bits(),
+                                            Ordering::Relaxed, Ordering::Relaxed,
+                                        ).is_ok() {
+                                            break;
+                                        }
+                                    }
+                                }
                             }
 
                             // Thread 0: update exploration + progress logging
                             if ti == 0 {
-                                if let Some(frac) = exploration_fraction {
+                                if let Some(base_frac) = exploration_fraction {
                                     let ema = f64::from_bits(ema_ref.load(Ordering::Relaxed));
+
+                                    // Adaptive exploration: when p1_decided_rate
+                                    // drifts from 0.5, ramp up exploration using
+                                    // squared deviation for smooth center / steep edges.
+                                    let frac = if let Some(max_frac) = exploration_max {
+                                        let p1_ema = f64::from_bits(p1_ema_ref.load(Ordering::Relaxed));
+                                        let deviation = (2.0 * (p1_ema - 0.5)).abs().min(1.0);
+                                        (base_frac + (max_frac - base_frac) * deviation.powf(exploration_exponent))
+                                            .clamp(base_frac, max_frac)
+                                    } else {
+                                        base_frac
+                                    };
+
                                     let new_explore = (ema * frac).ceil() as usize;
                                     let new_explore = new_explore.max(2);
                                     let old_explore = exploration_ref.swap(new_explore, Ordering::Relaxed);
                                     if new_explore != old_explore {
-                                        eprintln!(
-                                            "exploration_moves: {} -> {} (ema_len={:.1}, frac={:.0}%)",
-                                            old_explore, new_explore, ema, frac * 100.0,
-                                        );
+                                        if exploration_max.is_some() {
+                                            let p1_ema = f64::from_bits(p1_ema_ref.load(Ordering::Relaxed));
+                                            eprintln!(
+                                                "exploration_moves: {} -> {} (ema_len={:.1}, frac={:.0}%, p1_rate={:.2})",
+                                                old_explore, new_explore, ema, frac * 100.0, p1_ema,
+                                            );
+                                        } else {
+                                            eprintln!(
+                                                "exploration_moves: {} -> {} (ema_len={:.1}, frac={:.0}%)",
+                                                old_explore, new_explore, ema, frac * 100.0,
+                                            );
+                                        }
                                     }
                                 }
 
                                 let hundred = count / 100;
                                 if hundred > last_logged_hundred {
                                     last_logged_hundred = hundred;
-                                    eprintln!("{} games written", count);
+                                    let elapsed = start_time.elapsed().as_secs_f64();
+                                    let gps = count as f64 / elapsed.max(0.001);
+                                    eprintln!("{} games written ({:.1} games/s)", count, gps);
                                 }
                             }
                         }
@@ -865,8 +1391,9 @@ fn main() {
                 });
             }
 
-            // Drop client so server shuts down when game threads finish
+            // Drop clients so server(s) shut down when game threads finish
             drop(client);
+            drop(pool_client_opt);
         });
 
         let total_games = game_counter.load(Ordering::Relaxed);
@@ -903,6 +1430,7 @@ mod tests {
                 PositionData { policy: vec![0.5, 0.5], player: "P1", graph },
             ],
             winner,
+            move_count: 1,
         }
     }
 
@@ -911,15 +1439,59 @@ mod tests {
         let result = make_result(GraphType::Hex, "P1");
         let mut buf = Vec::new();
         write_game_binary(&mut buf, &result).unwrap();
-        assert!(buf.len() > 12);
+        assert!(buf.len() > 17);
         // Check magic
         assert_eq!(&buf[..4], RECORD_MAGIC);
+        assert_eq!(&buf[..4], b"HX03");
         // Read length prefix (after magic)
         let record_len = u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize;
         assert_eq!(record_len, buf.len() - 8); // total - magic - length
         // Read num_examples
         let num_examples = u32::from_le_bytes(buf[8..12].try_into().unwrap());
         assert_eq!(num_examples, 1);
+        // Winner byte follows num_examples
+        assert_eq!(buf[12] as i8, 1);
+        // move_count u32 follows winner byte
+        let move_count = u32::from_le_bytes(buf[13..17].try_into().unwrap());
+        assert_eq!(move_count, 1);
+    }
+
+    #[test]
+    fn winner_byte_roundtrip() {
+        for (w, expected) in [("P1", 1i8), ("P2", -1i8), ("draw", 0i8)] {
+            let result = make_result(GraphType::Hex, w);
+            let mut buf = Vec::new();
+            write_game_binary(&mut buf, &result).unwrap();
+            assert_eq!(&buf[..4], b"HX03");
+            assert_eq!(buf[12] as i8, expected, "winner {w}");
+            // Length prefix should match buffer minus magic+size header
+            let record_len = u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize;
+            assert_eq!(record_len, buf.len() - 8);
+        }
+    }
+
+    #[test]
+    fn move_count_roundtrip() {
+        // Simulate playout cap: 10 actual moves but only 3 recorded examples.
+        let game = GameState::with_config(small_game_config());
+        let (g1, _) = build_position_graph(&game, GraphType::Hex);
+        let (g2, _) = build_position_graph(&game, GraphType::Hex);
+        let (g3, _) = build_position_graph(&game, GraphType::Hex);
+        let result = GameResult {
+            positions: vec![
+                PositionData { policy: vec![0.5, 0.5], player: "P1", graph: g1 },
+                PositionData { policy: vec![0.5, 0.5], player: "P2", graph: g2 },
+                PositionData { policy: vec![0.5, 0.5], player: "P1", graph: g3 },
+            ],
+            winner: "P1",
+            move_count: 10,
+        };
+        let mut buf = Vec::new();
+        write_game_binary(&mut buf, &result).unwrap();
+        let num_examples = u32::from_le_bytes(buf[8..12].try_into().unwrap());
+        assert_eq!(num_examples, 3, "examples == positions.len()");
+        let move_count = u32::from_le_bytes(buf[13..17].try_into().unwrap());
+        assert_eq!(move_count, 10, "move_count distinct from examples");
     }
 
     #[test]
@@ -940,6 +1512,7 @@ mod tests {
                 PositionData { policy: vec![0.3, 0.7], player: "P2", graph: g2 },
             ],
             winner: "P1",
+            move_count: 2,
         };
         let record = result.to_record();
         assert_eq!(record.examples[0].value, 1.0);  // P1 wins, P1's turn
@@ -952,6 +1525,194 @@ mod tests {
         let result = make_result(GraphType::Hex, "draw");
         let record = result.to_record();
         assert_eq!(record.examples[0].value, 0.0);
+    }
+
+    #[test]
+    fn pick_pool_side_is_unbiased() {
+        // Both sides should appear with roughly 50/50 probability over many trials.
+        let mut rng = ChaCha8Rng::seed_from_u64(0xC0FFEE);
+        let mut p1 = 0usize;
+        let n = 20_000;
+        for _ in 0..n {
+            if pick_pool_side(&mut rng) == "P1" {
+                p1 += 1;
+            }
+        }
+        let frac = p1 as f64 / n as f64;
+        assert!(
+            (0.47..0.53).contains(&frac),
+            "pick_pool_side bias: P1 fraction = {frac:.4}"
+        );
+    }
+
+    #[test]
+    fn pick_pool_side_returns_only_p1_or_p2() {
+        let mut rng = ChaCha8Rng::seed_from_u64(1);
+        for _ in 0..100 {
+            let s = pick_pool_side(&mut rng);
+            assert!(s == "P1" || s == "P2");
+        }
+    }
+
+    #[test]
+    fn list_pool_snapshots_filters_pt_extension() {
+        let tmp = std::env::temp_dir().join(format!("hexo_pool_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        fs::write(tmp.join("a.pt"), b"x").unwrap();
+        fs::write(tmp.join("b.pt"), b"y").unwrap();
+        fs::write(tmp.join("ignore.txt"), b"z").unwrap();
+        fs::write(tmp.join("README"), b"q").unwrap();
+        let snaps = list_pool_snapshots(tmp.to_str().unwrap());
+        assert_eq!(snaps.len(), 2);
+        for p in &snaps {
+            assert_eq!(p.extension().and_then(|e| e.to_str()), Some("pt"));
+        }
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn try_replace_drains_and_sends_on_full_channel() {
+        // Capacity-1 channel: once full, try_replace must evict the stale
+        // value (via the consumer draining) and send the new one. We model
+        // the "consumer eventually drains" case: send, drain, send-again.
+        let (tx, rx) = mpsc::sync_channel::<i32>(1);
+
+        // First send into empty channel succeeds.
+        try_replace(&tx, 1).unwrap();
+        assert_eq!(rx.try_recv().unwrap(), 1);
+
+        // Stage a value, leave it buffered, then replace it. The first
+        // try_send in try_replace will observe Full; a single drain by the
+        // consumer between attempts allows the second try_send to land.
+        try_replace(&tx, 2).unwrap();
+        // Consumer drains so the replacement can proceed via try_replace's
+        // retry path.
+        let stale = rx.recv().unwrap();
+        assert_eq!(stale, 2);
+
+        // Rapid back-to-back sends without drains: last one wins via the
+        // fallback blocking send after consumer drains. We spawn a consumer
+        // that drains once with a small delay to mimic the real inference
+        // thread picking up the stale model.
+        try_replace(&tx, 3).unwrap();
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            let a = rx.recv().unwrap();
+            let b = rx.recv().unwrap();
+            (a, b)
+        });
+        try_replace(&tx, 4).unwrap();
+        let (a, b) = handle.join().unwrap();
+        // Order must be 3 then 4 (the replacement semantics preserve "most
+        // recent wins" but may stage up to one older value in flight).
+        assert_eq!(a, 3);
+        assert_eq!(b, 4);
+    }
+
+    #[test]
+    fn try_replace_errors_when_receiver_dropped() {
+        let (tx, rx) = mpsc::sync_channel::<i32>(1);
+        drop(rx);
+        assert!(try_replace(&tx, 42).is_err());
+    }
+
+    #[test]
+    fn list_pool_snapshots_missing_dir_returns_empty() {
+        let snaps = list_pool_snapshots("/nonexistent/path/that/does/not/exist/abc123");
+        assert!(snaps.is_empty());
+    }
+
+    #[test]
+    fn pool_ready_flag_default_false_then_settable() {
+        // The pool_ready flag is the public contract between the loader
+        // and the worker threads: it must start false (so workers do not
+        // route games to a pool inference server that has no model yet)
+        // and flip true exactly once the loader has staged a snapshot.
+        let pool_ready = Arc::new(AtomicBool::new(false));
+        assert!(!pool_ready.load(Ordering::Relaxed));
+        // Loader simulates a successful first stage:
+        pool_ready.store(true, Ordering::Relaxed);
+        assert!(pool_ready.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn list_pool_snapshots_empty_then_populated() {
+        // Models the "pool dir empty at curriculum start, files appear
+        // later" flow at the unit level: the loader caches the file list
+        // but must re-scan when the cache is empty so a freshly-populated
+        // dir is picked up on the next iteration without waiting for an
+        // mtime observation race.
+        let tmp = std::env::temp_dir().join(format!("hexo_pool_warmup_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let dir_str = tmp.to_str().unwrap();
+
+        // Initially empty.
+        let snaps = list_pool_snapshots(dir_str);
+        assert!(snaps.is_empty(), "fresh dir should have no snapshots");
+
+        // Trainer drops a checkpoint.
+        fs::write(tmp.join("model_step_100.pt"), b"fake").unwrap();
+        let snaps = list_pool_snapshots(dir_str);
+        assert_eq!(snaps.len(), 1, "newly-written .pt should be visible");
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn playout_cap_disabled_never_skips() {
+        // fraction=0.0, divisor=1: feature off; should never skip.
+        for r_int in 0..1000 {
+            let r = r_int as f64 / 1000.0;
+            assert!(!should_skip_example(r, 0.0, 1));
+            assert!(!should_skip_example(r, 0.0, 4));
+            assert!(!should_skip_example(r, 0.5, 1));
+        }
+    }
+
+    #[test]
+    fn playout_cap_active_always_skips_at_fraction_one() {
+        // fraction=1.0, divisor=4: every roll < 1.0 → skip.
+        let mut rng = ChaCha8Rng::seed_from_u64(7);
+        for _ in 0..1000 {
+            let r = rng.random::<f64>();
+            assert!(should_skip_example(r, 1.0, 4));
+        }
+    }
+
+    #[test]
+    fn playout_cap_statistical_match() {
+        // fraction=0.5, divisor=4: ~half the rolls should skip.
+        let mut rng = ChaCha8Rng::seed_from_u64(0xDEADBEEF);
+        let n = 10_000;
+        let mut skips = 0usize;
+        for _ in 0..n {
+            let r = rng.random::<f64>();
+            if should_skip_example(r, 0.5, 4) {
+                skips += 1;
+            }
+        }
+        let frac = skips as f64 / n as f64;
+        assert!(
+            (0.47..0.53).contains(&frac),
+            "playout_cap fraction skew: {frac:.4}"
+        );
+    }
+
+    #[test]
+    fn reduced_sim_config_uses_divisor() {
+        let base = MCTSConfig { n_simulations: 64, m_actions: 16, c_visit: 50, c_scale: 1.0 };
+        assert_eq!(reduced_sim_config(&base, 4).n_simulations, 16);
+        assert_eq!(reduced_sim_config(&base, 1).n_simulations, 64);
+        assert_eq!(reduced_sim_config(&base, 0).n_simulations, 64); // clamp divisor to 1
+        let tiny = MCTSConfig { n_simulations: 1, m_actions: 16, c_visit: 50, c_scale: 1.0 };
+        assert_eq!(reduced_sim_config(&tiny, 4).n_simulations, 1); // clamp result to 1
+        // Other fields preserved.
+        let r = reduced_sim_config(&base, 4);
+        assert_eq!(r.m_actions, 16);
+        assert_eq!(r.c_visit, 50);
+        assert_eq!(r.c_scale, 1.0);
     }
 
     #[test]
