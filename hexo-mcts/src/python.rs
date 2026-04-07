@@ -913,6 +913,52 @@ fn py_game_states_to_batch(
     ))
 }
 
+// ---------------------------------------------------------------------------
+// Phase 0 DAG-MCTS spike: thread-local instrumentation bindings.
+// Feature-gated; only present when built with `--features dedup_count`.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "dedup_count")]
+#[pyfunction(name = "reset_dedup_counters")]
+fn py_reset_dedup_counters() {
+    crate::mcts::dedup_count::reset_tls();
+}
+
+#[cfg(feature = "dedup_count")]
+#[pyfunction(name = "snapshot_dedup_counters")]
+fn py_snapshot_dedup_counters(py: Python<'_>) -> PyResult<Py<PyAny>> {
+    let (total, within, cross, unique) = crate::mcts::dedup_count::snapshot_tls();
+    let dict = pyo3::types::PyDict::new(py);
+    dict.set_item("total_expansions", total)?;
+    dict.set_item("within_turn_hits", within)?;
+    dict.set_item("cross_turn_hits", cross)?;
+    dict.set_item("unique_fingerprints", unique)?;
+    Ok(dict.into())
+}
+
+#[cfg(feature = "dedup_skip")]
+#[pyfunction(name = "set_skip_enabled")]
+fn py_set_skip_enabled(enabled: bool) {
+    crate::mcts::dedup_count::set_skip_enabled_tls(enabled);
+}
+
+#[cfg(feature = "dedup_skip")]
+#[pyfunction(name = "reset_eval_cache")]
+fn py_reset_eval_cache() {
+    crate::mcts::dedup_count::eval_cache_reset_tls();
+}
+
+#[cfg(feature = "dedup_skip")]
+#[pyfunction(name = "snapshot_eval_cache")]
+fn py_snapshot_eval_cache(py: Python<'_>) -> PyResult<Py<PyAny>> {
+    let (hits, misses, size) = crate::mcts::dedup_count::eval_cache_snapshot_tls();
+    let dict = pyo3::types::PyDict::new(py);
+    dict.set_item("hits", hits)?;
+    dict.set_item("misses", misses)?;
+    dict.set_item("size", size)?;
+    Ok(dict.into())
+}
+
 #[pymodule]
 fn hexo_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyGameConfig>()?;
@@ -929,5 +975,16 @@ fn hexo_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_batched_self_play, m)?)?;
     #[cfg(feature = "torch")]
     m.add_function(wrap_pyfunction!(py_native_self_play, m)?)?;
+    #[cfg(feature = "dedup_count")]
+    {
+        m.add_function(wrap_pyfunction!(py_reset_dedup_counters, m)?)?;
+        m.add_function(wrap_pyfunction!(py_snapshot_dedup_counters, m)?)?;
+    }
+    #[cfg(feature = "dedup_skip")]
+    {
+        m.add_function(wrap_pyfunction!(py_set_skip_enabled, m)?)?;
+        m.add_function(wrap_pyfunction!(py_reset_eval_cache, m)?)?;
+        m.add_function(wrap_pyfunction!(py_snapshot_eval_cache, m)?)?;
+    }
     Ok(())
 }

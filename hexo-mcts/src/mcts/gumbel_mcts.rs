@@ -47,9 +47,43 @@ where
         return Err("No legal moves in non-terminal state");
     }
 
-    // Step 1: Evaluate the root state — eval_fn returns raw logits, not priors
+    // Step 1: Evaluate the root state — eval_fn returns raw logits, not priors.
+    //
+    // Under `dedup_skip`, the cache is consulted *only if* the runtime
+    // skip flag is on. This lets the wall-clock prototype A/B both modes
+    // from a single compiled binary.
+    #[cfg(feature = "dedup_skip")]
+    let (root_logits_owned, root_value): (HashMap<Coord, f64>, f64) = {
+        if super::dedup_count::skip_enabled_tls() {
+            let fp = super::dedup_count::position_fingerprint(game, None);
+            if let Some(entry) = super::dedup_count::eval_cache_get_tls(fp) {
+                (entry.policy_logits, entry.value)
+            } else {
+                let (logits_list, values) = eval_fn(&[game.clone()]);
+                let lm = logits_list.into_iter().next().unwrap();
+                let v = values[0];
+                super::dedup_count::eval_cache_insert_tls(
+                    fp,
+                    super::dedup_count::CachedEval {
+                        policy_logits: lm.clone(),
+                        value: v,
+                    },
+                );
+                (lm, v)
+            }
+        } else {
+            let (logits_list, values) = eval_fn(&[game.clone()]);
+            (logits_list.into_iter().next().unwrap(), values[0])
+        }
+    };
+    #[cfg(feature = "dedup_skip")]
+    let root_logits_map = &root_logits_owned;
+
+    #[cfg(not(feature = "dedup_skip"))]
     let (logits_list, values) = eval_fn(&[game.clone()]);
+    #[cfg(not(feature = "dedup_skip"))]
     let root_logits_map = &logits_list[0];
+    #[cfg(not(feature = "dedup_skip"))]
     let root_value = values[0];
 
     // Build coords and logits arrays (sorted order matching legal_moves)
@@ -75,6 +109,11 @@ where
     let mut root = MCTSNode::new(1.0, None, current_player);
     root.game_state = Some(game.clone());
     root.expand(root_priors, root_value);
+
+    #[cfg(feature = "dedup_count")]
+    {
+        super::dedup_count::record_expansion_tls(None, game);
+    }
 
     // Step 3: Gumbel top-k sampling
     let (candidate_indices, gumbel_samples) =
@@ -181,7 +220,76 @@ fn simulate_batch_with_eval<F>(
         return;
     }
 
-    // Phase 2: Batch evaluate all non-terminal leaves — eval_fn returns raw logits
+    // Phase 2: Batch evaluate all non-terminal leaves — eval_fn returns raw logits.
+    //
+    // Under `dedup_skip`, first consult the per-search eval cache. States whose
+    // fingerprint already has a cached (logits, value) are NOT sent to the
+    // evaluator; their results come straight from the cache. The remaining
+    // (miss) states are batched into a single eval_fn call, and their results
+    // are inserted into the cache for future hits within the same search.
+    #[cfg(feature = "dedup_skip")]
+    let (logits_list, values): (Vec<HashMap<Coord, f64>>, Vec<f64>) = if !super::dedup_count::skip_enabled_tls() {
+        eval_fn(&pending_states)
+    } else {
+        let mut fingerprints: Vec<u128> = Vec::with_capacity(pending_states.len());
+        for (i, selection) in pending_selections.iter().enumerate() {
+            let path = &selection.path_actions;
+            let mut node: &MCTSNode = root;
+            let mut parent_state: Option<&GameState> = root.game_state.as_ref();
+            for (depth, &a) in path.iter().enumerate() {
+                let child = node.children.get(&a).expect("dedup_skip path broken");
+                if depth + 1 == path.len() {
+                    break;
+                }
+                parent_state = child.game_state.as_ref();
+                node = child;
+            }
+            let fp = super::dedup_count::position_fingerprint(
+                &pending_states[i],
+                parent_state,
+            );
+            fingerprints.push(fp);
+        }
+
+        let n = pending_states.len();
+        let mut out_logits: Vec<Option<HashMap<Coord, f64>>> = (0..n).map(|_| None).collect();
+        let mut out_values: Vec<f64> = vec![0.0; n];
+        let mut miss_idxs: Vec<usize> = Vec::new();
+        let mut miss_states: Vec<GameState> = Vec::new();
+        for (i, fp) in fingerprints.iter().enumerate() {
+            if let Some(entry) = super::dedup_count::eval_cache_get_tls(*fp) {
+                out_logits[i] = Some(entry.policy_logits);
+                out_values[i] = entry.value;
+            } else {
+                miss_idxs.push(i);
+                miss_states.push(pending_states[i].clone());
+            }
+        }
+
+        if !miss_states.is_empty() {
+            let (miss_logits, miss_vals) = eval_fn(&miss_states);
+            for (k, &i) in miss_idxs.iter().enumerate() {
+                let lm = miss_logits[k].clone();
+                let v = miss_vals[k];
+                super::dedup_count::eval_cache_insert_tls(
+                    fingerprints[i],
+                    super::dedup_count::CachedEval {
+                        policy_logits: lm.clone(),
+                        value: v,
+                    },
+                );
+                out_logits[i] = Some(lm);
+                out_values[i] = v;
+            }
+        }
+
+        (
+            out_logits.into_iter().map(|o| o.unwrap()).collect(),
+            out_values,
+        )
+    };
+
+    #[cfg(not(feature = "dedup_skip"))]
     let (logits_list, values) = eval_fn(&pending_states);
 
     // Phase 3: Convert logits to priors via softmax, expand leaves, and backup
@@ -197,6 +305,27 @@ fn simulate_batch_with_eval<F>(
             .collect();
         let leaf_value = values[i];
         complete_simulation(root, selection, leaf_priors, leaf_value);
+
+        #[cfg(feature = "dedup_count")]
+        {
+            // Walk the path to locate (parent_state, child_state) for the
+            // just-expanded leaf and record against the thread-local
+            // instrumentation singleton.
+            let mut node: &MCTSNode = root;
+            let mut parent_state: Option<&GameState> = root.game_state.as_ref();
+            let path = &selection.path_actions;
+            for (depth, &a) in path.iter().enumerate() {
+                let child = node.children.get(&a).expect("instr path broken");
+                if depth + 1 == path.len() {
+                    if let Some(child_state) = child.game_state.as_ref() {
+                        super::dedup_count::record_expansion_tls(parent_state, child_state);
+                    }
+                    break;
+                }
+                parent_state = child.game_state.as_ref();
+                node = child;
+            }
+        }
     }
 }
 
@@ -437,6 +566,48 @@ mod tests {
             result.action,
             winning_moves,
         );
+    }
+
+    /// REQ-0e-bis smoke test: with `dedup_skip`, running the same search
+    /// twice in a row (so the second run sees a fully populated eval cache)
+    /// must yield the same chosen action and improved policy as the first.
+    /// Verifies the cache-hit path produces tree nodes equivalent to a real
+    /// expansion.
+    #[cfg(feature = "dedup_skip")]
+    #[test]
+    fn dedup_skip_cache_hit_matches_real_eval() {
+        let game = GameState::with_config(small_config());
+        let config = MCTSConfig {
+            n_simulations: 32,
+            m_actions: 8,
+            c_visit: 50,
+            c_scale: 1.0,
+        };
+
+        crate::mcts::dedup_count::set_skip_enabled_tls(true);
+        // Run 1: cache empty -> all real evals.
+        crate::mcts::dedup_count::eval_cache_reset_tls();
+        let mut rng1 = ChaCha8Rng::seed_from_u64(123);
+        let r1 = gumbel_mcts(&game, &config, &mut rng1, &mut dummy_eval).unwrap();
+        let (h1, m1, _) = crate::mcts::dedup_count::eval_cache_snapshot_tls();
+
+        // Run 2: cache populated -> many cache hits, no resets.
+        let mut rng2 = ChaCha8Rng::seed_from_u64(123);
+        let r2 = gumbel_mcts(&game, &config, &mut rng2, &mut dummy_eval).unwrap();
+        let (h2, m2, _) = crate::mcts::dedup_count::eval_cache_snapshot_tls();
+
+        assert_eq!(r1.action, r2.action);
+        assert_eq!(r1.coords, r2.coords);
+        for (a, b) in r1.improved_policy.iter().zip(r2.improved_policy.iter()) {
+            assert!((a - b).abs() < 1e-9, "policy diverged: {} vs {}", a, b);
+        }
+        // Run 2 should have hit the cache far more than run 1.
+        assert!(h2 > h1, "second run should have more cache hits ({} vs {})", h2, h1);
+        // And it should have done strictly fewer fresh evals than run 1.
+        assert!(m2 - m1 < m1, "second run should miss less ({} new vs {} initial)", m2 - m1, m1);
+
+        crate::mcts::dedup_count::eval_cache_reset_tls();
+        crate::mcts::dedup_count::set_skip_enabled_tls(false);
     }
 
     #[test]

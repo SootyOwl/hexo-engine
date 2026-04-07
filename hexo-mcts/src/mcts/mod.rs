@@ -8,6 +8,9 @@ pub mod scoring;
 pub mod select;
 pub mod simulate;
 
+#[cfg(feature = "dedup_count")]
+pub mod dedup_count;
+
 /// MCTS configuration parameters.
 #[derive(Clone)]
 pub struct MCTSConfig {
