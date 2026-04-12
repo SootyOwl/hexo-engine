@@ -56,6 +56,7 @@ fn build_axis_graph(
     player_feat: f32,
     moves_feat: f32,
     win_length: u8,
+    prune_empty_edges: bool,
 ) -> AxisGraphData {
     debug_assert!(win_length >= 2, "win_length must be >= 2, got {win_length}");
     let n_stones = stones.len();
@@ -195,38 +196,46 @@ fn build_axis_graph(
 
                     let j_kind = node_kind[j];
 
-                    // Source player identity: +1 P1, -1 P2, 0 empty.
-                    // The receiving node (dst) uses this to know what's
-                    // sending it a message — critical for empty nodes to
-                    // detect opponent threats via incoming edges.
-                    let src_player_i = match i_kind {
-                        NodeKind::Stone(Player::P1) => 1.0f32,
-                        NodeKind::Stone(Player::P2) => -1.0f32,
-                        NodeKind::Empty => 0.0,
-                    };
-                    let src_player_j = match j_kind {
-                        NodeKind::Stone(Player::P1) => 1.0f32,
-                        NodeKind::Stone(Player::P2) => -1.0f32,
-                        NodeKind::Empty => 0.0,
-                    };
+                    // Skip empty→empty edges when pruning is enabled,
+                    // but continue the walk so empties can still reach
+                    // stones on the far side of other empties.
+                    let both_empty = matches!(i_kind, NodeKind::Empty)
+                        && matches!(j_kind, NodeKind::Empty);
 
-                    // Add bidirectional edges (i→j and j→i).
-                    let signed_dist = (d * sign) as f32;
-                    edge_src.push(i as i64);
-                    edge_dst.push(j as i64);
-                    let mut attr_fwd = [0.0f32; 5];
-                    attr_fwd[axis_idx] = 1.0;
-                    attr_fwd[3] = signed_dist;
-                    attr_fwd[4] = src_player_i;  // i is the source
-                    edge_attr.extend_from_slice(&attr_fwd);
+                    if !(prune_empty_edges && both_empty) {
+                        // Source player identity: +1 P1, -1 P2, 0 empty.
+                        // The receiving node (dst) uses this to know what's
+                        // sending it a message — critical for empty nodes to
+                        // detect opponent threats via incoming edges.
+                        let src_player_i = match i_kind {
+                            NodeKind::Stone(Player::P1) => 1.0f32,
+                            NodeKind::Stone(Player::P2) => -1.0f32,
+                            NodeKind::Empty => 0.0,
+                        };
+                        let src_player_j = match j_kind {
+                            NodeKind::Stone(Player::P1) => 1.0f32,
+                            NodeKind::Stone(Player::P2) => -1.0f32,
+                            NodeKind::Empty => 0.0,
+                        };
 
-                    edge_src.push(j as i64);
-                    edge_dst.push(i as i64);
-                    let mut attr_rev = [0.0f32; 5];
-                    attr_rev[axis_idx] = 1.0;
-                    attr_rev[3] = -signed_dist;
-                    attr_rev[4] = src_player_j;  // j is the source
-                    edge_attr.extend_from_slice(&attr_rev);
+                        // Add bidirectional edges (i→j and j→i).
+                        let signed_dist = (d * sign) as f32;
+                        edge_src.push(i as i64);
+                        edge_dst.push(j as i64);
+                        let mut attr_fwd = [0.0f32; 5];
+                        attr_fwd[axis_idx] = 1.0;
+                        attr_fwd[3] = signed_dist;
+                        attr_fwd[4] = src_player_i;  // i is the source
+                        edge_attr.extend_from_slice(&attr_fwd);
+
+                        edge_src.push(j as i64);
+                        edge_dst.push(i as i64);
+                        let mut attr_rev = [0.0f32; 5];
+                        attr_rev[axis_idx] = 1.0;
+                        attr_rev[3] = -signed_dist;
+                        attr_rev[4] = src_player_j;  // j is the source
+                        edge_attr.extend_from_slice(&attr_rev);
+                    }
 
                     // Walk stopping:
                     // - Stones stop at opponent stones (line is blocked).
@@ -305,6 +314,11 @@ fn build_axis_graph(
 
 /// Build axis-window graph arrays from a GameState.
 pub fn game_to_axis_graph_raw(game: &GameState) -> AxisGraphData {
+    game_to_axis_graph_raw_opts(game, false)
+}
+
+/// Build axis-window graph arrays with optional empty-edge pruning.
+pub fn game_to_axis_graph_raw_opts(game: &GameState, prune_empty_edges: bool) -> AxisGraphData {
     let mut stones = game.placed_stones();
     stones.sort_by_key(|&(coord, _)| coord);
     let legal = game.legal_moves(); // already sorted by engine
@@ -316,19 +330,29 @@ pub fn game_to_axis_graph_raw(game: &GameState) -> AxisGraphData {
     let moves_feat: f32 = game.moves_remaining_this_turn() as f32 / 2.0;
     let win_length = game.config().win_length;
 
-    build_axis_graph(&stones, &legal, player_feat, moves_feat, win_length)
+    build_axis_graph(&stones, &legal, player_feat, moves_feat, win_length, prune_empty_edges)
 }
 
 /// Build axis-window graph arrays for a batch of game states in parallel.
 pub fn game_to_axis_graph_batch(games: &[GameState]) -> Vec<AxisGraphData> {
+    game_to_axis_graph_batch_opts(games, false)
+}
+
+/// Build axis-window graph arrays for a batch with optional empty-edge pruning.
+pub fn game_to_axis_graph_batch_opts(games: &[GameState], prune_empty_edges: bool) -> Vec<AxisGraphData> {
     use rayon::prelude::*;
-    games.par_iter().map(game_to_axis_graph_raw).collect()
+    games.par_iter().map(|g| game_to_axis_graph_raw_opts(g, prune_empty_edges)).collect()
 }
 
 /// Produce 11 augmented axis-window graphs by applying the non-identity D6
 /// transforms to the input game state. Returns `(AxisGraphData, permutation)`
 /// pairs, where `permutation[new_legal_idx] = old_legal_idx`.
 pub fn augment_axis_graph(game: &GameState) -> Vec<(AxisGraphData, Vec<usize>)> {
+    augment_axis_graph_opts(game, false)
+}
+
+/// Augment with optional empty-edge pruning.
+pub fn augment_axis_graph_opts(game: &GameState, prune_empty_edges: bool) -> Vec<(AxisGraphData, Vec<usize>)> {
     use hexo_engine::symmetry::D6_TRANSFORMS;
 
     let mut stones = game.placed_stones();
@@ -363,7 +387,7 @@ pub fn augment_axis_graph(game: &GameState) -> Vec<(AxisGraphData, Vec<usize>)> 
             let t_legal: Vec<Coord> = indexed_legal.iter().map(|&(c, _)| c).collect();
             let permutation: Vec<usize> = indexed_legal.iter().map(|&(_, i)| i).collect();
 
-            let graph = build_axis_graph(&t_stones, &t_legal, player_feat, moves_feat, win_length);
+            let graph = build_axis_graph(&t_stones, &t_legal, player_feat, moves_feat, win_length, prune_empty_edges);
             (graph, permutation)
         })
         .collect()

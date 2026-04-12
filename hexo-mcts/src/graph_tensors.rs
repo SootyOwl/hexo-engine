@@ -9,7 +9,7 @@ use hexo_engine::types::{Coord, HEX_DIRS, Player};
 use hexo_engine::hex::hex_distance;
 use hexo_engine::GameState;
 
-use crate::axis_graph::game_to_axis_graph_raw;
+use crate::axis_graph::game_to_axis_graph_raw_opts;
 
 /// Graph type for model inference.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -207,7 +207,12 @@ pub fn build_graph_tensors(game: &GameState) -> GraphTensors {
 
 /// Build graph tensors from a game state using axis-window graph construction.
 pub fn build_axis_graph_tensors(game: &GameState) -> GraphTensors {
-    let axis_data = game_to_axis_graph_raw(game);
+    build_axis_graph_tensors_opts(game, false)
+}
+
+/// Build axis graph tensors with optional empty-edge pruning.
+pub fn build_axis_graph_tensors_opts(game: &GameState, prune_empty_edges: bool) -> GraphTensors {
+    let axis_data = game_to_axis_graph_raw_opts(game, prune_empty_edges);
 
     // Extract legal_coords from coords + legal_mask
     let legal_coords: Vec<Coord> = axis_data.legal_mask

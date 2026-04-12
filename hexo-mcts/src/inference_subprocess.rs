@@ -129,80 +129,88 @@ impl SubprocessModel {
             total_edges += g.num_edges as u32;
         }
 
-        // --- Serialize request to stdin ---
-        let stdin = self.child.stdin.as_mut().expect("stdin was piped");
-        let mut w = BufWriter::new(stdin);
+        // --- Build request into a single contiguous buffer ---
+        //
+        // Layout: header (19 bytes) + features (N×8×4) + edge_src (E×8) +
+        //         edge_dst (E×8) + [edge_attr (E×5×4)] + legal_mask (N) +
+        //         stone_mask (N) + batch (N×4)
+        let feat_bytes = total_nodes as usize * 8 * 4;
+        let edge_idx_bytes = total_edges as usize * 8 * 2; // src + dst
+        let edge_attr_bytes = if has_edge_attr { total_edges as usize * 5 * 4 } else { 0 };
+        let mask_bytes = total_nodes as usize * 2; // legal + stone
+        let batch_bytes = total_nodes as usize * 4;
+        let buf_size = 19 + feat_bytes + edge_idx_bytes + edge_attr_bytes + mask_bytes + batch_bytes;
 
-        // Header
-        w.write_all(&MAGIC.to_le_bytes()).map_err(|e| format!("write error: {e}"))?;
-        w.write_all(&[VERSION, MSG_FORWARD]).map_err(|e| format!("write error: {e}"))?;
-        w.write_all(&total_nodes.to_le_bytes()).map_err(|e| format!("write error: {e}"))?;
-        w.write_all(&total_edges.to_le_bytes()).map_err(|e| format!("write error: {e}"))?;
-        w.write_all(&num_graphs.to_le_bytes()).map_err(|e| format!("write error: {e}"))?;
-        w.write_all(&[has_edge_attr as u8]).map_err(|e| format!("write error: {e}"))?;
+        let mut buf = Vec::with_capacity(buf_size);
 
-        // Features: f32[total_nodes * 8]
+        // Header (19 bytes)
+        buf.extend_from_slice(&MAGIC.to_le_bytes());
+        buf.push(VERSION);
+        buf.push(MSG_FORWARD);
+        buf.extend_from_slice(&total_nodes.to_le_bytes());
+        buf.extend_from_slice(&total_edges.to_le_bytes());
+        buf.extend_from_slice(&num_graphs.to_le_bytes());
+        buf.push(has_edge_attr as u8);
+
+        // Features: copy each graph's feature slab as raw bytes
         for g in &graphs {
-            for &f in &g.features {
-                w.write_all(&f.to_le_bytes()).map_err(|e| format!("write error: {e}"))?;
-            }
+            buf.extend_from_slice(as_u8_slice(&g.features));
         }
 
-        // Edge indices with node offsets applied
+        // Edge src with node offsets applied
         let mut node_offset: i64 = 0;
         for g in &graphs {
             for &src in &g.edge_src {
-                w.write_all(&(src + node_offset).to_le_bytes())
-                    .map_err(|e| format!("write error: {e}"))?;
+                buf.extend_from_slice(&(src + node_offset).to_le_bytes());
             }
             node_offset += g.num_nodes as i64;
         }
 
+        // Edge dst with node offsets applied
         node_offset = 0;
         for g in &graphs {
             for &dst in &g.edge_dst {
-                w.write_all(&(dst + node_offset).to_le_bytes())
-                    .map_err(|e| format!("write error: {e}"))?;
+                buf.extend_from_slice(&(dst + node_offset).to_le_bytes());
             }
             node_offset += g.num_nodes as i64;
         }
 
-        // Edge attr (if present)
+        // Edge attr (if present) — raw byte copy, no per-graph offset
         if has_edge_attr {
             for g in &graphs {
                 if let Some(ref ea) = g.edge_attr {
-                    for &f in ea {
-                        w.write_all(&f.to_le_bytes())
-                            .map_err(|e| format!("write error: {e}"))?;
-                    }
+                    buf.extend_from_slice(as_u8_slice(ea));
                 }
             }
         }
 
-        // Legal mask
+        // Legal mask + stone mask — pack bools as single bytes
         for g in &graphs {
             for &m in &g.legal_mask {
-                w.write_all(&[m as u8]).map_err(|e| format!("write error: {e}"))?;
+                buf.push(m as u8);
             }
         }
-
-        // Stone mask
         for g in &graphs {
             for &m in &g.stone_mask {
-                w.write_all(&[m as u8]).map_err(|e| format!("write error: {e}"))?;
+                buf.push(m as u8);
             }
         }
 
         // Batch indices
         for (batch_idx, g) in graphs.iter().enumerate() {
             let idx = batch_idx as i32;
+            let idx_bytes = idx.to_le_bytes();
             for _ in 0..g.num_nodes {
-                w.write_all(&idx.to_le_bytes())
-                    .map_err(|e| format!("write error: {e}"))?;
+                buf.extend_from_slice(&idx_bytes);
             }
         }
 
-        w.flush().map_err(|e| format!("flush error: {e}"))?;
+        debug_assert_eq!(buf.len(), buf_size);
+
+        // Single write + flush
+        let stdin = self.child.stdin.as_mut().expect("stdin was piped");
+        stdin.write_all(&buf).map_err(|e| format!("write error: {e}"))?;
+        stdin.flush().map_err(|e| format!("flush error: {e}"))?;
 
         // --- Read response from stdout ---
         let stdout = self.child.stdout.as_mut().expect("stdout was piped");
@@ -417,4 +425,12 @@ fn read_i32_slice(r: &mut impl std::io::Read, out: &mut [i32]) -> Result<(), Str
         out[i] = i32::from_le_bytes(chunk.try_into().unwrap());
     }
     Ok(())
+}
+
+/// Reinterpret a `&[f32]` as `&[u8]` for zero-copy writes.
+/// Safe on all platforms (f32 has alignment ≥ u8).
+fn as_u8_slice(slice: &[f32]) -> &[u8] {
+    unsafe {
+        std::slice::from_raw_parts(slice.as_ptr() as *const u8, slice.len() * 4)
+    }
 }
