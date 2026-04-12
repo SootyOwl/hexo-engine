@@ -19,9 +19,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 #[cfg(feature = "torch")]
 use std::sync::mpsc::{SyncSender, TrySendError};
-use std::time::{Duration, Instant};
-#[cfg(feature = "torch")]
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use hexo_engine::game::{GameConfig, GameState};
 use hexo_engine::types::Coord;
@@ -236,7 +234,183 @@ fn inference_server_subprocess(
     }
 }
 
-#[cfg(feature = "torch")]
+/// Pool inference server for subprocess mode. Spawns its own SubprocessModel
+/// and waits for the pool loader to signal which checkpoint to load via a
+/// channel of file paths.
+fn pool_inference_server_subprocess(
+    request_rx: mpsc::Receiver<EvalRequest>,
+    max_batch: usize,
+    batch_timeout: Duration,
+    running: &AtomicBool,
+    pool_path_rx: mpsc::Receiver<String>,
+    python_bin: &str,
+    model_args: &[String],
+) {
+    // Wait for the first checkpoint path from the loader.
+    let first_path = match pool_path_rx.recv() {
+        Ok(p) => p,
+        Err(_) => return, // loader exited before producing a path
+    };
+
+    let mut model = match SubprocessModel::spawn(python_bin, &first_path, model_args) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("Pool subprocess failed to spawn: {e}");
+            return;
+        }
+    };
+
+    loop {
+        // Swap to any newly-staged checkpoint path before blocking on requests.
+        if let Ok(new_path) = pool_path_rx.try_recv() {
+            model.try_reload(&new_path);
+        }
+
+        let first = match request_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(req) => req,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if !running.load(Ordering::Relaxed) { break; }
+                continue;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+
+        let mut requests = vec![first];
+        let mut total_graphs: usize = requests[0].graphs.len();
+        let deadline = Instant::now() + batch_timeout;
+
+        while total_graphs < max_batch {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() { break; }
+            match request_rx.recv_timeout(remaining) {
+                Ok(req) => {
+                    total_graphs += req.graphs.len();
+                    requests.push(req);
+                }
+                Err(_) => break,
+            }
+        }
+
+        let mut all_graphs = Vec::with_capacity(total_graphs);
+        let mut slice_ranges: Vec<(usize, usize)> = Vec::with_capacity(requests.len());
+        for req in &mut requests {
+            let start = all_graphs.len();
+            all_graphs.extend(req.graphs.drain(..));
+            slice_ranges.push((start, all_graphs.len()));
+        }
+
+        match model.forward_graphs(all_graphs) {
+            Ok((all_logits, all_values)) => {
+                for (i, req) in requests.into_iter().enumerate() {
+                    let (start, end) = slice_ranges[i];
+                    let logits = all_logits[start..end].to_vec();
+                    let values = all_values[start..end].to_vec();
+                    let _ = req.response_tx.send((logits, values));
+                }
+            }
+            Err(e) => {
+                eprintln!("Pool subprocess forward error: {e}");
+                for req in requests {
+                    let n = req.graphs.len().max(1);
+                    let empty_logits: Vec<HashMap<Coord, f64>> =
+                        (0..n).map(|_| HashMap::new()).collect();
+                    let _ = req.response_tx.send((empty_logits, vec![0.0; n]));
+                }
+            }
+        }
+    }
+}
+
+/// Background pool loader for subprocess mode. Periodically picks a random
+/// checkpoint from pool_dir and sends its path to the pool inference server
+/// via a channel. The subprocess handles the actual reload.
+fn pool_subprocess_loader(
+    pool_dir: String,
+    pool_path_tx: mpsc::SyncSender<String>,
+    pool_disabled: Arc<AtomicBool>,
+    pool_ready: Arc<AtomicBool>,
+    running: Arc<AtomicBool>,
+) {
+    const RELOAD_INTERVAL_SECS: u64 = 30;
+    const WARMUP_INTERVAL_SECS: u64 = 5;
+
+    eprintln!(
+        "Pool loader started (dir={}, warmup_interval={}s, reload_interval={}s)",
+        pool_dir, WARMUP_INTERVAL_SECS, RELOAD_INTERVAL_SECS
+    );
+
+    let mut rng = ChaCha8Rng::from_os_rng();
+    let mut consecutive_failures: usize = 0;
+    let mut last_loaded_path: Option<String> = None;
+    let mut cached_snaps: Vec<std::path::PathBuf> = Vec::new();
+    let mut cached_mtime: Option<SystemTime> = None;
+    let mut first_iter = true;
+    let mut ever_loaded = false;
+
+    loop {
+        if !first_iter {
+            let interval = if ever_loaded { RELOAD_INTERVAL_SECS } else { WARMUP_INTERVAL_SECS };
+            for _ in 0..interval {
+                if !running.load(Ordering::Relaxed) {
+                    eprintln!("Pool loader exited");
+                    return;
+                }
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        }
+        first_iter = false;
+
+        if !running.load(Ordering::Relaxed) {
+            eprintln!("Pool loader exited");
+            return;
+        }
+
+        let dir_mtime = file_mtime(&pool_dir);
+        if cached_snaps.is_empty() || dir_mtime != cached_mtime {
+            cached_snaps = list_pool_snapshots(&pool_dir);
+            cached_mtime = dir_mtime;
+        }
+
+        if cached_snaps.is_empty() {
+            continue;
+        }
+
+        let idx = (rng.random::<u64>() as usize) % cached_snaps.len();
+        let pick = &cached_snaps[idx];
+        let path_str = pick.to_string_lossy().to_string();
+
+        let same_as_last = last_loaded_path.as_deref() == Some(path_str.as_str());
+        if !same_as_last {
+            eprintln!("Pool snapshot selected -> {}", pick.display());
+            last_loaded_path = Some(path_str.clone());
+        }
+
+        // Send path to pool inference server. Use try_send to avoid blocking
+        // if the server hasn't consumed the previous path yet.
+        // Drain any unconsumed path first.
+        while pool_path_tx.try_send(String::new()).is_ok() {}
+        match pool_path_tx.try_send(path_str) {
+            Ok(_) => {
+                consecutive_failures = 0;
+                if !ever_loaded {
+                    ever_loaded = true;
+                    pool_ready.store(true, Ordering::Relaxed);
+                    eprintln!("Pool ready: first snapshot path sent");
+                }
+            }
+            Err(e) => {
+                eprintln!("Pool loader: failed to send path: {e}");
+                consecutive_failures += 1;
+                if consecutive_failures >= 5 {
+                    eprintln!("Pool disabled after 5 consecutive failures");
+                    pool_disabled.store(true, Ordering::Relaxed);
+                    return;
+                }
+            }
+        }
+    }
+}
+
 /// Scan ``dir`` for ``*.pt`` files. Returns sorted list of paths.
 fn list_pool_snapshots(dir: &str) -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();
@@ -983,7 +1157,6 @@ impl RotatingWriter {
     }
 }
 
-#[cfg(feature = "torch")]
 fn file_mtime(path: &str) -> Option<SystemTime> {
     fs::metadata(path).ok().and_then(|m| m.modified().ok())
 }
@@ -1318,16 +1491,11 @@ fn main() {
 
         // Build the pool inference channel up front (when configured) so we
         // can clone the client into game threads inside the scope.
-        // Pool is only available with torch — subprocess mode disables it.
-        #[allow(unused_variables)] // pool_request_rx_opt used only with torch
         let (pool_client_opt, pool_request_rx_opt) =
-            if !python_inference && pool_fraction > 0.0 && pool_dir.is_some() {
+            if pool_fraction > 0.0 && pool_dir.is_some() {
                 let (ptx, prx) = mpsc::channel::<EvalRequest>();
                 (Some(InferenceClient { request_tx: ptx }), Some(prx))
             } else {
-                if python_inference && pool_fraction > 0.0 {
-                    eprintln!("Warning: --pool-dir is not supported with --python-inference, ignoring.");
-                }
                 (None, None)
             };
 
@@ -1352,6 +1520,33 @@ fn main() {
                         running_ref, Some(model_path_ref),
                     );
                 });
+
+                // Spawn pool inference server + background loader (if configured).
+                if let Some(prx) = pool_request_rx_opt {
+                    let pdir = pool_dir.clone().expect("pool_dir set when pool configured");
+                    let (pool_path_tx, pool_path_rx) = mpsc::sync_channel::<String>(1);
+
+                    let python_bin_clone = python_bin.clone();
+                    let model_args_clone = model_args.clone();
+                    s.spawn(move || {
+                        pool_inference_server_subprocess(
+                            prx, max_batch, batch_timeout,
+                            running_ref, pool_path_rx,
+                            &python_bin_clone, &model_args_clone,
+                        );
+                    });
+
+                    let pool_disabled_loader = pool_disabled.clone();
+                    let pool_ready_loader = pool_ready.clone();
+                    let running_loader = running.clone();
+                    s.spawn(move || {
+                        pool_subprocess_loader(
+                            pdir, pool_path_tx,
+                            pool_disabled_loader, pool_ready_loader,
+                            running_loader,
+                        );
+                    });
+                }
 
                 run_continuous_game_threads(
                     s, client, pool_client_opt, n_threads, seed, game_config,
