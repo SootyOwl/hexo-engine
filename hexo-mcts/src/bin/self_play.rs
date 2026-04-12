@@ -472,10 +472,10 @@ struct GameResult {
 
 impl GameResult {
     /// Convert to a serializable GameRecord, computing value targets.
-    fn to_record(&self) -> GameRecord {
+    fn to_record(&self, draw_value: f32) -> GameRecord {
         let examples = self.positions.iter().map(|pos| {
-            let value = if self.winner == "draw" {
-                0.0
+            let value: f64 = if self.winner == "draw" {
+                draw_value as f64
             } else if self.winner == pos.player {
                 1.0
             } else {
@@ -539,7 +539,7 @@ const RECORD_MAGIC: &[u8; 4] = b"HX03";
 /// [num_nodes*2*4B coords i32]
 /// [num_legal*8B policy f64]
 /// ```
-fn write_game_binary<W: Write>(writer: &mut W, result: &GameResult) -> std::io::Result<()> {
+fn write_game_binary<W: Write>(writer: &mut W, result: &GameResult, draw_value: f32) -> std::io::Result<()> {
     // First pass: compute total size
     let mut size = 4u32 + 1 + 4; // num_examples + winner byte + move_count
     for pos in &result.positions {
@@ -566,7 +566,7 @@ fn write_game_binary<W: Write>(writer: &mut W, result: &GameResult) -> std::io::
 
     for pos in &result.positions {
         let value: f64 = if result.winner == "draw" {
-            0.0
+            draw_value as f64
         } else if result.winner == pos.player {
             1.0
         } else {
@@ -623,8 +623,8 @@ fn write_example<W: Write>(writer: &mut W, pos: &PositionData, value: f64) -> st
 }
 
 /// Serialize a game to JSON (for batch mode / backwards compat).
-fn game_to_json(result: &GameResult) -> serde_json::Value {
-    let record = result.to_record();
+fn game_to_json(result: &GameResult, draw_value: f32) -> serde_json::Value {
+    let record = result.to_record(draw_value);
     serde_json::to_value(&record).expect("serialization failed")
 }
 
@@ -832,10 +832,11 @@ struct RotatingWriter {
     seq: u32,
     writer: BufWriter<fs::File>,
     bytes_written: u64,
+    draw_value: f32,
 }
 
 impl RotatingWriter {
-    fn new(dir: &str, filename: &str, max_bytes: u64) -> Self {
+    fn new(dir: &str, filename: &str, max_bytes: u64, draw_value: f32) -> Self {
         let (stem, ext) = match filename.rsplit_once('.') {
             Some((s, e)) => (s.to_string(), e.to_string()),
             None => (filename.to_string(), "bin".to_string()),
@@ -848,6 +849,7 @@ impl RotatingWriter {
             seq: 0,
             writer: BufWriter::new(fs::File::create("/dev/null").unwrap()),
             bytes_written: 0,
+            draw_value,
         };
         rw.rotate();
         rw
@@ -872,7 +874,7 @@ impl RotatingWriter {
             self.rotate();
         }
         let pos_before = self.bytes_written;
-        write_game_binary(&mut self.writer, result)?;
+        write_game_binary(&mut self.writer, result, self.draw_value)?;
         // Estimate bytes written (flush ensures data hits OS)
         self.writer.flush()?;
         // Use the file position to track actual bytes
@@ -924,6 +926,7 @@ fn main() {
     let mut exploration_max: Option<f64> = None; // adaptive exploration ceiling
     let mut exploration_window: u32 = 200; // EMA effective window for p1 decided rate
     let mut exploration_exponent: f64 = 1.0; // deviation curve: 1.0=linear, 2.0=squared
+    let mut draw_value: f32 = 0.0; // value target for drawn games (0.0=neutral, -0.1=penalty)
 
     let mut i = 1;
     while i < args.len() {
@@ -941,6 +944,7 @@ fn main() {
             "--exploration-max" => { exploration_max = Some(args[i + 1].parse().unwrap()); i += 2; }
             "--exploration-window" => { exploration_window = args[i + 1].parse().unwrap(); i += 2; }
             "--exploration-exponent" => { exploration_exponent = args[i + 1].parse().unwrap(); i += 2; }
+            "--draw-value" => { draw_value = args[i + 1].parse().unwrap(); i += 2; }
             "--output" => { output_path = args[i + 1].clone(); i += 2; }
             "--output-dir" => { output_dir = Some(args[i + 1].clone()); i += 2; }
             "--seed" => { seed = Some(args[i + 1].parse().unwrap()); i += 2; }
@@ -1131,7 +1135,7 @@ fn main() {
         let total_moves: usize = all_games.iter().map(|g| g.move_count as usize).sum();
 
         let json: Vec<serde_json::Value> = all_games.iter()
-            .map(|g| game_to_json(g))
+            .map(|g| game_to_json(g, draw_value))
             .collect();
         let tmp_path = format!("{}.tmp", output_path);
         fs::write(&tmp_path, serde_json::to_string(&json).unwrap())
@@ -1153,7 +1157,7 @@ fn main() {
         fs::create_dir_all(&dir).expect("Failed to create output directory");
 
         let rotating_writer = Arc::new(Mutex::new(
-            RotatingWriter::new(&dir, &output_filename, max_file_mb * 1024 * 1024),
+            RotatingWriter::new(&dir, &output_filename, max_file_mb * 1024 * 1024, draw_value),
         ));
 
         if let Some(frac) = exploration_fraction {
@@ -1438,7 +1442,7 @@ mod tests {
     fn hex_binary_roundtrip() {
         let result = make_result(GraphType::Hex, "P1");
         let mut buf = Vec::new();
-        write_game_binary(&mut buf, &result).unwrap();
+        write_game_binary(&mut buf, &result, 0.0).unwrap();
         assert!(buf.len() > 17);
         // Check magic
         assert_eq!(&buf[..4], RECORD_MAGIC);
@@ -1461,7 +1465,7 @@ mod tests {
         for (w, expected) in [("P1", 1i8), ("P2", -1i8), ("draw", 0i8)] {
             let result = make_result(GraphType::Hex, w);
             let mut buf = Vec::new();
-            write_game_binary(&mut buf, &result).unwrap();
+            write_game_binary(&mut buf, &result, 0.0).unwrap();
             assert_eq!(&buf[..4], b"HX03");
             assert_eq!(buf[12] as i8, expected, "winner {w}");
             // Length prefix should match buffer minus magic+size header
@@ -1487,7 +1491,7 @@ mod tests {
             move_count: 10,
         };
         let mut buf = Vec::new();
-        write_game_binary(&mut buf, &result).unwrap();
+        write_game_binary(&mut buf, &result, 0.0).unwrap();
         let num_examples = u32::from_le_bytes(buf[8..12].try_into().unwrap());
         assert_eq!(num_examples, 3, "examples == positions.len()");
         let move_count = u32::from_le_bytes(buf[13..17].try_into().unwrap());
@@ -1497,7 +1501,7 @@ mod tests {
     #[test]
     fn axis_msgpack_has_edge_attr() {
         let result = make_result(GraphType::Axis, "draw");
-        let record = result.to_record();
+        let record = result.to_record(0.0);
         assert!(record.examples[0].edge_attr.is_some());
     }
 
@@ -1514,17 +1518,24 @@ mod tests {
             winner: "P1",
             move_count: 2,
         };
-        let record = result.to_record();
+        let record = result.to_record(0.0);
         assert_eq!(record.examples[0].value, 1.0);  // P1 wins, P1's turn
         assert_eq!(record.examples[1].value, -1.0); // P1 wins, P2's turn
         assert_eq!(record.length, 2);
     }
 
     #[test]
-    fn value_targets_draw() {
+    fn value_targets_draw_neutral() {
         let result = make_result(GraphType::Hex, "draw");
-        let record = result.to_record();
+        let record = result.to_record(0.0);
         assert_eq!(record.examples[0].value, 0.0);
+    }
+
+    #[test]
+    fn value_targets_draw_penalty() {
+        let result = make_result(GraphType::Hex, "draw");
+        let record = result.to_record(-0.1);
+        assert!((record.examples[0].value - (-0.1)).abs() < 1e-6);
     }
 
     #[test]
@@ -1718,7 +1729,7 @@ mod tests {
     #[test]
     fn json_output_has_expected_keys() {
         let result = make_result(GraphType::Hex, "P1");
-        let json = game_to_json(&result);
+        let json = game_to_json(&result, 0.0);
         let examples = json["examples"].as_array().unwrap();
         assert_eq!(examples.len(), 1);
         assert!(examples[0]["features"].is_array());
