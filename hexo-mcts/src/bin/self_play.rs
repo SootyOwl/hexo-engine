@@ -24,7 +24,8 @@ use hexo_engine::game::{GameConfig, GameState};
 use hexo_engine::types::Coord;
 use hexo_rs::axis_graph::game_to_axis_graph_raw;
 use hexo_rs::graph::game_to_graph_raw;
-use hexo_rs::inference::{GraphTensors, GraphType, TorchModel};
+use hexo_rs::graph_tensors::GraphTensors;
+use hexo_rs::inference::{GraphType, TorchModel};
 use hexo_rs::mcts::MCTSConfig;
 
 use rand::{Rng, SeedableRng};
