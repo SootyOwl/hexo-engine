@@ -17,15 +17,20 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
+#[cfg(feature = "torch")]
 use std::sync::mpsc::{SyncSender, TrySendError};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
+#[cfg(feature = "torch")]
+use std::time::SystemTime;
 
 use hexo_engine::game::{GameConfig, GameState};
 use hexo_engine::types::Coord;
 use hexo_rs::axis_graph::game_to_axis_graph_raw;
 use hexo_rs::graph::game_to_graph_raw;
-use hexo_rs::graph_tensors::GraphTensors;
-use hexo_rs::inference::{GraphType, TorchModel};
+use hexo_rs::graph_tensors::{GraphTensors, GraphType};
+#[cfg(feature = "torch")]
+use hexo_rs::inference::TorchModel;
+use hexo_rs::inference_subprocess::SubprocessModel;
 use hexo_rs::mcts::MCTSConfig;
 
 use rand::{Rng, SeedableRng};
@@ -63,6 +68,7 @@ impl InferenceClient {
 /// Run the inference server loop. Collects requests into batches and
 /// runs forward passes. Returns when all senders are dropped or `running`
 /// is set to false.
+#[cfg(feature = "torch")]
 fn inference_server(
     request_rx: mpsc::Receiver<EvalRequest>,
     model: &mut TorchModel,
@@ -144,6 +150,93 @@ fn inference_server(
     }
 }
 
+/// Run the inference server loop using a Python subprocess model.
+/// Same batching logic as `inference_server` but uses `SubprocessModel`.
+fn inference_server_subprocess(
+    request_rx: mpsc::Receiver<EvalRequest>,
+    model: &mut SubprocessModel,
+    max_batch: usize,
+    batch_timeout: Duration,
+    running: &AtomicBool,
+    model_path: Option<&str>,
+) {
+    loop {
+        // Block on first request (or check shutdown)
+        let first = match request_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(req) => req,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if !running.load(Ordering::Relaxed) {
+                    break;
+                }
+                // Check for model reload during idle
+                if let Some(path) = model_path {
+                    model.try_reload(path);
+                }
+                continue;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+
+        // Collect more requests up to max_batch or timeout
+        let mut requests = vec![first];
+        let mut total_graphs: usize = requests[0].graphs.len();
+        let deadline = Instant::now() + batch_timeout;
+
+        while total_graphs < max_batch {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match request_rx.recv_timeout(remaining) {
+                Ok(req) => {
+                    total_graphs += req.graphs.len();
+                    requests.push(req);
+                }
+                Err(_) => break,
+            }
+        }
+
+        // Flatten all graphs into one batch
+        let mut all_graphs = Vec::with_capacity(total_graphs);
+        let mut slice_ranges: Vec<(usize, usize)> = Vec::with_capacity(requests.len());
+        for req in &mut requests {
+            let start = all_graphs.len();
+            all_graphs.extend(req.graphs.drain(..));
+            slice_ranges.push((start, all_graphs.len()));
+        }
+
+        // Single forward pass via subprocess
+        match model.forward_graphs(all_graphs) {
+            Ok((all_logits, all_values)) => {
+                // Scatter results back
+                for (i, req) in requests.into_iter().enumerate() {
+                    let (start, end) = slice_ranges[i];
+                    let logits = all_logits[start..end].to_vec();
+                    let values = all_values[start..end].to_vec();
+                    let _ = req.response_tx.send((logits, values));
+                }
+            }
+            Err(e) => {
+                eprintln!("Subprocess forward error: {e}");
+                // Send empty results so game threads don't hang
+                for req in requests {
+                    let n = req.graphs.len().max(1); // graphs already drained
+                    let empty_logits: Vec<HashMap<Coord, f64>> =
+                        (0..n).map(|_| HashMap::new()).collect();
+                    let empty_values: Vec<f64> = vec![0.0; n];
+                    let _ = req.response_tx.send((empty_logits, empty_values));
+                }
+            }
+        }
+
+        // Check for model reload after processing a batch
+        if let Some(path) = model_path {
+            model.try_reload(path);
+        }
+    }
+}
+
+#[cfg(feature = "torch")]
 /// Scan ``dir`` for ``*.pt`` files. Returns sorted list of paths.
 fn list_pool_snapshots(dir: &str) -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();
@@ -159,6 +252,7 @@ fn list_pool_snapshots(dir: &str) -> Vec<std::path::PathBuf> {
     out
 }
 
+#[cfg(feature = "torch")]
 /// Drain a bounded channel of capacity 1 and then send ``value``. Used by
 /// the pool loader to "always have the freshest model staged" without ever
 /// blocking the inference thread on disk I/O: if a previously staged model
@@ -193,6 +287,7 @@ fn try_replace<T>(tx: &SyncSender<T>, value: T) -> Result<(), TrySendError<T>> {
     }
 }
 
+#[cfg(feature = "torch")]
 /// Pool inference server: processes eval requests using the currently-
 /// loaded snapshot. Model reloads happen on a separate background loader
 /// thread; this server just picks up newly-staged models non-blockingly
@@ -279,6 +374,7 @@ fn pool_inference_server(
     }
 }
 
+#[cfg(feature = "torch")]
 /// Background pool model loader. Periodically picks a random ``.pt``
 /// snapshot from ``pool_dir``, loads it off-thread, and stages it for the
 /// pool inference server to atomically swap in. Never blocks the inference
@@ -397,6 +493,7 @@ fn pool_model_loader(
     }
 }
 
+#[cfg(feature = "torch")]
 fn try_reload_model(
     model: &mut TorchModel,
     path: &str,
@@ -886,6 +983,7 @@ impl RotatingWriter {
     }
 }
 
+#[cfg(feature = "torch")]
 fn file_mtime(path: &str) -> Option<SystemTime> {
     fs::metadata(path).ok().and_then(|m| m.modified().ok())
 }
@@ -922,12 +1020,25 @@ fn main() {
     let mut pool_fraction: f64 = 0.0;
     let mut playout_cap_fraction: f64 = 0.0;
     let mut playout_cap_divisor: u32 = 1;
+    #[allow(unused)] // used only with torch feature
     let mut padded_inference: bool = false;
+    #[allow(unused)] // used only with torch feature
     let mut shape_hist: bool = false;
     let mut exploration_max: Option<f64> = None; // adaptive exploration ceiling
     let mut exploration_window: u32 = 200; // EMA effective window for p1 decided rate
     let mut exploration_exponent: f64 = 1.0; // deviation curve: 1.0=linear, 2.0=squared
     let mut draw_value: f32 = 0.0; // value target for drawn games (0.0=neutral, -0.1=penalty)
+
+    // Python subprocess inference flags
+    let mut python_inference = false;
+    let mut python_bin = String::from("python");
+    let mut checkpoint_path: Option<String> = None;
+    let mut model_hidden_dim: usize = 256;
+    let mut model_num_layers: usize = 3;
+    let mut model_num_heads: usize = 8;
+    let mut model_policy_hidden: usize = 128;
+    let mut model_value_hidden: usize = 128;
+    let mut model_conv_type = String::from("gine");
 
     let mut i = 1;
     while i < args.len() {
@@ -974,8 +1085,8 @@ fn main() {
                 }
                 i += 2;
             }
-            "--padded-inference" => { padded_inference = true; i += 1; }
-            "--shape-hist" => { shape_hist = true; i += 1; }
+            "--padded-inference" => { #[allow(unused)] { padded_inference = true; } i += 1; }
+            "--shape-hist" => { #[allow(unused)] { shape_hist = true; } i += 1; }
             "--playout-cap-divisor" => {
                 playout_cap_divisor = args[i + 1].parse().unwrap();
                 if playout_cap_divisor < 1 {
@@ -984,6 +1095,15 @@ fn main() {
                 }
                 i += 2;
             }
+            "--python-inference" => { python_inference = true; i += 1; }
+            "--python-bin" => { python_bin = args[i + 1].clone(); i += 2; }
+            "--checkpoint" => { checkpoint_path = Some(args[i + 1].clone()); i += 2; }
+            "--model-hidden-dim" => { model_hidden_dim = args[i + 1].parse().unwrap(); i += 2; }
+            "--model-num-layers" => { model_num_layers = args[i + 1].parse().unwrap(); i += 2; }
+            "--model-num-heads" => { model_num_heads = args[i + 1].parse().unwrap(); i += 2; }
+            "--model-policy-hidden" => { model_policy_hidden = args[i + 1].parse().unwrap(); i += 2; }
+            "--model-value-hidden" => { model_value_hidden = args[i + 1].parse().unwrap(); i += 2; }
+            "--model-conv-type" => { model_conv_type = args[i + 1].clone(); i += 2; }
             _ => { eprintln!("Unknown arg: {}", args[i]); i += 1; }
         }
     }
@@ -1013,13 +1133,11 @@ fn main() {
         std::env::set_var("MKL_NUM_THREADS", omp_threads.to_string());
         std::env::set_var("OMP_PROC_BIND", "CLOSE");
     }
-    tch::set_num_threads(omp_threads as i32);
-    tch::set_num_interop_threads(1);
-
-    let tch_device = match device_str {
-        "cuda" => tch::Device::Cuda(0),
-        _ => tch::Device::Cpu,
-    };
+    #[cfg(feature = "torch")]
+    if !python_inference {
+        tch::set_num_threads(omp_threads as i32);
+        tch::set_num_interop_threads(1);
+    }
 
     // Ctrl+C handler
     let running = Arc::new(AtomicBool::new(true));
@@ -1044,22 +1162,15 @@ fn main() {
         c_scale: 1.0,
     });
 
-    // Load model once (shared via inference server)
-    eprintln!("Loading model from {}...", model_path);
-    let mut model = match TorchModel::load_with_graph_type(&model_path, tch_device, graph_type) {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("Failed to load model: {e}");
-            std::process::exit(1);
-        }
-    };
-
     let batch_timeout = if batch_timeout_ms > 0 {
         Duration::from_millis(batch_timeout_ms)
-    } else if tch_device == tch::Device::Cpu {
-        Duration::from_millis(5)
     } else {
-        Duration::from_millis(1)
+        // Default: shorter timeout for GPU, longer for CPU
+        if device_str == "cuda" {
+            Duration::from_millis(1)
+        } else {
+            Duration::from_millis(5)
+        }
     };
 
     let exploration_atomic = Arc::new(AtomicUsize::new(exploration));
@@ -1080,57 +1191,78 @@ fn main() {
         let (request_tx, request_rx) = mpsc::channel::<EvalRequest>();
         let client = InferenceClient { request_tx };
 
-        let all_games: Vec<GameResult> = std::thread::scope(|s| {
-            // Spawn inference server
-            let running_ref = &running;
-            let model_ref = &mut model;
-            let server_handle = s.spawn(move || {
-                inference_server(
-                    request_rx, model_ref, max_batch, batch_timeout,
-                    running_ref, None, tch_device, graph_type, padded_inference,
+        let all_games: Vec<GameResult> = if python_inference {
+            let ckpt = checkpoint_path.as_deref().unwrap_or(&model_path);
+            let model_args = subprocess_model_args(
+                model_hidden_dim, model_num_layers, model_num_heads,
+                model_policy_hidden, model_value_hidden,
+                &graph_type_str, &model_conv_type, device_str,
+            );
+            eprintln!("Spawning Python inference subprocess...");
+            let mut model = SubprocessModel::spawn(&python_bin, ckpt, &model_args)
+                .unwrap_or_else(|e| { eprintln!("Failed to spawn Python: {e}"); std::process::exit(1); });
+
+            std::thread::scope(|s| {
+                let running_ref = &running;
+                let model_ref = &mut model;
+                let server_handle = s.spawn(move || {
+                    inference_server_subprocess(
+                        request_rx, model_ref, max_batch, batch_timeout,
+                        running_ref, None,
+                    );
+                });
+
+                let results = run_batch_games(
+                    s, client, n_games, n_threads, seed, game_config, &mcts_config,
+                    &exploration_atomic, graph_type, playout_cap_fraction, playout_cap_divisor,
+                    &running,
                 );
-            });
 
-            // Spawn game threads
-            let games_per_thread = distribute(n_games, n_threads);
-            let handles: Vec<_> = games_per_thread
-                .into_iter()
-                .enumerate()
-                .map(|(ti, count)| {
-                    let client = client.clone();
-                    let mcts_config = &mcts_config;
-                    let exploration_ref = &exploration_atomic;
-                    let running_thread = running.clone();
-                    s.spawn(move || {
-                        let mut rng = make_rng(seed, ti as u64, 0);
-                        let mut results = Vec::with_capacity(count);
-                        for _ in 0..count {
-                            if let Some(game) = play_one_game(
-                                &client, None, None, game_config, mcts_config,
-                                exploration_ref, graph_type, &mut rng,
-                                playout_cap_fraction, playout_cap_divisor,
-                                &running_thread,
-                            ) {
-                                results.push(game);
-                            }
-                        }
-                        results
-                    })
+                server_handle.join().unwrap();
+                results
+            })
+        } else {
+            #[cfg(not(feature = "torch"))]
+            {
+                eprintln!("Built without torch feature. Use --python-inference or rebuild with --features torch.");
+                std::process::exit(1);
+            }
+            #[cfg(feature = "torch")]
+            {
+                let tch_device = match device_str {
+                    "cuda" => tch::Device::Cuda(0),
+                    _ => tch::Device::Cpu,
+                };
+                eprintln!("Loading model from {}...", model_path);
+                let mut model = match TorchModel::load_with_graph_type(&model_path, tch_device, graph_type) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        eprintln!("Failed to load model: {e}");
+                        std::process::exit(1);
+                    }
+                };
+
+                std::thread::scope(|s| {
+                    let running_ref = &running;
+                    let model_ref = &mut model;
+                    let server_handle = s.spawn(move || {
+                        inference_server(
+                            request_rx, model_ref, max_batch, batch_timeout,
+                            running_ref, None, tch_device, graph_type, padded_inference,
+                        );
+                    });
+
+                    let results = run_batch_games(
+                        s, client, n_games, n_threads, seed, game_config, &mcts_config,
+                        &exploration_atomic, graph_type, playout_cap_fraction, playout_cap_divisor,
+                        &running,
+                    );
+
+                    server_handle.join().unwrap();
+                    results
                 })
-                .collect();
-
-            // Collect game results
-            let results: Vec<GameResult> = handles
-                .into_iter()
-                .flat_map(|h| h.join().unwrap_or_default())
-                .collect();
-
-            // Drop the client so the inference server sees disconnect
-            drop(client);
-            server_handle.join().unwrap();
-
-            results
-        });
+            }
+        };
 
         let elapsed = start.elapsed();
         let total_moves: usize = all_games.iter().map(|g| g.move_count as usize).sum();
@@ -1151,7 +1283,8 @@ fn main() {
         );
     } else {
         // --- Continuous mode ---
-        if shape_hist {
+        #[cfg(feature = "torch")]
+        if shape_hist && !python_inference {
             hexo_rs::inference::enable_shape_hist();
         }
         let dir = output_dir.unwrap_or_else(|| "self_play_output".to_string());
@@ -1179,230 +1312,370 @@ fn main() {
         let (request_tx, request_rx) = mpsc::channel::<EvalRequest>();
         let client = InferenceClient { request_tx };
 
-        // Past-self opponent pool (optional). The loader thread is the
-        // single source of truth for the pool model: it polls the pool dir
-        // (which is empty at curriculum start), loads a random snapshot when
-        // one appears, and stages it for the pool inference server. We
-        // unconditionally spawn both threads when the pool is configured,
-        // and worker threads route to the pool only once `pool_ready` flips.
+        // Past-self opponent pool (optional, torch-only).
         let pool_disabled = Arc::new(AtomicBool::new(false));
         let pool_ready = Arc::new(AtomicBool::new(false));
 
         // Build the pool inference channel up front (when configured) so we
         // can clone the client into game threads inside the scope.
+        // Pool is only available with torch — subprocess mode disables it.
+        #[allow(unused_variables)] // pool_request_rx_opt used only with torch
         let (pool_client_opt, pool_request_rx_opt) =
-            if pool_fraction > 0.0 && pool_dir.is_some() {
+            if !python_inference && pool_fraction > 0.0 && pool_dir.is_some() {
                 let (ptx, prx) = mpsc::channel::<EvalRequest>();
                 (Some(InferenceClient { request_tx: ptx }), Some(prx))
             } else {
+                if python_inference && pool_fraction > 0.0 {
+                    eprintln!("Warning: --pool-dir is not supported with --python-inference, ignoring.");
+                }
                 (None, None)
             };
 
-        std::thread::scope(|s| {
-            // Spawn inference server (with model reloading)
-            let running_ref = &running;
-            let model_ref = &mut model;
-            let model_path_ref = model_path.as_str();
-            s.spawn(move || {
-                inference_server(
-                    request_rx, model_ref, max_batch, batch_timeout,
-                    running_ref, Some(model_path_ref), tch_device, graph_type, padded_inference,
-                );
-            });
+        if python_inference {
+            let ckpt = checkpoint_path.as_deref().unwrap_or(&model_path);
+            let model_args = subprocess_model_args(
+                model_hidden_dim, model_num_layers, model_num_heads,
+                model_policy_hidden, model_value_hidden,
+                &graph_type_str, &model_conv_type, device_str,
+            );
+            eprintln!("Spawning Python inference subprocess...");
+            let mut model = SubprocessModel::spawn(&python_bin, ckpt, &model_args)
+                .unwrap_or_else(|e| { eprintln!("Failed to spawn Python: {e}"); std::process::exit(1); });
 
-            // Spawn pool inference server + background loader (if configured).
-            // The loader owns all disk I/O and stages fresh models through a
-            // bounded(1) channel. The inference server blocks on the channel
-            // for its very first model — so it's safe to spawn both threads
-            // even when the pool dir is empty at startup. The loader will
-            // poll on a short cadence until a snapshot appears, then flip
-            // `pool_ready` so worker threads start routing games.
-            if let Some(prx) = pool_request_rx_opt {
+            std::thread::scope(|s| {
                 let running_ref = &running;
-                let pdir = pool_dir.clone().expect("pool_dir set when pool configured");
-                let (staged_tx, staged_rx) = mpsc::sync_channel::<TorchModel>(1);
-
+                let model_ref = &mut model;
+                let model_path_ref = model_path.as_str();
                 s.spawn(move || {
-                    pool_inference_server(
-                        prx, max_batch, batch_timeout,
-                        running_ref, staged_rx, padded_inference,
+                    inference_server_subprocess(
+                        request_rx, model_ref, max_batch, batch_timeout,
+                        running_ref, Some(model_path_ref),
                     );
                 });
 
-                let pool_disabled_loader = pool_disabled.clone();
-                let pool_ready_loader = pool_ready.clone();
-                let running_loader = running.clone();
-                s.spawn(move || {
-                    pool_model_loader(
-                        pdir, tch_device, graph_type,
-                        staged_tx, pool_disabled_loader, pool_ready_loader,
-                        running_loader,
+                run_continuous_game_threads(
+                    s, client, pool_client_opt, n_threads, seed, game_config,
+                    &mcts_config, &exploration_atomic, graph_type,
+                    playout_cap_fraction, playout_cap_divisor, pool_fraction,
+                    &pool_disabled, &pool_ready, &running, &game_counter,
+                    &rotating_writer, exploration_fraction, &ema_bits,
+                    &p1_ema_bits, exploration_window, exploration_exponent,
+                    exploration_max,
+                );
+            });
+        } else {
+            #[cfg(not(feature = "torch"))]
+            {
+                eprintln!("Built without torch feature. Use --python-inference or rebuild with --features torch.");
+                std::process::exit(1);
+            }
+            #[cfg(feature = "torch")]
+            {
+                let tch_device = match device_str {
+                    "cuda" => tch::Device::Cuda(0),
+                    _ => tch::Device::Cpu,
+                };
+                eprintln!("Loading model from {}...", model_path);
+                let mut model = match TorchModel::load_with_graph_type(&model_path, tch_device, graph_type) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        eprintln!("Failed to load model: {e}");
+                        std::process::exit(1);
+                    }
+                };
+
+                std::thread::scope(|s| {
+                    let running_ref = &running;
+                    let model_ref = &mut model;
+                    let model_path_ref = model_path.as_str();
+                    s.spawn(move || {
+                        inference_server(
+                            request_rx, model_ref, max_batch, batch_timeout,
+                            running_ref, Some(model_path_ref), tch_device, graph_type, padded_inference,
+                        );
+                    });
+
+                    // Spawn pool inference server + background loader (if configured).
+                    if let Some(prx) = pool_request_rx_opt {
+                        let running_ref = &running;
+                        let pdir = pool_dir.clone().expect("pool_dir set when pool configured");
+                        let (staged_tx, staged_rx) = mpsc::sync_channel::<TorchModel>(1);
+
+                        s.spawn(move || {
+                            pool_inference_server(
+                                prx, max_batch, batch_timeout,
+                                running_ref, staged_rx, padded_inference,
+                            );
+                        });
+
+                        let pool_disabled_loader = pool_disabled.clone();
+                        let pool_ready_loader = pool_ready.clone();
+                        let running_loader = running.clone();
+                        s.spawn(move || {
+                            pool_model_loader(
+                                pdir, tch_device, graph_type,
+                                staged_tx, pool_disabled_loader, pool_ready_loader,
+                                running_loader,
+                            );
+                        });
+                    }
+
+                    run_continuous_game_threads(
+                        s, client, pool_client_opt, n_threads, seed, game_config,
+                        &mcts_config, &exploration_atomic, graph_type,
+                        playout_cap_fraction, playout_cap_divisor, pool_fraction,
+                        &pool_disabled, &pool_ready, &running, &game_counter,
+                        &rotating_writer, exploration_fraction, &ema_bits,
+                        &p1_ema_bits, exploration_window, exploration_exponent,
+                        exploration_max,
                     );
                 });
             }
+        }
 
-            let start_time = std::time::Instant::now();
+        let total_games = game_counter.load(Ordering::Relaxed);
+        eprintln!("Stopped after {} games.", total_games);
+    }
+}
 
-            // Spawn game threads
-            for ti in 0..n_threads {
-                let running = running.clone();
-                let game_counter = game_counter.clone();
-                let rotating_writer = rotating_writer.clone();
-                let client = client.clone();
-                let pool_client = pool_client_opt.clone();
-                let pool_disabled_ref = pool_disabled.clone();
-                let pool_ready_ref = pool_ready.clone();
-                let mcts_config = &mcts_config;
-                let exploration_ref = &exploration_atomic;
-                let ema_ref = &ema_bits;
-                let p1_ema_ref = &p1_ema_bits;
+/// Build the model args vector for `SubprocessModel::spawn`.
+fn subprocess_model_args(
+    hidden_dim: usize,
+    num_layers: usize,
+    num_heads: usize,
+    policy_hidden: usize,
+    value_hidden: usize,
+    graph_type: &str,
+    conv_type: &str,
+    device: &str,
+) -> Vec<String> {
+    vec![
+        "--hidden-dim".into(), hidden_dim.to_string(),
+        "--num-layers".into(), num_layers.to_string(),
+        "--num-heads".into(), num_heads.to_string(),
+        "--policy-hidden".into(), policy_hidden.to_string(),
+        "--value-hidden".into(), value_hidden.to_string(),
+        "--graph-type".into(), graph_type.to_string(),
+        "--conv-type".into(), conv_type.to_string(),
+        "--device".into(), device.to_string(),
+    ]
+}
 
-                s.spawn(move || {
-                    let mut rng = make_rng(seed, ti as u64, 0);
-                    let mut last_logged_hundred: u64 = 0;
-                    const EMA_ALPHA: f64 = 0.05;
+/// Run batch-mode game threads inside a thread scope. Returns collected game results.
+/// Takes `client` by value so it is dropped when all game threads finish,
+/// signaling the inference server to shut down.
+fn run_batch_games<'scope, 'env: 'scope>(
+    s: &'scope std::thread::Scope<'scope, 'env>,
+    client: InferenceClient,
+    n_games: usize,
+    n_threads: usize,
+    seed: Option<u64>,
+    game_config: GameConfig,
+    mcts_config: &'env MCTSConfig,
+    exploration: &'env AtomicUsize,
+    graph_type: GraphType,
+    playout_cap_fraction: f64,
+    playout_cap_divisor: u32,
+    running: &'env Arc<AtomicBool>,
+) -> Vec<GameResult> {
+    let games_per_thread = distribute(n_games, n_threads);
+    let handles: Vec<_> = games_per_thread
+        .into_iter()
+        .enumerate()
+        .map(|(ti, count)| {
+            let client = client.clone();
+            let running_thread = running.clone();
+            s.spawn(move || {
+                let mut rng = make_rng(seed, ti as u64, 0);
+                let mut results = Vec::with_capacity(count);
+                for _ in 0..count {
+                    if let Some(game) = play_one_game(
+                        &client, None, None, game_config, mcts_config,
+                        exploration, graph_type, &mut rng,
+                        playout_cap_fraction, playout_cap_divisor,
+                        &running_thread,
+                    ) {
+                        results.push(game);
+                    }
+                }
+                results
+            })
+        })
+        .collect();
 
-                    while running.load(Ordering::Relaxed) {
-                        // Per-game pool routing: independently sample whether
-                        // this game uses a past-self opponent, and if so which
-                        // side that opponent plays.
-                        let (pool_client_ref, pool_side): (Option<&InferenceClient>, Option<&'static str>) =
-                            if let Some(ref pc) = pool_client {
-                                // Route to the pool only when it is both
-                                // not disabled AND has actually loaded a
-                                // first model. During the early-run warmup
-                                // window the pool may be configured but
-                                // not yet ready — those games run as
-                                // ordinary live-vs-live self-play.
-                                if !pool_disabled_ref.load(Ordering::Relaxed)
-                                    && pool_ready_ref.load(Ordering::Relaxed)
-                                    && rng.random::<f64>() < pool_fraction
-                                {
-                                    (Some(pc), Some(pick_pool_side(&mut rng)))
-                                } else {
-                                    (None, None)
-                                }
+    // Drop the original client so server sees disconnect after threads finish
+    drop(client);
+
+    handles
+        .into_iter()
+        .flat_map(|h| h.join().unwrap_or_default())
+        .collect()
+}
+
+/// Spawn continuous-mode game threads inside a thread scope.
+/// Takes `client` and `pool_client_opt` by value; the originals are dropped
+/// after all game-thread clones have been created, so the inference servers
+/// see a disconnect once every game thread finishes.
+#[allow(clippy::too_many_arguments)]
+fn run_continuous_game_threads<'scope, 'env: 'scope>(
+    s: &'scope std::thread::Scope<'scope, 'env>,
+    client: InferenceClient,
+    pool_client_opt: Option<InferenceClient>,
+    n_threads: usize,
+    seed: Option<u64>,
+    game_config: GameConfig,
+    mcts_config: &'env MCTSConfig,
+    exploration_atomic: &'env AtomicUsize,
+    graph_type: GraphType,
+    playout_cap_fraction: f64,
+    playout_cap_divisor: u32,
+    pool_fraction: f64,
+    pool_disabled: &'env Arc<AtomicBool>,
+    pool_ready: &'env Arc<AtomicBool>,
+    running: &'env Arc<AtomicBool>,
+    game_counter: &'env Arc<AtomicU64>,
+    rotating_writer: &'env Arc<Mutex<RotatingWriter>>,
+    exploration_fraction: Option<f64>,
+    ema_bits: &'env AtomicU64,
+    p1_ema_bits: &'env AtomicU64,
+    exploration_window: u32,
+    exploration_exponent: f64,
+    exploration_max: Option<f64>,
+) {
+    let start_time = std::time::Instant::now();
+
+    for ti in 0..n_threads {
+        let running = running.clone();
+        let game_counter = game_counter.clone();
+        let rotating_writer = rotating_writer.clone();
+        let client = client.clone();
+        let pool_client = pool_client_opt.clone();
+        let pool_disabled_ref = pool_disabled.clone();
+        let pool_ready_ref = pool_ready.clone();
+
+        s.spawn(move || {
+            let mut rng = make_rng(seed, ti as u64, 0);
+            let mut last_logged_hundred: u64 = 0;
+            const EMA_ALPHA: f64 = 0.05;
+
+            while running.load(Ordering::Relaxed) {
+                // Per-game pool routing
+                let (pool_client_ref, pool_side): (Option<&InferenceClient>, Option<&'static str>) =
+                    if let Some(ref pc) = pool_client {
+                        if !pool_disabled_ref.load(Ordering::Relaxed)
+                            && pool_ready_ref.load(Ordering::Relaxed)
+                            && rng.random::<f64>() < pool_fraction
+                        {
+                            (Some(pc), Some(pick_pool_side(&mut rng)))
+                        } else {
+                            (None, None)
+                        }
+                    } else {
+                        (None, None)
+                    };
+
+                if let Some(result) = play_one_game(
+                    &client, pool_client_ref, pool_side,
+                    game_config, mcts_config,
+                    exploration_atomic, graph_type, &mut rng,
+                    playout_cap_fraction, playout_cap_divisor,
+                    &running,
+                ) {
+                    let game_len = result.move_count as f64;
+
+                    {
+                        let mut rw = rotating_writer.lock().unwrap();
+                        if let Err(e) = rw.write_game(&result) {
+                            eprintln!("Thread {ti}: failed to write game: {e}");
+                        }
+                    }
+
+                    let count = game_counter.fetch_add(1, Ordering::Relaxed) + 1;
+
+                    // All threads: update game-length EMA via CAS loop
+                    if exploration_fraction.is_some() {
+                        loop {
+                            let old_bits = ema_bits.load(Ordering::Relaxed);
+                            let old_ema = f64::from_bits(old_bits);
+                            let updated = if old_ema == 0.0 {
+                                game_len
                             } else {
-                                (None, None)
+                                EMA_ALPHA * game_len + (1.0 - EMA_ALPHA) * old_ema
                             };
-
-                        if let Some(result) = play_one_game(
-                            &client, pool_client_ref, pool_side,
-                            game_config, mcts_config,
-                            exploration_ref, graph_type, &mut rng,
-                            playout_cap_fraction, playout_cap_divisor,
-                            &running,
-                        ) {
-                            let game_len = result.move_count as f64;
-
-                            {
-                                let mut rw = rotating_writer.lock().unwrap();
-                                if let Err(e) = rw.write_game(&result) {
-                                    eprintln!("Thread {ti}: failed to write game: {e}");
-                                }
+                            if ema_bits.compare_exchange_weak(
+                                old_bits, updated.to_bits(),
+                                Ordering::Relaxed, Ordering::Relaxed,
+                            ).is_ok() {
+                                break;
                             }
+                        }
 
-                            let count = game_counter.fetch_add(1, Ordering::Relaxed) + 1;
-
-                            // All threads: update game-length EMA via CAS loop
-                            if exploration_fraction.is_some() {
-                                loop {
-                                    let old_bits = ema_ref.load(Ordering::Relaxed);
-                                    let old_ema = f64::from_bits(old_bits);
-                                    let updated = if old_ema == 0.0 {
-                                        game_len
-                                    } else {
-                                        EMA_ALPHA * game_len + (1.0 - EMA_ALPHA) * old_ema
-                                    };
-                                    if ema_ref.compare_exchange_weak(
-                                        old_bits, updated.to_bits(),
-                                        Ordering::Relaxed, Ordering::Relaxed,
-                                    ).is_ok() {
-                                        break;
-                                    }
-                                }
-
-                                // Update p1 decided rate EMA (skip draws)
-                                let p1_sample = match result.winner {
-                                    "P1" => Some(1.0f64),
-                                    "P2" => Some(0.0f64),
-                                    _ => None,
-                                };
-                                // EMA alpha derived from --exploration-window.
-                                // alpha = 2/(window+1) gives the standard EMA
-                                // effective window size.
-                                let p1_ema_alpha: f64 = 2.0 / (exploration_window as f64 + 1.0);
-                                if let Some(sample) = p1_sample {
-                                    loop {
-                                        let old_bits = p1_ema_ref.load(Ordering::Relaxed);
-                                        let old_ema = f64::from_bits(old_bits);
-                                        let updated = p1_ema_alpha * sample + (1.0 - p1_ema_alpha) * old_ema;
-                                        if p1_ema_ref.compare_exchange_weak(
-                                            old_bits, updated.to_bits(),
-                                            Ordering::Relaxed, Ordering::Relaxed,
-                                        ).is_ok() {
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-
-                            // Thread 0: update exploration + progress logging
-                            if ti == 0 {
-                                if let Some(base_frac) = exploration_fraction {
-                                    let ema = f64::from_bits(ema_ref.load(Ordering::Relaxed));
-
-                                    // Adaptive exploration: when p1_decided_rate
-                                    // drifts from 0.5, ramp up exploration using
-                                    // squared deviation for smooth center / steep edges.
-                                    let frac = if let Some(max_frac) = exploration_max {
-                                        let p1_ema = f64::from_bits(p1_ema_ref.load(Ordering::Relaxed));
-                                        let deviation = (2.0 * (p1_ema - 0.5)).abs().min(1.0);
-                                        (base_frac + (max_frac - base_frac) * deviation.powf(exploration_exponent))
-                                            .clamp(base_frac, max_frac)
-                                    } else {
-                                        base_frac
-                                    };
-
-                                    let new_explore = (ema * frac).ceil() as usize;
-                                    let new_explore = new_explore.max(2);
-                                    let old_explore = exploration_ref.swap(new_explore, Ordering::Relaxed);
-                                    if new_explore != old_explore {
-                                        if exploration_max.is_some() {
-                                            let p1_ema = f64::from_bits(p1_ema_ref.load(Ordering::Relaxed));
-                                            eprintln!(
-                                                "exploration_moves: {} -> {} (ema_len={:.1}, frac={:.0}%, p1_rate={:.2})",
-                                                old_explore, new_explore, ema, frac * 100.0, p1_ema,
-                                            );
-                                        } else {
-                                            eprintln!(
-                                                "exploration_moves: {} -> {} (ema_len={:.1}, frac={:.0}%)",
-                                                old_explore, new_explore, ema, frac * 100.0,
-                                            );
-                                        }
-                                    }
-                                }
-
-                                let hundred = count / 100;
-                                if hundred > last_logged_hundred {
-                                    last_logged_hundred = hundred;
-                                    let elapsed = start_time.elapsed().as_secs_f64();
-                                    let gps = count as f64 / elapsed.max(0.001);
-                                    eprintln!("{} games written ({:.1} games/s)", count, gps);
+                        // Update p1 decided rate EMA (skip draws)
+                        let p1_sample = match result.winner {
+                            "P1" => Some(1.0f64),
+                            "P2" => Some(0.0f64),
+                            _ => None,
+                        };
+                        let p1_ema_alpha: f64 = 2.0 / (exploration_window as f64 + 1.0);
+                        if let Some(sample) = p1_sample {
+                            loop {
+                                let old_bits = p1_ema_bits.load(Ordering::Relaxed);
+                                let old_ema = f64::from_bits(old_bits);
+                                let updated = p1_ema_alpha * sample + (1.0 - p1_ema_alpha) * old_ema;
+                                if p1_ema_bits.compare_exchange_weak(
+                                    old_bits, updated.to_bits(),
+                                    Ordering::Relaxed, Ordering::Relaxed,
+                                ).is_ok() {
+                                    break;
                                 }
                             }
                         }
                     }
-                });
+
+                    // Thread 0: update exploration + progress logging
+                    if ti == 0 {
+                        if let Some(base_frac) = exploration_fraction {
+                            let ema = f64::from_bits(ema_bits.load(Ordering::Relaxed));
+
+                            let frac = if let Some(max_frac) = exploration_max {
+                                let p1_ema = f64::from_bits(p1_ema_bits.load(Ordering::Relaxed));
+                                let deviation = (2.0 * (p1_ema - 0.5)).abs().min(1.0);
+                                (base_frac + (max_frac - base_frac) * deviation.powf(exploration_exponent))
+                                    .clamp(base_frac, max_frac)
+                            } else {
+                                base_frac
+                            };
+
+                            let new_explore = (ema * frac).ceil() as usize;
+                            let new_explore = new_explore.max(2);
+                            let old_explore = exploration_atomic.swap(new_explore, Ordering::Relaxed);
+                            if new_explore != old_explore {
+                                if exploration_max.is_some() {
+                                    let p1_ema = f64::from_bits(p1_ema_bits.load(Ordering::Relaxed));
+                                    eprintln!(
+                                        "exploration_moves: {} -> {} (ema_len={:.1}, frac={:.0}%, p1_rate={:.2})",
+                                        old_explore, new_explore, ema, frac * 100.0, p1_ema,
+                                    );
+                                } else {
+                                    eprintln!(
+                                        "exploration_moves: {} -> {} (ema_len={:.1}, frac={:.0}%)",
+                                        old_explore, new_explore, ema, frac * 100.0,
+                                    );
+                                }
+                            }
+                        }
+
+                        let hundred = count / 100;
+                        if hundred > last_logged_hundred {
+                            last_logged_hundred = hundred;
+                            let elapsed = start_time.elapsed().as_secs_f64();
+                            let gps = count as f64 / elapsed.max(0.001);
+                            eprintln!("{} games written ({:.1} games/s)", count, gps);
+                        }
+                    }
+                }
             }
-
-            // Drop clients so server(s) shut down when game threads finish
-            drop(client);
-            drop(pool_client_opt);
         });
-
-        let total_games = game_counter.load(Ordering::Relaxed);
-        eprintln!("Stopped after {} games.", total_games);
     }
 }
 
@@ -1566,6 +1839,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "torch")]
     #[test]
     fn list_pool_snapshots_filters_pt_extension() {
         let tmp = std::env::temp_dir().join(format!("hexo_pool_test_{}", std::process::id()));
@@ -1583,6 +1857,7 @@ mod tests {
         let _ = fs::remove_dir_all(&tmp);
     }
 
+    #[cfg(feature = "torch")]
     #[test]
     fn try_replace_drains_and_sends_on_full_channel() {
         // Capacity-1 channel: once full, try_replace must evict the stale
@@ -1622,6 +1897,7 @@ mod tests {
         assert_eq!(b, 4);
     }
 
+    #[cfg(feature = "torch")]
     #[test]
     fn try_replace_errors_when_receiver_dropped() {
         let (tx, rx) = mpsc::sync_channel::<i32>(1);
@@ -1629,6 +1905,7 @@ mod tests {
         assert!(try_replace(&tx, 42).is_err());
     }
 
+    #[cfg(feature = "torch")]
     #[test]
     fn list_pool_snapshots_missing_dir_returns_empty() {
         let snaps = list_pool_snapshots("/nonexistent/path/that/does/not/exist/abc123");
@@ -1648,6 +1925,7 @@ mod tests {
         assert!(pool_ready.load(Ordering::Relaxed));
     }
 
+    #[cfg(feature = "torch")]
     #[test]
     fn list_pool_snapshots_empty_then_populated() {
         // Models the "pool dir empty at curriculum start, files appear

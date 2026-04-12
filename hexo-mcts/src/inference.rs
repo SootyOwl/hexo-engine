@@ -15,12 +15,8 @@ use hexo_engine::GameState;
 
 use crate::graph_tensors::{GraphTensors, build_graph_tensors, build_axis_graph_tensors};
 
-/// Graph type for model inference.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GraphType {
-    Hex,
-    Axis,
-}
+// Re-export GraphType from graph_tensors so existing consumers keep working.
+pub use crate::graph_tensors::GraphType;
 
 /// Lightweight (total_nodes, total_edges) histogram shared across all
 /// `forward_graphs*` call sites. Every `SHAPE_LOG_INTERVAL` batches we dump
