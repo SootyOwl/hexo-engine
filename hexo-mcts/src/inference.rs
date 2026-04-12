@@ -72,6 +72,12 @@ pub struct TorchModel {
     /// input tensors are cast to match before the forward pass.
     float_kind: Kind,
     graph_type: GraphType,
+    /// Whether the model's forward() accepts precomputed index tensors
+    /// (legal_idx, stone_idx, stone_batch) as arguments 8-10.
+    /// Auto-detected on first forward call: if 10-arg call fails with an
+    /// argument-count error, falls back to 7-arg mode for all subsequent calls.
+    /// New models (11 args incl. self) eliminate GPU→CPU nonzero syncs.
+    supports_index_tensors: std::sync::atomic::AtomicU8,  // 0=unknown, 1=yes, 2=no
 }
 
 impl TorchModel {
@@ -101,7 +107,10 @@ impl TorchModel {
             _ => {}
         }
         eprintln!("Model graph_type: {:?}", graph_type);
-        Ok(TorchModel { model, device, float_kind, graph_type })
+        Ok(TorchModel {
+            model, device, float_kind, graph_type,
+            supports_index_tensors: std::sync::atomic::AtomicU8::new(0),
+        })
     }
 
     /// Build graph tensors for a batch of game states.
@@ -212,10 +221,52 @@ impl TorchModel {
                 ivalues.push(tch::IValue::Tensor(empty));
             }
         }
+
+        // Precompute index tensors to eliminate GPU→CPU nonzero syncs.
+        // Only appended if the model supports them (auto-detected on first call).
+        let idx_support = self.supports_index_tensors.load(std::sync::atomic::Ordering::Relaxed);
+        if idx_support != 2 {
+            let mut legal_idx: Vec<i64> = Vec::new();
+            let mut stone_idx: Vec<i64> = Vec::new();
+            let mut stone_batch_vec: Vec<i64> = Vec::new();
+            for i in 0..total_nodes {
+                if all_legal_mask[i] {
+                    legal_idx.push(i as i64);
+                }
+                if all_stone_mask[i] {
+                    stone_idx.push(i as i64);
+                    stone_batch_vec.push(all_batch[i]);
+                }
+            }
+            ivalues.push(tch::IValue::Tensor(Tensor::from_slice(&legal_idx).to_device(self.device)));
+            ivalues.push(tch::IValue::Tensor(Tensor::from_slice(&stone_idx).to_device(self.device)));
+            ivalues.push(tch::IValue::Tensor(Tensor::from_slice(&stone_batch_vec).to_device(self.device)));
+        }
+
         // Run model via IValue interface (num_graphs is int, not Tensor)
         let _guard = tch::no_grad_guard();
         let result = match self.model.forward_is(&ivalues) {
-            Ok(r) => r,
+            Ok(r) => {
+                if idx_support == 0 {
+                    eprintln!("Model supports index tensors — GPU nonzero syncs eliminated");
+                    self.supports_index_tensors.store(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                r
+            }
+            Err(e) if idx_support == 0 && format!("{e}").contains("Expected at most") => {
+                // Old model without index tensor params — retry without them
+                eprintln!("Model does not support index tensors, using boolean masks (re-export to upgrade)");
+                self.supports_index_tensors.store(2, std::sync::atomic::Ordering::Relaxed);
+                ivalues.truncate(ivalues.len() - 3);
+                match self.model.forward_is(&ivalues) {
+                    Ok(r) => r,
+                    Err(e2) => {
+                        eprintln!("Model forward failed on retry: {e2}");
+                        let dummy_logits = (0..n).map(|_| HashMap::new()).collect();
+                        return (dummy_logits, vec![0.0; n]);
+                    }
+                }
+            }
             Err(e) => {
                 eprintln!("Model forward failed: {e}");
                 let dummy_logits = (0..n).map(|_| HashMap::new()).collect();
@@ -417,9 +468,48 @@ impl TorchModel {
                 ivalues.push(tch::IValue::Tensor(empty));
             }
         }
+
+        // Precompute index tensors (only over real nodes, not ghost padding)
+        let idx_support = self.supports_index_tensors.load(std::sync::atomic::Ordering::Relaxed);
+        if idx_support != 2 {
+            let mut legal_idx: Vec<i64> = Vec::new();
+            let mut stone_idx: Vec<i64> = Vec::new();
+            let mut stone_batch_vec: Vec<i64> = Vec::new();
+            for i in 0..real_nodes {
+                if all_legal_mask[i] {
+                    legal_idx.push(i as i64);
+                }
+                if all_stone_mask[i] {
+                    stone_idx.push(i as i64);
+                    stone_batch_vec.push(all_batch[i]);
+                }
+            }
+            ivalues.push(tch::IValue::Tensor(Tensor::from_slice(&legal_idx).to_device(self.device)));
+            ivalues.push(tch::IValue::Tensor(Tensor::from_slice(&stone_idx).to_device(self.device)));
+            ivalues.push(tch::IValue::Tensor(Tensor::from_slice(&stone_batch_vec).to_device(self.device)));
+        }
+
         let _guard = tch::no_grad_guard();
         let result = match self.model.forward_is(&ivalues) {
-            Ok(r) => r,
+            Ok(r) => {
+                if idx_support == 0 {
+                    self.supports_index_tensors.store(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                r
+            }
+            Err(e) if idx_support == 0 && format!("{e}").contains("Expected at most") => {
+                eprintln!("Model does not support index tensors, using boolean masks (re-export to upgrade)");
+                self.supports_index_tensors.store(2, std::sync::atomic::Ordering::Relaxed);
+                ivalues.truncate(ivalues.len() - 3);
+                match self.model.forward_is(&ivalues) {
+                    Ok(r) => r,
+                    Err(e2) => {
+                        eprintln!("Padded model forward failed on retry: {e2}");
+                        let dummy_logits = (0..n).map(|_| HashMap::new()).collect();
+                        return (dummy_logits, vec![0.0; n]);
+                    }
+                }
+            }
             Err(e) => {
                 eprintln!("Padded model forward failed: {e}");
                 let dummy_logits = (0..n).map(|_| HashMap::new()).collect();
