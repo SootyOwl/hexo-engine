@@ -359,7 +359,11 @@ impl TorchModel {
         record_shape(real_nodes, real_edges);
 
         let target_nodes = pick_bucket(real_nodes + 1, NODE_BUCKETS);
-        let target_edges = pick_bucket(real_edges + 1, EDGE_BUCKETS);
+        // Pick edge bucket set based on observed edge/node ratio:
+        // unpruned axis graphs have ~20-28× ratio, pruned ~3.5-8×.
+        let edge_ratio = if real_nodes > 0 { real_edges / real_nodes } else { 0 };
+        let edge_buckets = if edge_ratio <= 10 { EDGE_BUCKETS_PRUNED } else { EDGE_BUCKETS };
+        let target_edges = pick_bucket(real_edges + 1, edge_buckets);
         let ghost_nodes = target_nodes - real_nodes;
         let ghost_edges = target_edges - real_edges;
         debug_assert!(ghost_nodes >= 1);
@@ -590,10 +594,15 @@ impl TorchModel {
 const NODE_BUCKETS: &[usize] = &[4096, 16384, 32768, 65536, 131072, 196608];
 
 /// Edge-count buckets for `forward_graphs_padded`.
-// Edge/node ratio is ~20-22× for axis graphs (3 axes × 2 directions × up to
-// win_length-1 steps per direction, plus global-dummy-node edges). Each
-// edge bucket is sized at ~24× the corresponding node bucket to leave slack.
+// Edge/node ratio is ~20-28× for unpruned axis graphs (3 axes × 2 directions
+// × up to win_length-1 steps per direction, plus global-dummy-node edges).
+// Each bucket is sized at ~24× the corresponding node bucket to leave slack.
 const EDGE_BUCKETS: &[usize] = &[98304, 393216, 786432, 1572864, 3145728, 4718592];
+
+/// Edge-count buckets for pruned axis graphs (empty→empty edges removed).
+// Edge/node ratio drops to ~3.5-8× when empty→empty edges are pruned.
+// Buckets sized at ~10× the corresponding node bucket for headroom.
+const EDGE_BUCKETS_PRUNED: &[usize] = &[16384, 65536, 131072, 262144, 524288, 1048576];
 
 /// Counts how many times `pick_bucket` has exceeded its top bucket and
 /// fallen through to the `div_ceil` path. Each overflow introduces a new

@@ -23,7 +23,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use hexo_engine::game::{GameConfig, GameState};
 use hexo_engine::types::Coord;
-use hexo_rs::axis_graph::game_to_axis_graph_raw;
+use hexo_rs::axis_graph::game_to_axis_graph_raw_opts;
 use hexo_rs::graph::game_to_graph_raw;
 use hexo_rs::graph_tensors::{GraphTensors, GraphType};
 #[cfg(feature = "torch")]
@@ -81,8 +81,17 @@ fn inference_server(
 ) {
     let mut model_mtime = model_path.and_then(file_mtime);
 
+    // Perf counters (mirrors the Python inference server's [perf] output)
+    let mut perf_count: u64 = 0;
+    let mut perf_total_us: u64 = 0;
+    let mut perf_queue_us: u64 = 0;
+    let mut perf_forward_us: u64 = 0;
+    let mut perf_total_graphs: u64 = 0;
+    let mut perf_total_nodes: u64 = 0;
+
     loop {
         // Block on first request (or check shutdown)
+        let t0 = Instant::now();
         let first = match request_rx.recv_timeout(Duration::from_millis(100)) {
             Ok(req) => req,
             Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -116,13 +125,18 @@ fn inference_server(
                 Err(_) => break,
             }
         }
+        let t_queue = Instant::now();
 
         // Flatten all graphs into one batch
         let mut all_graphs = Vec::with_capacity(total_graphs);
         let mut slice_ranges: Vec<(usize, usize)> = Vec::with_capacity(requests.len());
+        let mut batch_nodes: usize = 0;
         for req in &mut requests {
             let start = all_graphs.len();
-            all_graphs.extend(req.graphs.drain(..));
+            for g in req.graphs.drain(..) {
+                batch_nodes += g.num_nodes;
+                all_graphs.push(g);
+            }
             slice_ranges.push((start, all_graphs.len()));
         }
 
@@ -132,6 +146,7 @@ fn inference_server(
         } else {
             model.forward_graphs(all_graphs)
         };
+        let t_done = Instant::now();
 
         // Scatter results back
         for (i, req) in requests.into_iter().enumerate() {
@@ -139,6 +154,27 @@ fn inference_server(
             let logits = all_logits[start..end].to_vec();
             let values = all_values[start..end].to_vec();
             let _ = req.response_tx.send((logits, values));
+        }
+
+        // Perf tracking
+        perf_count += 1;
+        perf_total_us += (t_done - t0).as_micros() as u64;
+        perf_queue_us += (t_queue - t0).as_micros() as u64;
+        perf_forward_us += (t_done - t_queue).as_micros() as u64;
+        perf_total_graphs += total_graphs as u64;
+        perf_total_nodes += batch_nodes as u64;
+        if perf_count % 100 == 0 {
+            let n = perf_count as f64;
+            eprintln!(
+                "[perf] batches={} avg_total={:.1}ms avg_queue_wait={:.1}ms \
+                 avg_forward={:.1}ms avg_graphs={:.1} avg_nodes={:.0}",
+                perf_count,
+                perf_total_us as f64 / n / 1000.0,
+                perf_queue_us as f64 / n / 1000.0,
+                perf_forward_us as f64 / n / 1000.0,
+                perf_total_graphs as f64 / n,
+                perf_total_nodes as f64 / n,
+            );
         }
 
         // Check for model reload after processing a batch
@@ -263,7 +299,9 @@ fn pool_inference_server_subprocess(
     loop {
         // Swap to any newly-staged checkpoint path before blocking on requests.
         if let Ok(new_path) = pool_path_rx.try_recv() {
-            model.try_reload(&new_path);
+            if !new_path.is_empty() {
+                model.try_reload(&new_path);
+            }
         }
 
         let first = match request_rx.recv_timeout(Duration::from_millis(100)) {
@@ -385,10 +423,9 @@ fn pool_subprocess_loader(
             last_loaded_path = Some(path_str.clone());
         }
 
-        // Send path to pool inference server. Use try_send to avoid blocking
-        // if the server hasn't consumed the previous path yet.
-        // Drain any unconsumed path first.
-        while pool_path_tx.try_send(String::new()).is_ok() {}
+        // Send path to pool inference server. If the channel is full
+        // (server hasn't consumed the previous path yet), just skip —
+        // the server will pick up this snapshot on the next reload cycle.
         match pool_path_tx.try_send(path_str) {
             Ok(_) => {
                 consecutive_failures = 0;
@@ -397,6 +434,9 @@ fn pool_subprocess_loader(
                     pool_ready.store(true, Ordering::Relaxed);
                     eprintln!("Pool ready: first snapshot path sent");
                 }
+            }
+            Err(mpsc::TrySendError::Full(_)) => {
+                eprintln!("Pool loader: channel full, skipping (server busy)");
             }
             Err(e) => {
                 eprintln!("Pool loader: failed to send path: {e}");
@@ -709,6 +749,7 @@ struct ExampleRecord {
     num_nodes: usize,
     policy: Vec<f64>,
     value: f64,
+    sample_weight: f32,
 }
 
 /// One game's worth of examples, written as a single msgpack record.
@@ -724,6 +765,12 @@ struct PositionData {
     policy: Vec<f64>,
     player: &'static str,
     graph: GraphOutput,
+    /// Per-example loss weight in [0, 1]. 1.0 for full-cap MCTS searches;
+    /// `1/playout_cap_divisor` for fast-cap searches under PCR. Reflects
+    /// the relative trust in the improved-policy target as a function of
+    /// the search budget that produced it. Written to the wire format
+    /// (HX04) and applied multiplicatively in the trainer's loss.
+    sample_weight: f32,
 }
 
 /// Holds the raw graph data for serialization (avoids cloning into JSON).
@@ -765,6 +812,7 @@ impl GameResult {
                     num_nodes: g.num_nodes,
                     policy: pos.policy.clone(),
                     value,
+                    sample_weight: pos.sample_weight,
                 },
                 GraphOutput::Axis(g) => ExampleRecord {
                     features: g.features.clone(),
@@ -777,6 +825,7 @@ impl GameResult {
                     num_nodes: g.num_nodes,
                     policy: pos.policy.clone(),
                     value,
+                    sample_weight: pos.sample_weight,
                 },
             }
         }).collect();
@@ -789,21 +838,32 @@ impl GameResult {
 }
 
 /// Magic bytes identifying the start of a game record.
-const RECORD_MAGIC: &[u8; 4] = b"HX03";
+///
+/// Version history:
+/// - HX01: original. No winner byte.
+/// - HX02: added 1B winner.
+/// - HX03: added 4B move_count.
+/// - HX04: added 4B sample_weight per example (post-PCR-discard fix). With PCR
+///   active, fast-cap positions are now written with weight = 1/divisor instead
+///   of being discarded, since Gumbel-AZ's completed-Q targets are informative
+///   even at low sims. Trainer applies weights multiplicatively in the loss.
+const RECORD_MAGIC: &[u8; 4] = b"HX04";
 
 /// Write a game as a length-prefixed binary record.
 ///
-/// Format: `[4B magic "HX03"][4B LE record_size][4B LE num_examples][1B winner i8][4B LE move_count u32][example...]`
+/// Format: `[4B magic "HX04"][4B LE record_size][4B LE num_examples][1B winner i8][4B LE move_count u32][example...]`
 ///
-/// `move_count` is the total number of moves played in the game. It may
-/// exceed `num_examples` when playout cap randomization is active, because
-/// fast-search positions advance the game but are not recorded.
+/// `move_count` is the total number of moves played in the game. With
+/// playout-cap randomisation off (or with the HX04+weighted variant)
+/// `move_count` equals `num_examples`. With legacy PCR-discard active
+/// (HX03) `move_count` could exceed `num_examples`.
 ///
 /// `winner`: 1 = P1, -1 = P2, 0 = draw.
 ///
 /// Each example:
 /// ```text
 /// [2B num_nodes][2B num_edges][2B num_legal][1B has_edge_attr][4B value f32]
+/// [4B sample_weight f32]                                         -- HX04+
 /// [num_nodes*8*4B features f32]
 /// [num_edges*8B edge_src i64][num_edges*8B edge_dst i64]
 /// [num_edges*5*4B edge_attr f32]  -- only if has_edge_attr
@@ -816,7 +876,7 @@ fn write_game_binary<W: Write>(writer: &mut W, result: &GameResult, draw_value: 
     let mut size = 4u32 + 1 + 4; // num_examples + winner byte + move_count
     for pos in &result.positions {
         let (n, e, nl, has_ea) = example_dims(pos);
-        size += 2 + 2 + 2 + 1 + 4; // header (u16×3 + u8 + f32)
+        size += 2 + 2 + 2 + 1 + 4 + 4; // header (u16×3 + u8 + value f32 + sample_weight f32)
         size += (n * 8 * 4) as u32; // features (f32)
         size += (e * 2 * 2) as u32; // edge_src + edge_dst (u16)
         if has_ea { size += (e * 5 * 4) as u32; } // edge_attr (f32)
@@ -873,6 +933,7 @@ fn write_example<W: Write>(writer: &mut W, pos: &PositionData, value: f64) -> st
     writer.write_all(&(num_legal as u16).to_le_bytes())?;
     writer.write_all(&[has_ea as u8])?;
     writer.write_all(&(value as f32).to_le_bytes())?;
+    writer.write_all(&pos.sample_weight.to_le_bytes())?;
 
     // Features (f32 LE)
     for &f in features { writer.write_all(&f.to_le_bytes())?; }
@@ -909,10 +970,11 @@ fn game_to_json(result: &GameResult, draw_value: f32) -> serde_json::Value {
 fn build_position_graph(
     game: &GameState,
     graph_type: GraphType,
+    prune_empty_edges: bool,
 ) -> (GraphOutput, GraphTensors) {
     match graph_type {
         GraphType::Axis => {
-            let g = game_to_axis_graph_raw(game);
+            let g = game_to_axis_graph_raw_opts(game, prune_empty_edges);
             let t = GraphTensors::from_axis(&g);
             (GraphOutput::Axis(g), t)
         }
@@ -970,6 +1032,7 @@ fn play_one_game(
     mcts_config: &MCTSConfig,
     exploration: &AtomicUsize,
     graph_type: GraphType,
+    prune_empty_edges: bool,
     rng: &mut ChaCha8Rng,
     playout_cap_fraction: f64,
     playout_cap_divisor: u32,
@@ -992,7 +1055,7 @@ fn play_one_game(
         };
 
         // Build graph ONCE for this position — reuse for both output and root eval
-        let (graph_output, root_tensors) = build_position_graph(&game, graph_type);
+        let (graph_output, root_tensors) = build_position_graph(&game, graph_type, prune_empty_edges);
 
         // Choose which inference client services THIS root's MCTS search.
         // For pool games, the pool client serves searches whose side-to-move
@@ -1013,7 +1076,7 @@ fn play_one_game(
                 // Leaf evals: build graphs on this game thread (CPU work)
                 states.iter().map(|s| {
                     match graph_type {
-                        GraphType::Axis => GraphTensors::from(game_to_axis_graph_raw(s)),
+                        GraphType::Axis => GraphTensors::from(game_to_axis_graph_raw_opts(s, prune_empty_edges)),
                         GraphType::Hex => GraphTensors::from(game_to_graph_raw(s)),
                     }
                 }).collect()
@@ -1021,10 +1084,14 @@ fn play_one_game(
             active_client.evaluate(graphs)
         };
 
-        // Wu (2019) playout cap randomization: with probability
-        // `playout_cap_fraction`, run a reduced-budget search and skip
-        // recording a training example for this position. The played
-        // move still advances the game.
+        // Wu (2019) playout cap randomisation, adapted for Gumbel AZ (HX04):
+        // with probability `playout_cap_fraction`, run a reduced-budget search.
+        // Unlike vanilla AZ (which discards fast-cap targets as too noisy),
+        // Gumbel AZ's improved_policy = softmax(logits + σ(completed_Q)) is
+        // informative even at low sims, so we record every position. Fast-cap
+        // examples carry a smaller `sample_weight` (= 1/divisor) so the
+        // trainer down-weights them in the loss to reflect the smaller
+        // search budget behind the target.
         let roll: f64 = rng.random::<f64>();
         let fast_search = should_skip_example(roll, playout_cap_fraction, playout_cap_divisor);
         let local_cfg;
@@ -1033,6 +1100,13 @@ fn play_one_game(
             &local_cfg
         } else {
             mcts_config
+        };
+        let sample_weight: f32 = if fast_search {
+            // Reduced-search trust = reduced_sims / full_sims = 1 / divisor.
+            // playout_cap_divisor==1 yields 1.0 (PCR fully off) and is safe.
+            1.0 / (playout_cap_divisor.max(1) as f32)
+        } else {
+            1.0
         };
 
         let result = match gumbel_mcts(&game, active_cfg, rng, &mut eval) {
@@ -1062,13 +1136,12 @@ fn play_one_game(
             result.action
         };
 
-        if !fast_search {
-            positions.push(PositionData {
-                policy: result.improved_policy,
-                player: current_player,
-                graph: graph_output,
-            });
-        }
+        positions.push(PositionData {
+            policy: result.improved_policy,
+            player: current_player,
+            graph: graph_output,
+            sample_weight,
+        });
 
         if !running.load(Ordering::Relaxed) {
             return None;
@@ -1201,6 +1274,7 @@ fn main() {
     let mut exploration_window: u32 = 200; // EMA effective window for p1 decided rate
     let mut exploration_exponent: f64 = 1.0; // deviation curve: 1.0=linear, 2.0=squared
     let mut draw_value: f32 = 0.0; // value target for drawn games (0.0=neutral, -0.1=penalty)
+    let mut prune_empty_edges = false;
 
     // Python subprocess inference flags
     let mut python_inference = false;
@@ -1259,6 +1333,7 @@ fn main() {
                 i += 2;
             }
             "--padded-inference" => { #[allow(unused)] { padded_inference = true; } i += 1; }
+            "--prune-empty-edges" => { prune_empty_edges = true; i += 1; }
             "--shape-hist" => { #[allow(unused)] { shape_hist = true; } i += 1; }
             "--playout-cap-divisor" => {
                 playout_cap_divisor = args[i + 1].parse().unwrap();
@@ -1387,7 +1462,7 @@ fn main() {
 
                 let results = run_batch_games(
                     s, client, n_games, n_threads, seed, game_config, &mcts_config,
-                    &exploration_atomic, graph_type, playout_cap_fraction, playout_cap_divisor,
+                    &exploration_atomic, graph_type, prune_empty_edges, playout_cap_fraction, playout_cap_divisor,
                     &running,
                 );
 
@@ -1427,7 +1502,7 @@ fn main() {
 
                     let results = run_batch_games(
                         s, client, n_games, n_threads, seed, game_config, &mcts_config,
-                        &exploration_atomic, graph_type, playout_cap_fraction, playout_cap_divisor,
+                        &exploration_atomic, graph_type, prune_empty_edges, playout_cap_fraction, playout_cap_divisor,
                         &running,
                     );
 
@@ -1550,7 +1625,7 @@ fn main() {
 
                 run_continuous_game_threads(
                     s, client, pool_client_opt, n_threads, seed, game_config,
-                    &mcts_config, &exploration_atomic, graph_type,
+                    &mcts_config, &exploration_atomic, graph_type, prune_empty_edges,
                     playout_cap_fraction, playout_cap_divisor, pool_fraction,
                     &pool_disabled, &pool_ready, &running, &game_counter,
                     &rotating_writer, exploration_fraction, &ema_bits,
@@ -1617,7 +1692,7 @@ fn main() {
 
                     run_continuous_game_threads(
                         s, client, pool_client_opt, n_threads, seed, game_config,
-                        &mcts_config, &exploration_atomic, graph_type,
+                        &mcts_config, &exploration_atomic, graph_type, prune_empty_edges,
                         playout_cap_fraction, playout_cap_divisor, pool_fraction,
                         &pool_disabled, &pool_ready, &running, &game_counter,
                         &rotating_writer, exploration_fraction, &ema_bits,
@@ -1669,6 +1744,7 @@ fn run_batch_games<'scope, 'env: 'scope>(
     mcts_config: &'env MCTSConfig,
     exploration: &'env AtomicUsize,
     graph_type: GraphType,
+    prune_empty_edges: bool,
     playout_cap_fraction: f64,
     playout_cap_divisor: u32,
     running: &'env Arc<AtomicBool>,
@@ -1686,7 +1762,7 @@ fn run_batch_games<'scope, 'env: 'scope>(
                 for _ in 0..count {
                     if let Some(game) = play_one_game(
                         &client, None, None, game_config, mcts_config,
-                        exploration, graph_type, &mut rng,
+                        exploration, graph_type, prune_empty_edges, &mut rng,
                         playout_cap_fraction, playout_cap_divisor,
                         &running_thread,
                     ) {
@@ -1722,6 +1798,7 @@ fn run_continuous_game_threads<'scope, 'env: 'scope>(
     mcts_config: &'env MCTSConfig,
     exploration_atomic: &'env AtomicUsize,
     graph_type: GraphType,
+    prune_empty_edges: bool,
     playout_cap_fraction: f64,
     playout_cap_divisor: u32,
     pool_fraction: f64,
@@ -1772,7 +1849,7 @@ fn run_continuous_game_threads<'scope, 'env: 'scope>(
                 if let Some(result) = play_one_game(
                     &client, pool_client_ref, pool_side,
                     game_config, mcts_config,
-                    exploration_atomic, graph_type, &mut rng,
+                    exploration_atomic, graph_type, prune_empty_edges, &mut rng,
                     playout_cap_fraction, playout_cap_divisor,
                     &running,
                 ) {
@@ -1897,10 +1974,10 @@ mod tests {
 
     fn make_result(graph_type: GraphType, winner: &'static str) -> GameResult {
         let game = GameState::with_config(small_game_config());
-        let (graph, _tensors) = build_position_graph(&game, graph_type);
+        let (graph, _tensors) = build_position_graph(&game, graph_type, false);
         GameResult {
             positions: vec![
-                PositionData { policy: vec![0.5, 0.5], player: "P1", graph },
+                PositionData { policy: vec![0.5, 0.5], player: "P1", graph, sample_weight: 1.0 },
             ],
             winner,
             move_count: 1,
@@ -1915,7 +1992,7 @@ mod tests {
         assert!(buf.len() > 17);
         // Check magic
         assert_eq!(&buf[..4], RECORD_MAGIC);
-        assert_eq!(&buf[..4], b"HX03");
+        assert_eq!(&buf[..4], b"HX04");
         // Read length prefix (after magic)
         let record_len = u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize;
         assert_eq!(record_len, buf.len() - 8); // total - magic - length
@@ -1935,7 +2012,7 @@ mod tests {
             let result = make_result(GraphType::Hex, w);
             let mut buf = Vec::new();
             write_game_binary(&mut buf, &result, 0.0).unwrap();
-            assert_eq!(&buf[..4], b"HX03");
+            assert_eq!(&buf[..4], b"HX04");
             assert_eq!(buf[12] as i8, expected, "winner {w}");
             // Length prefix should match buffer minus magic+size header
             let record_len = u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize;
@@ -1947,14 +2024,14 @@ mod tests {
     fn move_count_roundtrip() {
         // Simulate playout cap: 10 actual moves but only 3 recorded examples.
         let game = GameState::with_config(small_game_config());
-        let (g1, _) = build_position_graph(&game, GraphType::Hex);
-        let (g2, _) = build_position_graph(&game, GraphType::Hex);
-        let (g3, _) = build_position_graph(&game, GraphType::Hex);
+        let (g1, _) = build_position_graph(&game, GraphType::Hex, false);
+        let (g2, _) = build_position_graph(&game, GraphType::Hex, false);
+        let (g3, _) = build_position_graph(&game, GraphType::Hex, false);
         let result = GameResult {
             positions: vec![
-                PositionData { policy: vec![0.5, 0.5], player: "P1", graph: g1 },
-                PositionData { policy: vec![0.5, 0.5], player: "P2", graph: g2 },
-                PositionData { policy: vec![0.5, 0.5], player: "P1", graph: g3 },
+                PositionData { policy: vec![0.5, 0.5], player: "P1", graph: g1, sample_weight: 1.0 },
+                PositionData { policy: vec![0.5, 0.5], player: "P2", graph: g2, sample_weight: 1.0 },
+                PositionData { policy: vec![0.5, 0.5], player: "P1", graph: g3, sample_weight: 1.0 },
             ],
             winner: "P1",
             move_count: 10,
@@ -1977,12 +2054,12 @@ mod tests {
     #[test]
     fn value_targets_win() {
         let game = GameState::with_config(small_game_config());
-        let (g1, _) = build_position_graph(&game, GraphType::Hex);
-        let (g2, _) = build_position_graph(&game, GraphType::Hex);
+        let (g1, _) = build_position_graph(&game, GraphType::Hex, false);
+        let (g2, _) = build_position_graph(&game, GraphType::Hex, false);
         let result = GameResult {
             positions: vec![
-                PositionData { policy: vec![0.5, 0.5], player: "P1", graph: g1 },
-                PositionData { policy: vec![0.3, 0.7], player: "P2", graph: g2 },
+                PositionData { policy: vec![0.5, 0.5], player: "P1", graph: g1, sample_weight: 1.0 },
+                PositionData { policy: vec![0.3, 0.7], player: "P2", graph: g2, sample_weight: 1.0 },
             ],
             winner: "P1",
             move_count: 2,
