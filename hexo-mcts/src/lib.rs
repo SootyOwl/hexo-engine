@@ -1,6 +1,7 @@
 pub mod axis_graph;
 pub mod batch_tensors;
 pub mod graph;
+pub mod graph_tensors;
 #[cfg(feature = "torch")]
 pub mod inference;
 pub mod mcts;
