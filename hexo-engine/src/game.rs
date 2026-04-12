@@ -191,6 +191,49 @@ impl GameState {
     pub fn config(&self) -> &GameConfig {
         &self.config
     }
+
+    /// Reconstructs a non-terminal `GameState` directly from a stone set and
+    /// turn info, bypassing the move-replay path. Intended for tests and
+    /// benchmarks that need to materialise positions extracted from external
+    /// sources (e.g. self-play binaries) without reconstructing move order.
+    ///
+    /// `stones` must contain the (0,0) opening for P1. No win check is run —
+    /// the caller is responsible for only passing non-terminal positions.
+    pub fn from_state(
+        stones: &[(Coord, Player)],
+        current_player: Player,
+        moves_remaining: u8,
+        config: GameConfig,
+    ) -> Self {
+        assert!(moves_remaining == 1 || moves_remaining == 2);
+        let mut board = Board::new();
+        // Board::new() seeds (0,0)=P1; replay the rest from the input.
+        for &(coord, player) in stones {
+            if coord == (0, 0) && player == Player::P1 {
+                continue;
+            }
+            board
+                .place(coord, player)
+                .expect("from_state: stones must not collide");
+        }
+        let offsets: Arc<[Coord]> = hex_offsets(config.placement_radius).into();
+        let cached_legal: HashSet<Coord> =
+            legal_moves(&board, config.placement_radius).into_iter().collect();
+        let turn = match current_player {
+            Player::P1 => TurnState::P1Turn { moves_left: moves_remaining },
+            Player::P2 => TurnState::P2Turn { moves_left: moves_remaining },
+        };
+        let move_count = stones.len().saturating_sub(1) as u32;
+        GameState {
+            board,
+            turn,
+            config,
+            move_count,
+            winner: None,
+            offsets,
+            cached_legal,
+        }
+    }
 }
 
 #[cfg(test)]
