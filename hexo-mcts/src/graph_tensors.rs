@@ -11,6 +11,13 @@ use hexo_engine::GameState;
 
 use crate::axis_graph::game_to_axis_graph_raw;
 
+/// Graph type for model inference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraphType {
+    Hex,
+    Axis,
+}
+
 /// Raw graph tensors for one game state.
 pub struct GraphTensors {
     pub features: Vec<f32>,    // N*8 flat
