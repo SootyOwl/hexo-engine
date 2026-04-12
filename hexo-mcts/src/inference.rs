@@ -187,24 +187,6 @@ impl TorchModel {
         let batch_tensor = Tensor::from_slice(&all_batch).to_device(self.device);
         let num_graphs = n as i64;
 
-        // Precompute index tensors for graph-break-free forward pass
-        let mut legal_idx: Vec<i64> = Vec::new();
-        let mut stone_idx: Vec<i64> = Vec::new();
-        let mut stone_batch_vec: Vec<i64> = Vec::new();
-        for i in 0..total_nodes {
-            if all_legal_mask[i] {
-                legal_idx.push(i as i64);
-            }
-            if all_stone_mask[i] {
-                stone_idx.push(i as i64);
-                stone_batch_vec.push(all_batch[i]);
-            }
-        }
-
-        let legal_idx_tensor = Tensor::from_slice(&legal_idx).to_device(self.device);
-        let stone_idx_tensor = Tensor::from_slice(&stone_idx).to_device(self.device);
-        let stone_batch_tensor = Tensor::from_slice(&stone_batch_vec).to_device(self.device);
-
         // Build IValue list — axis models get edge_attr as 7th argument
         let mut ivalues = vec![
             tch::IValue::Tensor(x),
@@ -230,10 +212,6 @@ impl TorchModel {
                 ivalues.push(tch::IValue::Tensor(empty));
             }
         }
-        ivalues.push(tch::IValue::Tensor(legal_idx_tensor));
-        ivalues.push(tch::IValue::Tensor(stone_idx_tensor));
-        ivalues.push(tch::IValue::Tensor(stone_batch_tensor));
-
         // Run model via IValue interface (num_graphs is int, not Tensor)
         let _guard = tch::no_grad_guard();
         let result = match self.model.forward_is(&ivalues) {
@@ -416,24 +394,6 @@ impl TorchModel {
         let batch_tensor = Tensor::from_slice(&all_batch).to_device(self.device);
         let num_graphs_with_ghost = (n + 1) as i64;
 
-        // Precompute index tensors for graph-break-free forward pass
-        let mut legal_idx: Vec<i64> = Vec::new();
-        let mut stone_idx: Vec<i64> = Vec::new();
-        let mut stone_batch_vec: Vec<i64> = Vec::new();
-        for i in 0..real_nodes {
-            if all_legal_mask[i] {
-                legal_idx.push(i as i64);
-            }
-            if all_stone_mask[i] {
-                stone_idx.push(i as i64);
-                stone_batch_vec.push(all_batch[i]);
-            }
-        }
-
-        let legal_idx_tensor = Tensor::from_slice(&legal_idx).to_device(self.device);
-        let stone_idx_tensor = Tensor::from_slice(&stone_idx).to_device(self.device);
-        let stone_batch_tensor = Tensor::from_slice(&stone_batch_vec).to_device(self.device);
-
         let mut ivalues = vec![
             tch::IValue::Tensor(x),
             tch::IValue::Tensor(edge_index),
@@ -457,10 +417,6 @@ impl TorchModel {
                 ivalues.push(tch::IValue::Tensor(empty));
             }
         }
-        ivalues.push(tch::IValue::Tensor(legal_idx_tensor));
-        ivalues.push(tch::IValue::Tensor(stone_idx_tensor));
-        ivalues.push(tch::IValue::Tensor(stone_batch_tensor));
-
         let _guard = tch::no_grad_guard();
         let result = match self.model.forward_is(&ivalues) {
             Ok(r) => r,
