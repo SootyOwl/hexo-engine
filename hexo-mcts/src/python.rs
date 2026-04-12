@@ -880,7 +880,7 @@ fn py_native_self_play(
 /// Bypasses PyG Batch.from_data_list() by returning pre-collated flat arrays
 /// ready for torch.tensor() conversion.
 ///
-/// Returns a tuple: (features, edge_src, edge_dst, legal_mask, stone_mask, batch, num_graphs, legal_counts)
+/// Returns a tuple: (features, edge_src, edge_dst, legal_mask, stone_mask, batch, num_graphs, legal_counts, legal_idx, stone_idx, stone_batch)
 #[pyfunction(name = "game_states_to_batch")]
 fn py_game_states_to_batch(
     py: Python<'_>,
@@ -894,6 +894,9 @@ fn py_game_states_to_batch(
     Vec<i64>,   // batch vector
     usize,      // num_graphs
     Vec<usize>, // legal_counts
+    Vec<i64>,   // legal_idx
+    Vec<i64>,   // stone_idx
+    Vec<i64>,   // stone_batch
 )> {
     use crate::batch_tensors::collate_graphs;
     use crate::graph::game_to_graph_raw;
@@ -910,6 +913,9 @@ fn py_game_states_to_batch(
         bt.batch,
         bt.num_graphs,
         bt.legal_counts,
+        bt.legal_idx,
+        bt.stone_idx,
+        bt.stone_batch,
     ))
 }
 
