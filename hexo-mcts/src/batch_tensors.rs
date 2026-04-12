@@ -7,11 +7,15 @@ pub struct BatchTensors {
     pub features: Vec<f32>,       // total_nodes * 8, row-major
     pub edge_index_src: Vec<i64>, // total_edges (with node offsets applied)
     pub edge_index_dst: Vec<i64>,
-    pub legal_mask: Vec<bool>,    // total_nodes
-    pub stone_mask: Vec<bool>,    // total_nodes
+    pub legal_mask: Vec<bool>,    // total_nodes (keep for backward compat)
+    pub stone_mask: Vec<bool>,    // total_nodes (keep for backward compat)
     pub batch: Vec<i64>,          // total_nodes, each = graph index
     pub num_graphs: usize,
     pub legal_counts: Vec<usize>, // per-graph count of legal nodes
+    // precomputed index tensors (eliminates GPU nonzero calls)
+    pub legal_idx: Vec<i64>,      // global indices where legal_mask is true
+    pub stone_idx: Vec<i64>,      // global indices where stone_mask is true
+    pub stone_batch: Vec<i64>,    // graph index per stone node
 }
 
 pub fn collate_graphs(graphs: &[GraphData]) -> BatchTensors {
@@ -27,6 +31,9 @@ pub fn collate_graphs(graphs: &[GraphData]) -> BatchTensors {
     let mut batch = Vec::with_capacity(total_nodes);
     let mut legal_counts = Vec::with_capacity(num_graphs);
 
+    let mut legal_idx = Vec::new();
+    let mut stone_idx = Vec::new();
+    let mut stone_batch = Vec::new();
     let mut node_offset: i64 = 0;
 
     for (graph_idx, g) in graphs.iter().enumerate() {
@@ -46,6 +53,18 @@ pub fn collate_graphs(graphs: &[GraphData]) -> BatchTensors {
         }
 
         legal_counts.push(g.legal_mask.iter().filter(|&&m| m).count());
+
+        for (local_i, (&is_legal, &is_stone)) in g.legal_mask.iter().zip(&g.stone_mask).enumerate() {
+            let global_i = node_offset + local_i as i64;
+            if is_legal {
+                legal_idx.push(global_i);
+            }
+            if is_stone {
+                stone_idx.push(global_i);
+                stone_batch.push(graph_idx as i64);
+            }
+        }
+
         node_offset += g.num_nodes as i64;
     }
 
@@ -58,6 +77,9 @@ pub fn collate_graphs(graphs: &[GraphData]) -> BatchTensors {
         batch,
         num_graphs,
         legal_counts,
+        legal_idx,
+        stone_idx,
+        stone_batch,
     }
 }
 
@@ -83,5 +105,16 @@ mod tests {
         assert!(bt.batch[..n1].iter().all(|&b| b == 0));
         assert!(bt.batch[n1..].iter().all(|&b| b == 1));
         assert!(bt.edge_index_src.iter().any(|&s| s >= n1 as i64));
+
+        // legal_idx should index into legal positions
+        assert_eq!(bt.legal_idx.len(), bt.legal_mask.iter().filter(|&&b| b).count());
+        // stone_idx should index into stone positions
+        assert_eq!(bt.stone_idx.len(), bt.stone_mask.iter().filter(|&&b| b).count());
+        // stone_batch length matches stone_idx
+        assert_eq!(bt.stone_batch.len(), bt.stone_idx.len());
+        // all legal_idx values should be in range
+        assert!(bt.legal_idx.iter().all(|&i| (i as usize) < bt.batch.len()));
+        // all stone_idx values should be in range
+        assert!(bt.stone_idx.iter().all(|&i| (i as usize) < bt.batch.len()));
     }
 }
