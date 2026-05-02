@@ -94,6 +94,48 @@ impl PyGameState {
         })
     }
 
+    /// Construct a GameState directly from a list of placed stones.
+    ///
+    /// Bypasses turn-order and placement-radius enforcement, so the caller can
+    /// build arbitrary positions for puzzle / setup workflows. The board is
+    /// always seeded with P1 at (0,0); a redundant (0,0)=P1 entry in `stones`
+    /// is silently ignored.
+    ///
+    /// Args:
+    ///     stones: list of ((q, r), "P1"|"P2") pairs.
+    ///     current_player: "P1" or "P2" — whose turn it is in the resulting state.
+    ///     moves_remaining: 1 or 2 — placements left this turn.
+    ///     config: GameConfig (optional, defaults to FULL_HEXO).
+    #[staticmethod]
+    #[pyo3(signature = (stones, current_player, moves_remaining=2, config=None))]
+    fn from_state(
+        stones: Vec<((i32, i32), String)>,
+        current_player: String,
+        moves_remaining: u8,
+        config: Option<&PyGameConfig>,
+    ) -> PyResult<Self> {
+        if moves_remaining != 1 && moves_remaining != 2 {
+            return Err(PyValueError::new_err("moves_remaining must be 1 or 2"));
+        }
+        let parse_player = |s: &str| -> PyResult<Player> {
+            match s {
+                "P1" => Ok(Player::P1),
+                "P2" => Ok(Player::P2),
+                other => Err(PyValueError::new_err(format!(
+                    "player must be 'P1' or 'P2', got {other:?}"
+                ))),
+            }
+        };
+        let cur = parse_player(&current_player)?;
+        let mut typed_stones: Vec<(Coord, Player)> = Vec::with_capacity(stones.len());
+        for (coord, p) in stones {
+            typed_stones.push((coord, parse_player(&p)?));
+        }
+        let cfg = config.map(|c| c.inner).unwrap_or(GameConfig::FULL_HEXO);
+        let inner = GameState::from_state(&typed_stones, cur, moves_remaining, cfg);
+        Ok(PyGameState { inner })
+    }
+
     fn legal_moves(&self) -> Vec<(i32, i32)> {
         self.inner.legal_moves()
     }
