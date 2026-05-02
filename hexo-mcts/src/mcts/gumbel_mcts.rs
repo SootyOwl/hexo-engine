@@ -119,16 +119,30 @@ where
     let (candidate_indices, gumbel_samples) =
         gumbel_top_k(&logits, config.m_actions, rng);
 
-    // Step 3.5: Check for immediate winning moves among candidates
-    // If any candidate action leads to a terminal win, skip expensive sequential halving.
-    // Return a one-hot improved policy on the winning move (the search hasn't
-    // visited any children yet, so compute_improved_policy would just return
-    // the raw softmax which is uninformative).
+    // Step 3.5: Forced-win shortcut over the candidate set.
+    //
+    // Phase A (depth-1, original): if any candidate makes the game terminal as
+    // a win for the current player, return a one-hot improved policy on it and
+    // skip sequential halving.
+    //
+    // Phase B (depth-2): HeXO turns are two placements. If we're at the start
+    // of a turn (moves_remaining_this_turn() == 2) and a candidate's first
+    // placement leaves a position where the same player can immediately win
+    // with their second placement, that candidate is the first half of a
+    // 1-turn forced win. Return one-hot on it. This mirrors the depth-1
+    // shortcut so own_4 patterns get the same supervised one-hot policy
+    // target that own_5 patterns already enjoy.
+    //
+    // Scoped to the Gumbel-top-K candidate set (not all legal moves) to
+    // bound cost; uninformed priors will miss some forced wins but the
+    // network's own learning concentrates priors on gap squares over time
+    // (depth-1 supervision already works this way for own_5).
+    let me = game.current_player();
     for &idx in &candidate_indices {
         let coord = coords[idx];
         let mut test_game = game.clone();
         if test_game.apply_move(coord).is_ok() && test_game.is_terminal() {
-            if test_game.winner() == game.current_player() {
+            if test_game.winner() == me {
                 let mut improved_policy = vec![0.0; coords.len()];
                 improved_policy[idx] = 1.0;
                 return Ok(MCTSResult {
@@ -136,6 +150,39 @@ where
                     improved_policy,
                     coords,
                 });
+            }
+        }
+    }
+
+    if game.moves_remaining_this_turn() == 2 {
+        for &idx in &candidate_indices {
+            let m1 = coords[idx];
+            let mut g1 = game.clone();
+            if g1.apply_move(m1).is_err() {
+                continue;
+            }
+            // is_terminal already handled in Phase A.
+            if g1.is_terminal() {
+                continue;
+            }
+            // The 2-placement forced-win pattern requires the same player to
+            // still be on move after m1 (i.e. moves_remaining drops 2→1, not
+            // 2→other-player). If apply_move flipped the turn for any reason
+            // (won't here, but defensive), skip.
+            if g1.current_player() != me {
+                continue;
+            }
+            for m2 in g1.legal_moves() {
+                let mut g2 = g1.clone();
+                if g2.apply_move(m2).is_ok() && g2.is_terminal() && g2.winner() == me {
+                    let mut improved_policy = vec![0.0; coords.len()];
+                    improved_policy[idx] = 1.0;
+                    return Ok(MCTSResult {
+                        action: m1,
+                        improved_policy,
+                        coords,
+                    });
+                }
             }
         }
     }
@@ -620,6 +667,128 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Depth-2 forced-win shortcut: when the current player has 2 placements
+    /// remaining this turn and a candidate's first placement leaves the same
+    /// player able to win on their second placement, MCTS must short-circuit
+    /// with a one-hot policy on that first placement. Mirrors the depth-1
+    /// shortcut behaviour for own_4-style 1-turn forced wins.
+    #[test]
+    fn gumbel_mcts_two_placement_forced_win_returns_one_hot_policy() {
+        // win_length = 4: P1 has stones at (0,0) and (3,0). Filling the gaps
+        // at (1,0) and (2,0) (in either order) makes a 4-in-a-row along the
+        // q-axis. Stones are spaced so that ONLY this specific gap pair
+        // produces a 2-placement forced win (no other 4-window is reachable
+        // in two placements). Single-placement does NOT win (depth-1
+        // shortcut must not fire).
+        let config_game = GameConfig {
+            win_length: 4,
+            placement_radius: 1,
+            max_moves: 80,
+        };
+        // Minimal position: two P1 stones along the q-axis 3 cells apart.
+        // radius=1 keeps the legal-move set small (~10 cells) so m_actions
+        // covers it entirely and the depth-2 shortcut deterministically
+        // sees both gap squares.
+        let stones = vec![
+            ((0, 0), Player::P1),
+            ((3, 0), Player::P1),
+        ];
+        let game = GameState::from_state(&stones, Player::P1, 2, config_game);
+
+        // Sanity: both gap squares are legal, neither alone wins.
+        for &gap in &[(1, 0), (2, 0)] {
+            assert!(
+                game.legal_moves().contains(&gap),
+                "gap {gap:?} must be legal in the constructed position"
+            );
+            let mut g = game.clone();
+            g.apply_move(gap).unwrap();
+            assert!(
+                !g.is_terminal(),
+                "single placement at {gap:?} should not win (depth-1 must not fire)"
+            );
+        }
+
+        // m_actions large enough that all legal moves are in the candidate
+        // set, ensuring the depth-2 shortcut sees both gap squares.
+        let config = MCTSConfig {
+            n_simulations: 64,
+            m_actions: 64,
+            c_visit: 50,
+            c_scale: 1.0,
+        };
+
+        for seed in 0..20 {
+            let mut rng = ChaCha8Rng::seed_from_u64(seed);
+            let result = gumbel_mcts(&game, &config, &mut rng, &mut dummy_eval).unwrap();
+
+            assert!(
+                result.action == (1, 0) || result.action == (2, 0),
+                "seed {seed}: action {:?} must be one of the forced-win gaps",
+                result.action
+            );
+
+            let action_idx = result
+                .coords
+                .iter()
+                .position(|&c| c == result.action)
+                .expect("action must be in coords");
+
+            assert_eq!(
+                result.improved_policy[action_idx], 1.0,
+                "seed {seed}: chosen gap should have probability 1.0"
+            );
+            for (i, &p) in result.improved_policy.iter().enumerate() {
+                if i != action_idx {
+                    assert_eq!(
+                        p, 0.0,
+                        "seed {seed}: non-winning move {i} should have probability 0.0"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Guard: the depth-2 shortcut must NOT fire when the current player has
+    /// only 1 placement left this turn (their next placement ends the turn,
+    /// so a "two-step forced win" is actually opp-then-self, not a forced
+    /// win). The same own_4 pattern should produce a non-one-hot policy
+    /// when the precondition fails.
+    #[test]
+    fn gumbel_mcts_depth2_shortcut_skipped_mid_turn() {
+        let config_game = GameConfig {
+            win_length: 4,
+            placement_radius: 1,
+            max_moves: 80,
+        };
+        let stones = vec![
+            ((0, 0), Player::P1),
+            ((3, 0), Player::P1),
+        ];
+        // moves_remaining = 1: P1 will place once, then P2 moves.
+        let game = GameState::from_state(&stones, Player::P1, 1, config_game);
+
+        let config = MCTSConfig {
+            n_simulations: 64,
+            m_actions: 64,
+            c_visit: 50,
+            c_scale: 1.0,
+        };
+
+        let mut rng = ChaCha8Rng::seed_from_u64(0);
+        let result = gumbel_mcts(&game, &config, &mut rng, &mut dummy_eval).unwrap();
+
+        // No single-placement win exists here, so depth-1 doesn't fire either.
+        // Improved policy must therefore come from sequential halving — i.e.
+        // it must NOT be one-hot on either gap. (We assert no entry hits 1.0
+        // exactly; a real search distributes weight.)
+        assert!(
+            result.improved_policy.iter().all(|&p| p < 0.999),
+            "depth-2 shortcut must not fire mid-turn; got policy {:?}",
+            result.improved_policy
+        );
     }
 
     /// REQ-0e-bis smoke test: with `dedup_skip`, running the same search
