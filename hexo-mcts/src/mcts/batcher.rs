@@ -5,7 +5,7 @@
 //! the real eval function once, and dispatches results back via per-request
 //! oneshot channels.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -91,7 +91,7 @@ where
                 for req in pending {
                     let n = req.states.len();
                     let _ = req.response_tx.send(EvalResponse {
-                        logits: vec![HashMap::new(); n],
+                        logits: vec![HashMap::default(); n],
                         values: vec![0.0; n],
                     });
                 }

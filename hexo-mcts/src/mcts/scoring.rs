@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 
 use hexo_engine::{Coord, Player};
 
@@ -36,7 +36,7 @@ pub fn normalize_q(
     q_max: f64,
 ) -> HashMap<Coord, f64> {
     if q_values.is_empty() {
-        return HashMap::new();
+        return HashMap::default();
     }
     if !(q_max > q_min) {
         return q_values.keys().map(|&a| (a, 0.0)).collect();
@@ -105,8 +105,9 @@ impl QContext {
         // Step 1: v_mix
         let vmix_val = v_mix(node.value_estimate, &node.children, parent_player);
 
-        // Step 2: completed_q
-        let mut completed_q: HashMap<Coord, f64> = HashMap::new();
+        // Step 2: completed_q (pre-sized to avoid HashMap rehash during the loop)
+        let mut completed_q: HashMap<Coord, f64> =
+            HashMap::with_capacity_and_hasher(all_actions.len(), Default::default());
         for &a in all_actions {
             if let Some(child) = node.children.get(&a) {
                 if child.visit_count > 0 {
@@ -190,7 +191,7 @@ mod tests {
 
     #[test]
     fn normalize_q_basic() {
-        let q = HashMap::from([((0, 0), 0.0), ((1, 0), 1.0)]);
+        let q = [((0, 0), 0.0), ((1, 0), 1.0)].into_iter().collect::<HashMap<_,_>>();
         let norm = normalize_q(&q, 0.0, 1.0);
         assert!((norm[&(0, 0)] - 0.0).abs() < 1e-10);
         assert!((norm[&(1, 0)] - 1.0).abs() < 1e-10);
@@ -198,7 +199,7 @@ mod tests {
 
     #[test]
     fn normalize_q_equal_min_max() {
-        let q = HashMap::from([((0, 0), 0.5), ((1, 0), 0.5)]);
+        let q = [((0, 0), 0.5), ((1, 0), 0.5)].into_iter().collect::<HashMap<_,_>>();
         let norm = normalize_q(&q, 0.5, 0.5);
         assert_eq!(norm[&(0, 0)], 0.0);
         assert_eq!(norm[&(1, 0)], 0.0);
@@ -206,14 +207,14 @@ mod tests {
 
     #[test]
     fn normalize_q_empty() {
-        let q: HashMap<Coord, f64> = HashMap::new();
+        let q: HashMap<Coord, f64> = HashMap::default();
         let norm = normalize_q(&q, 0.0, 1.0);
         assert!(norm.is_empty());
     }
 
     #[test]
     fn normalize_q_clamps() {
-        let q = HashMap::from([((0, 0), -1.0), ((1, 0), 2.0)]);
+        let q = [((0, 0), -1.0), ((1, 0), 2.0)].into_iter().collect::<HashMap<_,_>>();
         let norm = normalize_q(&q, 0.0, 1.0);
         assert_eq!(norm[&(0, 0)], 0.0);
         assert_eq!(norm[&(1, 0)], 1.0);
@@ -221,7 +222,7 @@ mod tests {
 
     #[test]
     fn v_mix_no_visits() {
-        let children: HashMap<Coord, MCTSNode> = HashMap::new();
+        let children: HashMap<Coord, MCTSNode> = HashMap::default();
         assert_eq!(v_mix(0.5, &children, Player::P1), 0.5);
     }
 
@@ -239,10 +240,8 @@ mod tests {
         c2.visit_count = 1;
         c2.value_sum = 0.0; // Q = 0.0
 
-        let children: HashMap<Coord, MCTSNode> = HashMap::from([
-            ((1, 0), c1),
-            ((0, 1), c2),
-        ]);
+        let children: HashMap<Coord, MCTSNode> = [            ((1, 0), c1),
+            ((0, 1), c2),].into_iter().collect::<HashMap<_,_>>();
         let result = v_mix(0.5, &children, Player::P1);
         assert!((result - 0.74).abs() < 1e-10);
     }
@@ -257,7 +256,7 @@ mod tests {
         c.value_sum = 1.0; // Q = 0.5
 
         let children: HashMap<Coord, MCTSNode> =
-            HashMap::from([((1, 0), c)]);
+            [((1, 0), c)].into_iter().collect::<HashMap<_,_>>();
         let result = v_mix(0.0, &children, Player::P1);
         assert!((result - (-1.0 / 3.0)).abs() < 1e-10);
     }
@@ -271,10 +270,8 @@ mod tests {
         let c2 = MCTSNode::new(0.4, Some((0, 1)), Player::P1);
         // c2 unvisited
 
-        let children: HashMap<Coord, MCTSNode> = HashMap::from([
-            ((1, 0), c1),
-            ((0, 1), c2),
-        ]);
+        let children: HashMap<Coord, MCTSNode> = [            ((1, 0), c1),
+            ((0, 1), c2),].into_iter().collect::<HashMap<_,_>>();
         // total_N = 4, sum_visited_prior = 0.6 (only c1)
         // sum_pi_q = 0.6 * 0.5 = 0.3
         // v_mix = (0.1 + 4/0.6 * 0.3) / (1 + 4) = (0.1 + 2.0) / 5 = 0.42
@@ -339,10 +336,8 @@ mod tests {
         c2.visit_count = 2;
         c2.value_sum = -1.0; // Q = -0.5
 
-        let children: HashMap<Coord, MCTSNode> = HashMap::from([
-            ((1, 0), c1),
-            ((0, 1), c2),
-        ]);
+        let children: HashMap<Coord, MCTSNode> = [            ((1, 0), c1),
+            ((0, 1), c2),].into_iter().collect::<HashMap<_,_>>();
         let val_est = 0.42;
         let result = v_mix(val_est, &children, Player::P1);
         // sum_visited_prior = 2e-12 < 1e-8, so should return value_estimate

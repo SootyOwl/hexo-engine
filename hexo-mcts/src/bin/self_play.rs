@@ -10,7 +10,7 @@
 //! a batch and runs a single forward pass, achieving better hardware
 //! utilization (especially on GPU) than per-thread model instances.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 use std::fs;
 use std::io::{BufWriter, Write};
 use std::sync::Arc;
@@ -35,6 +35,68 @@ use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
 // ---------------------------------------------------------------------------
+// Per-move profiling for play_one_game (gated behind --profile-play / the
+// PROFILE_PLAY_ENABLED static). Each game thread accumulates section-level
+// timings in a thread-local and flushes one summary line at the end of its
+// measurement allocation. Overhead per move when disabled = atomic load only.
+// ---------------------------------------------------------------------------
+
+static PROFILE_PLAY_ENABLED: AtomicBool = AtomicBool::new(false);
+
+#[derive(Default)]
+struct PlayPerfCounters {
+    moves: u64,
+    games: u64,
+    graph_build_ns: u128,
+    mcts_total_ns: u128,
+    eval_wait_ns: u128,
+    eval_graph_build_ns: u128,
+    apply_move_ns: u128,
+    iter_total_ns: u128,
+}
+
+thread_local! {
+    static PLAY_PERF: std::cell::RefCell<PlayPerfCounters> =
+        std::cell::RefCell::new(PlayPerfCounters::default());
+}
+
+fn play_perf_flush() {
+    if !PROFILE_PLAY_ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    PLAY_PERF.with(|cell| {
+        let mut p = cell.borrow_mut();
+        if p.moves == 0 {
+            return;
+        }
+        let n = p.moves as f64;
+        let to_us = |ns: u128| -> f64 { (ns as f64) / n / 1000.0 };
+        // Pure MCTS CPU work = mcts_total − eval_wait (eval_wait is time
+        // spent inside the eval closure, which gumbel_mcts called from
+        // within its own loop). Pipe time inside eval_wait = eval_wait −
+        // eval_graph_build.
+        let mcts_cpu_us = to_us(p.mcts_total_ns.saturating_sub(p.eval_wait_ns));
+        let pipe_wait_us = to_us(p.eval_wait_ns.saturating_sub(p.eval_graph_build_ns));
+        eprintln!(
+            "[play_perf] tid={:?} games={} moves={} per_move_us(total={:.0} \
+             graph_build={:.0} mcts_total={:.0} mcts_cpu={:.0} \
+             eval_wait={:.0} eval_graph_build={:.0} pipe_wait={:.0} apply={:.0})",
+            std::thread::current().id(),
+            p.games, p.moves,
+            to_us(p.iter_total_ns),
+            to_us(p.graph_build_ns),
+            to_us(p.mcts_total_ns),
+            mcts_cpu_us,
+            to_us(p.eval_wait_ns),
+            to_us(p.eval_graph_build_ns),
+            pipe_wait_us,
+            to_us(p.apply_move_ns),
+        );
+        *p = PlayPerfCounters::default();
+    });
+}
+
+// ---------------------------------------------------------------------------
 // Batched inference server
 // ---------------------------------------------------------------------------
 
@@ -47,16 +109,41 @@ struct EvalRequest {
 }
 
 /// Handle held by game threads to submit eval requests.
+///
+/// Holds one or more request channels — one per inference batcher worker.
+/// `evaluate()` does sender-side round-robin via a shared atomic counter,
+/// distributing requests evenly across workers so multiple Python
+/// inference subprocesses can hide each other's GPU sync latency.
+///
+/// At N=1 (the default), behaviour is observationally identical to the
+/// historical single-Sender client: the counter still increments but
+/// `index % 1 == 0`, so every request goes to the sole worker.
 #[derive(Clone)]
 struct InferenceClient {
-    request_tx: mpsc::Sender<EvalRequest>,
+    request_txs: Arc<Vec<mpsc::Sender<EvalRequest>>>,
+    counter: Arc<AtomicUsize>,
 }
 
 impl InferenceClient {
+    /// Build a client over `request_txs.len()` worker channels. Panics if
+    /// the vector is empty (callers always wire at least one worker).
+    fn new(request_txs: Vec<mpsc::Sender<EvalRequest>>) -> Self {
+        assert!(
+            !request_txs.is_empty(),
+            "InferenceClient requires at least one worker channel"
+        );
+        Self {
+            request_txs: Arc::new(request_txs),
+            counter: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
     /// Submit graphs for evaluation and block until results arrive.
+    /// Routes the request to one worker chosen by round-robin.
     fn evaluate(&self, graphs: Vec<GraphTensors>) -> (Vec<HashMap<Coord, f64>>, Vec<f64>) {
         let (response_tx, response_rx) = mpsc::channel();
-        self.request_tx
+        let idx = self.counter.fetch_add(1, Ordering::Relaxed) % self.request_txs.len();
+        self.request_txs[idx]
             .send(EvalRequest { graphs, response_tx })
             .expect("inference server gone");
         response_rx.recv().expect("inference server dropped response")
@@ -256,7 +343,7 @@ fn inference_server_subprocess(
                 for req in requests {
                     let n = req.graphs.len().max(1); // graphs already drained
                     let empty_logits: Vec<HashMap<Coord, f64>> =
-                        (0..n).map(|_| HashMap::new()).collect();
+                        (0..n).map(|_| HashMap::default()).collect();
                     let empty_values: Vec<f64> = vec![0.0; n];
                     let _ = req.response_tx.send((empty_logits, empty_values));
                 }
@@ -351,7 +438,7 @@ fn pool_inference_server_subprocess(
                 for req in requests {
                     let n = req.graphs.len().max(1);
                     let empty_logits: Vec<HashMap<Coord, f64>> =
-                        (0..n).map(|_| HashMap::new()).collect();
+                        (0..n).map(|_| HashMap::default()).collect();
                     let _ = req.response_tx.send((empty_logits, vec![0.0; n]));
                 }
             }
@@ -1021,6 +1108,9 @@ fn reduced_sim_config(base: &MCTSConfig, divisor: u32) -> MCTSConfig {
         m_actions: base.m_actions,
         c_visit: base.c_visit,
         c_scale: base.c_scale,
+        virtual_loss: base.virtual_loss,
+        root_dirichlet_alpha: base.root_dirichlet_alpha,
+        root_dirichlet_fraction: base.root_dirichlet_fraction,
     }
 }
 
@@ -1043,11 +1133,13 @@ fn play_one_game(
     let mut game = GameState::with_config(game_config);
     let mut positions = Vec::new();
     let mut move_count = 0;
+    let profile = PROFILE_PLAY_ENABLED.load(Ordering::Relaxed);
 
     while !game.is_terminal() {
         if !running.load(Ordering::Relaxed) {
             return None;
         }
+        let iter_start = if profile { Some(Instant::now()) } else { None };
         let current_player = match game.current_player() {
             Some(hexo_engine::types::Player::P1) => "P1",
             Some(hexo_engine::types::Player::P2) => "P2",
@@ -1055,7 +1147,9 @@ fn play_one_game(
         };
 
         // Build graph ONCE for this position — reuse for both output and root eval
+        let t = if profile { Some(Instant::now()) } else { None };
         let (graph_output, root_tensors) = build_position_graph(&game, graph_type, prune_empty_edges);
+        let graph_build_ns = t.map(|i| i.elapsed().as_nanos()).unwrap_or(0);
 
         // Choose which inference client services THIS root's MCTS search.
         // For pool games, the pool client serves searches whose side-to-move
@@ -1068,20 +1162,28 @@ fn play_one_game(
         // Eval closure: builds graphs on this thread, sends to inference server.
         // Root eval reuses the pre-built graph; leaf evals build fresh.
         let mut cached_root = Some(root_tensors);
+        let mut eval_wait_ns: u128 = 0;
+        let mut eval_graph_build_ns: u128 = 0;
         let mut eval = |states: &[GameState]| -> (Vec<HashMap<Coord, f64>>, Vec<f64>) {
+            let eval_start = if profile { Some(Instant::now()) } else { None };
             let graphs = if let Some(gt) = cached_root.take() {
                 debug_assert_eq!(states.len(), 1, "root eval should be single state");
                 vec![gt]
             } else {
+                let gb = if profile { Some(Instant::now()) } else { None };
                 // Leaf evals: build graphs on this game thread (CPU work)
-                states.iter().map(|s| {
+                let gs: Vec<_> = states.iter().map(|s| {
                     match graph_type {
                         GraphType::Axis => GraphTensors::from(game_to_axis_graph_raw_opts(s, prune_empty_edges)),
                         GraphType::Hex => GraphTensors::from(game_to_graph_raw(s)),
                     }
-                }).collect()
+                }).collect();
+                if let Some(i) = gb { eval_graph_build_ns += i.elapsed().as_nanos(); }
+                gs
             };
-            active_client.evaluate(graphs)
+            let result = active_client.evaluate(graphs);
+            if let Some(i) = eval_start { eval_wait_ns += i.elapsed().as_nanos(); }
+            result
         };
 
         // Wu (2019) playout cap randomisation, adapted for Gumbel AZ (HX04):
@@ -1109,6 +1211,7 @@ fn play_one_game(
             1.0
         };
 
+        let t = if profile { Some(Instant::now()) } else { None };
         let result = match gumbel_mcts(&game, active_cfg, rng, &mut eval) {
             Ok(r) => r,
             Err(e) => {
@@ -1116,6 +1219,7 @@ fn play_one_game(
                 return None;
             }
         };
+        let mcts_total_ns = t.map(|i| i.elapsed().as_nanos()).unwrap_or(0);
 
         let action = if move_count < exploration.load(Ordering::Relaxed) {
             let policy = &result.improved_policy;
@@ -1146,11 +1250,31 @@ fn play_one_game(
         if !running.load(Ordering::Relaxed) {
             return None;
         }
+        let t = if profile { Some(Instant::now()) } else { None };
         if let Err(e) = game.apply_move(action) {
             eprintln!("Invalid move from MCTS: {e:?}, dropping game");
             return None;
         }
+        let apply_move_ns = t.map(|i| i.elapsed().as_nanos()).unwrap_or(0);
         move_count += 1;
+
+        if profile {
+            let iter_total_ns = iter_start.map(|i| i.elapsed().as_nanos()).unwrap_or(0);
+            PLAY_PERF.with(|cell| {
+                let mut p = cell.borrow_mut();
+                p.moves += 1;
+                p.graph_build_ns += graph_build_ns;
+                p.mcts_total_ns += mcts_total_ns;
+                p.eval_wait_ns += eval_wait_ns;
+                p.eval_graph_build_ns += eval_graph_build_ns;
+                p.apply_move_ns += apply_move_ns;
+                p.iter_total_ns += iter_total_ns;
+            });
+        }
+    }
+
+    if profile {
+        PLAY_PERF.with(|cell| cell.borrow_mut().games += 1);
     }
 
     let winner = match game.winner() {
@@ -1279,6 +1403,14 @@ fn main() {
     // Python subprocess inference flags
     let mut python_inference = false;
     let mut python_bin = String::from("python");
+    // Number of parallel Python inference subprocesses driving the main
+    // self-play request stream. Default 1 = single subprocess (historical
+    // behaviour, byte-identical CLI for existing configs). N>1 spawns N
+    // independent inference workers with sender-side round-robin so multiple
+    // GPU forward passes can overlap, hiding per-batch CUDA sync latency.
+    // Only honored when --python-inference is set; the in-process torch
+    // path is always single-worker.
+    let mut python_inference_workers: usize = 1;
     let mut checkpoint_path: Option<String> = None;
     let mut model_hidden_dim: usize = 256;
     let mut model_num_layers: usize = 3;
@@ -1286,6 +1418,26 @@ fn main() {
     let mut model_policy_hidden: usize = 128;
     let mut model_value_hidden: usize = 128;
     let mut model_conv_type = String::from("gine");
+
+    // Sequential Halving inner-loop fusion (virtual-loss leaf-parallel MCTS).
+    // 0.0 = disabled (serial sims, current behaviour). 0.3–1.0 enables fusion.
+    let mut virtual_loss: f64 = 0.0;
+
+    // Root Dirichlet noise (AlphaZero-style root exploration applied before
+    // Gumbel-Top-k candidate sampling). Both default to 0.0 → disabled,
+    // bit-equivalent to existing behaviour.
+    let mut root_dirichlet_alpha: f64 = 0.0;
+    let mut root_dirichlet_fraction: f64 = 0.0;
+
+    // Warmup games to play in batch mode BEFORE the timing-of-record begins.
+    // Lets workers desync from the initial all-start-from-empty / all-at-
+    // same-SH-phase lockstep, so the measured games/s reflects steady-state
+    // batcher dynamics rather than the early synchronised regime. 0 disables.
+    let mut warmup_games: usize = 0;
+
+    // When true, each game worker accumulates per-section timing for moves
+    // it plays during measurement and prints a summary at end of its run.
+    let mut profile_play: bool = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -1344,6 +1496,14 @@ fn main() {
                 i += 2;
             }
             "--python-inference" => { python_inference = true; i += 1; }
+            "--python-inference-workers" => {
+                python_inference_workers = args[i + 1].parse().unwrap();
+                if python_inference_workers == 0 {
+                    eprintln!("--python-inference-workers must be >= 1, got 0");
+                    std::process::exit(1);
+                }
+                i += 2;
+            }
             "--python-bin" => { python_bin = args[i + 1].clone(); i += 2; }
             "--checkpoint" => { checkpoint_path = Some(args[i + 1].clone()); i += 2; }
             "--model-hidden-dim" => { model_hidden_dim = args[i + 1].parse().unwrap(); i += 2; }
@@ -1352,6 +1512,35 @@ fn main() {
             "--model-policy-hidden" => { model_policy_hidden = args[i + 1].parse().unwrap(); i += 2; }
             "--model-value-hidden" => { model_value_hidden = args[i + 1].parse().unwrap(); i += 2; }
             "--model-conv-type" => { model_conv_type = args[i + 1].clone(); i += 2; }
+            "--virtual-loss" => {
+                virtual_loss = args[i + 1].parse().unwrap();
+                if !virtual_loss.is_finite() || virtual_loss < 0.0 {
+                    eprintln!("--virtual-loss must be a non-negative finite number, got {}", virtual_loss);
+                    std::process::exit(1);
+                }
+                i += 2;
+            }
+            "--root-dirichlet-alpha" => {
+                root_dirichlet_alpha = args[i + 1].parse().unwrap();
+                if !root_dirichlet_alpha.is_finite() || root_dirichlet_alpha < 0.0 {
+                    eprintln!("--root-dirichlet-alpha must be a non-negative finite number, got {}", root_dirichlet_alpha);
+                    std::process::exit(1);
+                }
+                i += 2;
+            }
+            "--root-dirichlet-fraction" => {
+                root_dirichlet_fraction = args[i + 1].parse().unwrap();
+                if !root_dirichlet_fraction.is_finite() || !(0.0..=1.0).contains(&root_dirichlet_fraction) {
+                    eprintln!("--root-dirichlet-fraction must be in [0, 1], got {}", root_dirichlet_fraction);
+                    std::process::exit(1);
+                }
+                i += 2;
+            }
+            "--warmup-games" => {
+                warmup_games = args[i + 1].parse().unwrap();
+                i += 2;
+            }
+            "--profile-play" => { profile_play = true; i += 1; }
             _ => { eprintln!("Unknown arg: {}", args[i]); i += 1; }
         }
     }
@@ -1359,6 +1548,18 @@ fn main() {
     if model_path.is_empty() {
         eprintln!("Usage: self_play --model <path.pt> [--continuous] [options]");
         std::process::exit(1);
+    }
+
+    // python_inference_workers > 1 is only meaningful for the Python
+    // subprocess inference path. The in-process torch path always shares a
+    // single TorchModel, so multiple batchers would just serialise on it.
+    if !python_inference && python_inference_workers > 1 {
+        eprintln!(
+            "Warning: --python-inference-workers={} requires --python-inference; \
+             forcing to 1 (in-process torch is always single-worker).",
+            python_inference_workers,
+        );
+        python_inference_workers = 1;
     }
 
     // Auto-detect thread counts
@@ -1402,12 +1603,17 @@ fn main() {
         _ => GraphType::Hex,
     };
 
+    PROFILE_PLAY_ENABLED.store(profile_play, Ordering::Relaxed);
+
     let game_config = GameConfig { win_length, placement_radius: radius, max_moves };
     let mcts_config = Arc::new(MCTSConfig {
         n_simulations: n_sims,
         m_actions,
         c_visit: 50,
         c_scale: 1.0,
+        virtual_loss,
+        root_dirichlet_alpha,
+        root_dirichlet_fraction,
     });
 
     let batch_timeout = if batch_timeout_ms > 0 {
@@ -1430,21 +1636,26 @@ fn main() {
     if !continuous {
         // --- Batch mode ---
         eprintln!(
-            "Playing {} games (sims={}, m={}, explore={}, threads={}, omp={}, max_batch={})...",
-            n_games, n_sims, m_actions, exploration, n_threads, omp_threads, max_batch,
+            "Playing {} games (sims={}, m={}, explore={}, threads={}, omp={}, max_batch={}, warmup={})...",
+            n_games, n_sims, m_actions, exploration, n_threads, omp_threads, max_batch, warmup_games,
         );
-        let start = Instant::now();
 
-        // Create inference channel
+        // Create inference channel (batch mode is always single-worker).
         let (request_tx, request_rx) = mpsc::channel::<EvalRequest>();
-        let client = InferenceClient { request_tx };
+        let client = InferenceClient::new(vec![request_tx]);
 
-        let all_games: Vec<GameResult> = if python_inference {
+        // Each inference branch returns (all_games, measurement_elapsed).
+        // measurement_elapsed is started AFTER warmup completes so the
+        // reported games/s reflects steady-state worker distribution (warmup
+        // breaks the initial all-workers-at-empty-board lockstep) and does
+        // not include torch.compile or model load.
+        let (all_games, elapsed): (Vec<GameResult>, Duration) = if python_inference {
             let ckpt = checkpoint_path.as_deref().unwrap_or(&model_path);
             let model_args = subprocess_model_args(
                 model_hidden_dim, model_num_layers, model_num_heads,
                 model_policy_hidden, model_value_hidden,
                 &graph_type_str, &model_conv_type, device_str,
+                padded_inference,
             );
             eprintln!("Spawning Python inference subprocess...");
             let mut model = SubprocessModel::spawn(&python_bin, ckpt, &model_args)
@@ -1460,14 +1671,14 @@ fn main() {
                     );
                 });
 
-                let results = run_batch_games(
-                    s, client, n_games, n_threads, seed, game_config, &mcts_config,
+                let (results, measured) = run_batch_games_with_warmup(
+                    s, client, warmup_games, n_games, n_threads, seed, game_config, &mcts_config,
                     &exploration_atomic, graph_type, prune_empty_edges, playout_cap_fraction, playout_cap_divisor,
                     &running,
                 );
 
                 server_handle.join().unwrap();
-                results
+                (results, measured)
             })
         } else {
             #[cfg(not(feature = "torch"))]
@@ -1500,19 +1711,17 @@ fn main() {
                         );
                     });
 
-                    let results = run_batch_games(
-                        s, client, n_games, n_threads, seed, game_config, &mcts_config,
+                    let (results, measured) = run_batch_games_with_warmup(
+                        s, client, warmup_games, n_games, n_threads, seed, game_config, &mcts_config,
                         &exploration_atomic, graph_type, prune_empty_edges, playout_cap_fraction, playout_cap_divisor,
                         &running,
                     );
 
                     server_handle.join().unwrap();
-                    results
+                    (results, measured)
                 })
             }
         };
-
-        let elapsed = start.elapsed();
         let total_moves: usize = all_games.iter().map(|g| g.move_count as usize).sum();
 
         let json: Vec<serde_json::Value> = all_games.iter()
@@ -1524,7 +1733,7 @@ fn main() {
             .expect("Failed to write output");
 
         eprintln!(
-            "Done: {} games, {} moves, {:.1}s ({:.2}s/game, {:.1} games/s)",
+            "Done: {} games, {} moves, {:.1}s ({:.2}s/game, {:.3} games/s)",
             n_games, total_moves, elapsed.as_secs_f64(),
             elapsed.as_secs_f64() / n_games as f64,
             n_games as f64 / elapsed.as_secs_f64(),
@@ -1556,11 +1765,23 @@ fn main() {
 
         let game_counter = Arc::new(AtomicU64::new(0));
 
-        // Create inference channel
-        let (request_tx, request_rx) = mpsc::channel::<EvalRequest>();
-        let client = InferenceClient { request_tx };
+        // Create main inference channels — one per python_inference_workers.
+        // N=1 (default) is byte-for-byte equivalent to the historical
+        // single-Sender path. N>1 spawns N independent Python inference
+        // subprocesses; the InferenceClient round-robins requests across
+        // their batcher threads so multiple GPU forward passes can overlap.
+        let n_workers = python_inference_workers.max(1);
+        let mut main_request_txs: Vec<mpsc::Sender<EvalRequest>> = Vec::with_capacity(n_workers);
+        let mut main_request_rxs: Vec<Option<mpsc::Receiver<EvalRequest>>> =
+            Vec::with_capacity(n_workers);
+        for _ in 0..n_workers {
+            let (tx, rx) = mpsc::channel::<EvalRequest>();
+            main_request_txs.push(tx);
+            main_request_rxs.push(Some(rx));
+        }
+        let client = InferenceClient::new(main_request_txs);
 
-        // Past-self opponent pool (optional, torch-only).
+        // Past-self opponent pool (optional, torch-only). Always single-worker.
         let pool_disabled = Arc::new(AtomicBool::new(false));
         let pool_ready = Arc::new(AtomicBool::new(false));
 
@@ -1569,7 +1790,7 @@ fn main() {
         let (pool_client_opt, pool_request_rx_opt) =
             if pool_fraction > 0.0 && pool_dir.is_some() {
                 let (ptx, prx) = mpsc::channel::<EvalRequest>();
-                (Some(InferenceClient { request_tx: ptx }), Some(prx))
+                (Some(InferenceClient::new(vec![ptx])), Some(prx))
             } else {
                 (None, None)
             };
@@ -1580,21 +1801,43 @@ fn main() {
                 model_hidden_dim, model_num_layers, model_num_heads,
                 model_policy_hidden, model_value_hidden,
                 &graph_type_str, &model_conv_type, device_str,
+                padded_inference,
             );
-            eprintln!("Spawning Python inference subprocess...");
-            let mut model = SubprocessModel::spawn(&python_bin, ckpt, &model_args)
-                .unwrap_or_else(|e| { eprintln!("Failed to spawn Python: {e}"); std::process::exit(1); });
+            if n_workers > 1 {
+                eprintln!(
+                    "Spawning {} Python inference subprocesses (round-robin)...",
+                    n_workers,
+                );
+            } else {
+                eprintln!("Spawning Python inference subprocess...");
+            }
+            // Spawn one SubprocessModel per worker. We collect them into a
+            // Vec so each batcher thread owns its own &mut SubprocessModel
+            // inside the thread scope below.
+            let mut models: Vec<SubprocessModel> = Vec::with_capacity(n_workers);
+            for wid in 0..n_workers {
+                match SubprocessModel::spawn(&python_bin, ckpt, &model_args) {
+                    Ok(m) => models.push(m),
+                    Err(e) => {
+                        eprintln!("Failed to spawn Python inference worker {wid}: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
 
             std::thread::scope(|s| {
                 let running_ref = &running;
-                let model_ref = &mut model;
                 let model_path_ref = model_path.as_str();
-                s.spawn(move || {
-                    inference_server_subprocess(
-                        request_rx, model_ref, max_batch, batch_timeout,
-                        running_ref, Some(model_path_ref),
-                    );
-                });
+                // Each batcher thread gets one (rx, &mut model) pair.
+                for (rx_opt, model) in main_request_rxs.iter_mut().zip(models.iter_mut()) {
+                    let rx = rx_opt.take().expect("each receiver consumed exactly once");
+                    s.spawn(move || {
+                        inference_server_subprocess(
+                            rx, model, max_batch, batch_timeout,
+                            running_ref, Some(model_path_ref),
+                        );
+                    });
+                }
 
                 // Spawn pool inference server + background loader (if configured).
                 if let Some(prx) = pool_request_rx_opt {
@@ -1653,6 +1896,12 @@ fn main() {
                         std::process::exit(1);
                     }
                 };
+
+                // In-process torch inference is always single-worker; pull
+                // the sole receiver out of the main_request_rxs vec.
+                let request_rx = main_request_rxs[0]
+                    .take()
+                    .expect("torch path requires exactly one main receiver");
 
                 std::thread::scope(|s| {
                     let running_ref = &running;
@@ -1718,8 +1967,9 @@ fn subprocess_model_args(
     graph_type: &str,
     conv_type: &str,
     device: &str,
+    padded_inference: bool,
 ) -> Vec<String> {
-    vec![
+    let mut v = vec![
         "--hidden-dim".into(), hidden_dim.to_string(),
         "--num-layers".into(), num_layers.to_string(),
         "--num-heads".into(), num_heads.to_string(),
@@ -1728,15 +1978,33 @@ fn subprocess_model_args(
         "--graph-type".into(), graph_type.to_string(),
         "--conv-type".into(), conv_type.to_string(),
         "--device".into(), device.to_string(),
-    ]
+    ];
+    if padded_inference {
+        v.push("--padded-inference".into());
+    }
+    v
 }
 
 /// Run batch-mode game threads inside a thread scope. Returns collected game results.
 /// Takes `client` by value so it is dropped when all game threads finish,
 /// signaling the inference server to shut down.
-fn run_batch_games<'scope, 'env: 'scope>(
+/// Run batch-mode games with an optional per-worker warmup phase.
+///
+/// Workers play `ceil(warmup_games / n_threads)` warmup games each (results
+/// discarded), then wait at a barrier so all warmup completes before any
+/// measurement starts, then play their measurement allocation. **Same OS
+/// threads run both phases**, which is the entire point — without that, the
+/// measurement phase would respawn workers that all start fresh from the
+/// empty board and re-enter the same lockstep we were trying to escape.
+///
+/// Returns `(measurement_games, measurement_elapsed)`. The elapsed time is
+/// measured from the moment the barrier releases (= last warmup-game done +
+/// barrier sync latency) to when the last measurement game finishes.
+#[allow(clippy::too_many_arguments)]
+fn run_batch_games_with_warmup<'scope, 'env: 'scope>(
     s: &'scope std::thread::Scope<'scope, 'env>,
     client: InferenceClient,
+    warmup_games: usize,
     n_games: usize,
     n_threads: usize,
     seed: Option<u64>,
@@ -1748,16 +2016,42 @@ fn run_batch_games<'scope, 'env: 'scope>(
     playout_cap_fraction: f64,
     playout_cap_divisor: u32,
     running: &'env Arc<AtomicBool>,
-) -> Vec<GameResult> {
+) -> (Vec<GameResult>, Duration) {
     let games_per_thread = distribute(n_games, n_threads);
-    let handles: Vec<_> = games_per_thread
+    let warmup_per_thread = if warmup_games > 0 {
+        distribute(warmup_games, n_threads)
+    } else {
+        vec![0usize; n_threads]
+    };
+    // n_threads workers + 1 caller, so the caller can take the measurement
+    // start time at the moment workers all begin measurement games.
+    let barrier = Arc::new(std::sync::Barrier::new(n_threads + 1));
+
+    let handles: Vec<_> = warmup_per_thread
         .into_iter()
+        .zip(games_per_thread)
         .enumerate()
-        .map(|(ti, count)| {
+        .map(|(ti, (warmup_count, count))| {
             let client = client.clone();
             let running_thread = running.clone();
+            let barrier = barrier.clone();
             s.spawn(move || {
                 let mut rng = make_rng(seed, ti as u64, 0);
+                // Warmup: play games but discard the results. Same `rng`
+                // carries forward so measurement games continue the RNG
+                // stream — they don't replay the warmup positions.
+                for _ in 0..warmup_count {
+                    if !running_thread.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let _ = play_one_game(
+                        &client, None, None, game_config, mcts_config,
+                        exploration, graph_type, prune_empty_edges, &mut rng,
+                        playout_cap_fraction, playout_cap_divisor,
+                        &running_thread,
+                    );
+                }
+                barrier.wait();
                 let mut results = Vec::with_capacity(count);
                 for _ in 0..count {
                     if let Some(game) = play_one_game(
@@ -1769,6 +2063,7 @@ fn run_batch_games<'scope, 'env: 'scope>(
                         results.push(game);
                     }
                 }
+                play_perf_flush();
                 results
             })
         })
@@ -1777,10 +2072,17 @@ fn run_batch_games<'scope, 'env: 'scope>(
     // Drop the original client so server sees disconnect after threads finish
     drop(client);
 
-    handles
+    // Block here until every worker has finished warmup. Use the
+    // post-barrier instant as the measurement start.
+    barrier.wait();
+    let measurement_start = Instant::now();
+
+    let games: Vec<GameResult> = handles
         .into_iter()
         .flat_map(|h| h.join().unwrap_or_default())
-        .collect()
+        .collect();
+
+    (games, measurement_start.elapsed())
 }
 
 /// Spawn continuous-mode game threads inside a thread scope.
@@ -2264,17 +2566,18 @@ mod tests {
 
     #[test]
     fn reduced_sim_config_uses_divisor() {
-        let base = MCTSConfig { n_simulations: 64, m_actions: 16, c_visit: 50, c_scale: 1.0 };
+        let base = MCTSConfig { n_simulations: 64, m_actions: 16, c_visit: 50, c_scale: 1.0, virtual_loss: 0.5, ..Default::default() };
         assert_eq!(reduced_sim_config(&base, 4).n_simulations, 16);
         assert_eq!(reduced_sim_config(&base, 1).n_simulations, 64);
         assert_eq!(reduced_sim_config(&base, 0).n_simulations, 64); // clamp divisor to 1
-        let tiny = MCTSConfig { n_simulations: 1, m_actions: 16, c_visit: 50, c_scale: 1.0 };
+        let tiny = MCTSConfig { n_simulations: 1, m_actions: 16, c_visit: 50, c_scale: 1.0, virtual_loss: 0.0, ..Default::default() };
         assert_eq!(reduced_sim_config(&tiny, 4).n_simulations, 1); // clamp result to 1
         // Other fields preserved.
         let r = reduced_sim_config(&base, 4);
         assert_eq!(r.m_actions, 16);
         assert_eq!(r.c_visit, 50);
         assert_eq!(r.c_scale, 1.0);
+        assert_eq!(r.virtual_loss, 0.5);
     }
 
     #[test]
@@ -2286,5 +2589,238 @@ mod tests {
         assert!(examples[0]["features"].is_array());
         assert!(examples[0]["policy"].is_array());
         assert_eq!(examples[0]["value"].as_f64().unwrap(), 1.0);
+    }
+
+    // -----------------------------------------------------------------------
+    // InferenceClient round-robin tests
+    //
+    // These tests exercise the sender-side round-robin distribution
+    // implemented by `InferenceClient` without requiring a real Python
+    // subprocess. A stub batcher thread per worker consumes EvalRequests
+    // and echoes a per-worker tag back via the request's response_tx.
+    // -----------------------------------------------------------------------
+
+    use std::sync::atomic::AtomicUsize;
+
+    /// Build a synthetic `EvalRequest` carrying a single dummy graph whose
+    /// `num_nodes` field encodes a caller-supplied sentinel. The stub
+    /// batcher echoes this sentinel into the response so the client can
+    /// verify it received the response intended for *its* request.
+    fn dummy_graph_with_sentinel(sentinel: usize) -> GraphTensors {
+        GraphTensors {
+            features: Vec::new(),
+            edge_src: Vec::new(),
+            edge_dst: Vec::new(),
+            edge_attr: None,
+            legal_mask: Vec::new(),
+            stone_mask: Vec::new(),
+            legal_coords: Vec::new(),
+            num_nodes: sentinel,
+            num_edges: 0,
+        }
+    }
+
+    /// Stub batcher: pull EvalRequests from `rx`, record how many it saw,
+    /// and reply with a value vector tagged with `worker_id` for every
+    /// graph in the request (so the caller can detect crosstalk). Exits
+    /// when `running` is cleared or when all senders are dropped.
+    fn spawn_stub_batcher(
+        worker_id: usize,
+        rx: mpsc::Receiver<EvalRequest>,
+        running: Arc<AtomicBool>,
+        seen: Arc<AtomicUsize>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            loop {
+                match rx.recv_timeout(Duration::from_millis(50)) {
+                    Ok(req) => {
+                        seen.fetch_add(1, Ordering::Relaxed);
+                        // Tag every result slot with (worker_id, sentinel_from_graph).
+                        // values[i] = worker_id as f64 lets the caller verify
+                        // routing; logits[i] is empty (game code wouldn't read
+                        // it in this stubbed environment).
+                        let n = req.graphs.len();
+                        let logits: Vec<HashMap<Coord, f64>> =
+                            (0..n).map(|_| HashMap::default()).collect();
+                        let values: Vec<f64> = req.graphs.iter()
+                            .map(|g| {
+                                // Pack worker_id in the low 32 bits and the
+                                // sentinel (num_nodes) in the high 32 bits so
+                                // the test can decode both from a single f64.
+                                let packed: u64 =
+                                    (worker_id as u64) | ((g.num_nodes as u64) << 32);
+                                packed as f64
+                            })
+                            .collect();
+                        let _ = req.response_tx.send((logits, values));
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        if !running.load(Ordering::Relaxed) {
+                            break;
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn test_inference_client_single_worker_unchanged() {
+        // N=1: behaviour must be observationally identical to the previous
+        // single-Sender InferenceClient. One stub batcher, a handful of
+        // evaluate() calls, every one routes to worker 0.
+        let running = Arc::new(AtomicBool::new(true));
+        let seen = Arc::new(AtomicUsize::new(0));
+
+        let (tx, rx) = mpsc::channel::<EvalRequest>();
+        let stub = spawn_stub_batcher(0, rx, running.clone(), seen.clone());
+
+        let client = InferenceClient::new(vec![tx]);
+        for sentinel in 100..105 {
+            let (_logits, values) = client.evaluate(vec![dummy_graph_with_sentinel(sentinel)]);
+            assert_eq!(values.len(), 1);
+            let packed = values[0] as u64;
+            let worker = (packed & 0xFFFF_FFFF) as usize;
+            let echoed = (packed >> 32) as usize;
+            assert_eq!(worker, 0, "N=1 must always route to worker 0");
+            assert_eq!(echoed, sentinel, "sentinel must round-trip");
+        }
+        assert_eq!(seen.load(Ordering::Relaxed), 5);
+
+        // Shutdown.
+        drop(client);
+        running.store(false, Ordering::Relaxed);
+        stub.join().expect("stub batcher must exit");
+    }
+
+    #[test]
+    fn test_inference_client_round_robin_n3() {
+        // N=3: 6 sequential evaluate() calls must hit workers in a strict
+        // round-robin pattern starting from 0: [0,1,2,0,1,2].
+        let running = Arc::new(AtomicBool::new(true));
+
+        let mut txs: Vec<mpsc::Sender<EvalRequest>> = Vec::new();
+        let mut handles: Vec<std::thread::JoinHandle<()>> = Vec::new();
+        let mut seens: Vec<Arc<AtomicUsize>> = Vec::new();
+        for wid in 0..3 {
+            let (tx, rx) = mpsc::channel::<EvalRequest>();
+            let seen = Arc::new(AtomicUsize::new(0));
+            handles.push(spawn_stub_batcher(wid, rx, running.clone(), seen.clone()));
+            txs.push(tx);
+            seens.push(seen);
+        }
+
+        let client = InferenceClient::new(txs);
+        let mut observed_workers: Vec<usize> = Vec::new();
+        for sentinel in 0..6 {
+            let (_logits, values) = client.evaluate(vec![dummy_graph_with_sentinel(sentinel)]);
+            let packed = values[0] as u64;
+            let worker = (packed & 0xFFFF_FFFF) as usize;
+            let echoed = (packed >> 32) as usize;
+            assert_eq!(echoed, sentinel, "sentinel must round-trip on call {sentinel}");
+            observed_workers.push(worker);
+        }
+
+        assert_eq!(observed_workers, vec![0, 1, 2, 0, 1, 2]);
+        for (wid, s) in seens.iter().enumerate() {
+            assert_eq!(s.load(Ordering::Relaxed), 2, "worker {wid} should have seen 2 requests");
+        }
+
+        drop(client);
+        running.store(false, Ordering::Relaxed);
+        for h in handles { h.join().expect("stub batcher must exit"); }
+    }
+
+    #[test]
+    fn test_inference_client_concurrent_n4_no_crosstalk() {
+        // 4 stub batchers; 16 client threads × 50 calls each. Each call
+        // submits a unique sentinel and verifies the response echoes that
+        // exact sentinel back. Any crosstalk between concurrent callers
+        // would surface as a mismatched sentinel.
+        const N_WORKERS: usize = 4;
+        const N_THREADS: usize = 16;
+        const N_CALLS: usize = 50;
+
+        let running = Arc::new(AtomicBool::new(true));
+        let mut txs: Vec<mpsc::Sender<EvalRequest>> = Vec::new();
+        let mut handles: Vec<std::thread::JoinHandle<()>> = Vec::new();
+        for wid in 0..N_WORKERS {
+            let (tx, rx) = mpsc::channel::<EvalRequest>();
+            let seen = Arc::new(AtomicUsize::new(0));
+            handles.push(spawn_stub_batcher(wid, rx, running.clone(), seen));
+            txs.push(tx);
+        }
+
+        let client = InferenceClient::new(txs);
+
+        let mut callers: Vec<std::thread::JoinHandle<usize>> = Vec::new();
+        for tid in 0..N_THREADS {
+            let client = client.clone();
+            callers.push(std::thread::spawn(move || {
+                let mut local_ok = 0usize;
+                for i in 0..N_CALLS {
+                    // Unique sentinel per (tid, i).
+                    let sentinel = tid * N_CALLS + i + 1;
+                    let (_logits, values) =
+                        client.evaluate(vec![dummy_graph_with_sentinel(sentinel)]);
+                    assert_eq!(values.len(), 1);
+                    let packed = values[0] as u64;
+                    let echoed = (packed >> 32) as usize;
+                    // Per-call sentinel must round-trip: detects any crosstalk
+                    // (response delivered to wrong caller's response_tx).
+                    assert_eq!(echoed, sentinel,
+                        "tid={tid} call={i}: expected sentinel {sentinel}, got {echoed}");
+                    local_ok += 1;
+                }
+                local_ok
+            }));
+        }
+
+        let total_ok: usize = callers.into_iter().map(|h| h.join().unwrap()).sum();
+        assert_eq!(total_ok, N_THREADS * N_CALLS);
+
+        drop(client);
+        running.store(false, Ordering::Relaxed);
+        for h in handles { h.join().expect("stub batcher must exit"); }
+    }
+
+    #[test]
+    fn test_inference_client_shutdown_clean() {
+        // Drop the client *and* clear running; all stub batcher threads
+        // must exit within 500ms. Catches "leaked threads on shutdown"
+        // regressions.
+        const N_WORKERS: usize = 3;
+        let running = Arc::new(AtomicBool::new(true));
+        let mut txs: Vec<mpsc::Sender<EvalRequest>> = Vec::new();
+        let mut handles: Vec<std::thread::JoinHandle<()>> = Vec::new();
+        for wid in 0..N_WORKERS {
+            let (tx, rx) = mpsc::channel::<EvalRequest>();
+            let seen = Arc::new(AtomicUsize::new(0));
+            handles.push(spawn_stub_batcher(wid, rx, running.clone(), seen));
+            txs.push(tx);
+        }
+        let client = InferenceClient::new(txs);
+
+        // Hand out a few clones, do some traffic, then drop everything.
+        let c2 = client.clone();
+        let _ = c2.evaluate(vec![dummy_graph_with_sentinel(1)]);
+        drop(c2);
+        let _ = client.evaluate(vec![dummy_graph_with_sentinel(2)]);
+        drop(client);
+
+        running.store(false, Ordering::Relaxed);
+
+        // All stub batchers must exit promptly. We give a generous budget
+        // (500ms) — the stub's recv_timeout is 50ms.
+        let deadline = Instant::now() + Duration::from_millis(500);
+        for (i, h) in handles.into_iter().enumerate() {
+            // join() blocks; rely on the stub timing out and seeing running=false
+            // OR the channel being disconnected (since we dropped the senders).
+            // Either way, the thread must exit before the deadline.
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(remaining > Duration::ZERO, "worker {i} exceeded shutdown deadline");
+            h.join().expect("stub batcher must exit cleanly");
+        }
     }
 }

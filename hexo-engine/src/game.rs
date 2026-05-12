@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::board::Board;
@@ -180,6 +180,11 @@ impl GameState {
             .iter()
             .map(|(&coord, &player)| (coord, player))
             .collect()
+    }
+
+    /// Returns a reference to the underlying stone map (no allocation).
+    pub fn stones(&self) -> &HashMap<Coord, Player> {
+        self.board.stones()
     }
 
     /// Returns the total number of moves made so far (not counting P1's opening stone).

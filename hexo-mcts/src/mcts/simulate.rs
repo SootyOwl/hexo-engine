@@ -1,4 +1,5 @@
 use hexo_engine::{Coord, Player};
+use rustc_hash::FxHashMap as HashMap;
 
 use super::backup::compute_backup_values;
 use super::node::MCTSNode;
@@ -119,6 +120,95 @@ pub fn apply_backup(
     }
 }
 
+/// Apply virtual-loss bookkeeping along a path through the tree.
+///
+/// Used by Sequential Halving inner-loop fusion (Phase 2): when several leaves
+/// are selected and held pending a single batched network evaluation, each
+/// selected path gets a virtual "loss" applied so subsequent selections within
+/// the same fused batch see the in-flight path as visited+pessimised, encouraging
+/// diversification.
+///
+/// Mirrors `apply_backup` but with `leaf_value = -magnitude` (the leaf is treated
+/// as if it had been evaluated to a loss from the leaf player's perspective), and
+/// also increments `virtual_loss_count` on every touched node so a paired
+/// `revert_virtual_loss` can roll the bookkeeping back.
+///
+/// No-op when `magnitude <= 0.0` (the disabled-fusion path).
+pub fn apply_virtual_loss(
+    root: &mut MCTSNode,
+    selection: &LeafSelection,
+    magnitude: f64,
+) {
+    if magnitude <= 0.0 {
+        return;
+    }
+    let backup_vals =
+        super::backup::compute_backup_values(&selection.path_players, -magnitude);
+    debug_assert_eq!(backup_vals.len(), selection.path_actions.len() + 1);
+
+    root.visit_count += 1;
+    root.value_sum += backup_vals[0];
+    root.virtual_loss_count += 1;
+
+    let mut node: &mut MCTSNode = root;
+    for (i, &action) in selection.path_actions.iter().enumerate() {
+        let child = node
+            .children
+            .get_mut(&action)
+            .expect("apply_virtual_loss: path broken");
+        child.visit_count += 1;
+        child.value_sum += backup_vals[i + 1];
+        child.virtual_loss_count += 1;
+        node = child;
+    }
+}
+
+/// Revert a previously applied virtual-loss path. The `selection` and `magnitude`
+/// must match the matching `apply_virtual_loss` call; otherwise the tree state
+/// will not be restored correctly.
+///
+/// No-op when `magnitude <= 0.0`.
+pub fn revert_virtual_loss(
+    root: &mut MCTSNode,
+    selection: &LeafSelection,
+    magnitude: f64,
+) {
+    if magnitude <= 0.0 {
+        return;
+    }
+    let backup_vals =
+        super::backup::compute_backup_values(&selection.path_players, -magnitude);
+    debug_assert_eq!(backup_vals.len(), selection.path_actions.len() + 1);
+
+    root.visit_count = root
+        .visit_count
+        .checked_sub(1)
+        .expect("revert_virtual_loss: root visit_count underflow");
+    root.value_sum -= backup_vals[0];
+    root.virtual_loss_count = root
+        .virtual_loss_count
+        .checked_sub(1)
+        .expect("revert_virtual_loss: root virtual_loss_count underflow");
+
+    let mut node: &mut MCTSNode = root;
+    for (i, &action) in selection.path_actions.iter().enumerate() {
+        let child = node
+            .children
+            .get_mut(&action)
+            .expect("revert_virtual_loss: path broken");
+        child.visit_count = child
+            .visit_count
+            .checked_sub(1)
+            .expect("revert_virtual_loss: child visit_count underflow");
+        child.value_sum -= backup_vals[i + 1];
+        child.virtual_loss_count = child
+            .virtual_loss_count
+            .checked_sub(1)
+            .expect("revert_virtual_loss: child virtual_loss_count underflow");
+        node = child;
+    }
+}
+
 /// Run a full simulation: select leaf, compute backup values, apply them.
 ///
 /// For non-terminal leaves, the caller must provide the network evaluation
@@ -152,7 +242,7 @@ pub fn simulate_select(
 pub fn complete_simulation(
     root: &mut MCTSNode,
     selection: &LeafSelection,
-    leaf_priors: std::collections::HashMap<Coord, f64>,
+    leaf_priors: HashMap<Coord, f64>,
     leaf_value: f64,
 ) {
     // Navigate to the leaf
@@ -173,7 +263,7 @@ pub fn complete_simulation(
 mod tests {
     use super::*;
     use hexo_engine::{GameConfig, GameState};
-    use std::collections::HashMap;
+    use rustc_hash::FxHashMap as HashMap;
 
     fn small_config() -> GameConfig {
         GameConfig {
@@ -186,7 +276,7 @@ mod tests {
     fn make_root() -> MCTSNode {
         let game = GameState::with_config(small_config());
         let moves = game.legal_moves();
-        let mut priors = HashMap::new();
+        let mut priors = HashMap::default();
         for &m in &moves {
             priors.insert(m, 1.0 / moves.len() as f64);
         }
@@ -230,7 +320,7 @@ mod tests {
         let winning_move = (2, 0);
         assert!(moves.contains(&winning_move));
 
-        let mut priors = HashMap::new();
+        let mut priors = HashMap::default();
         for &m in &moves {
             priors.insert(m, 1.0 / moves.len() as f64);
         }
@@ -274,7 +364,7 @@ mod tests {
         game.apply_move((1, 0)).unwrap(); // P2 move 1
 
         let moves = game.legal_moves();
-        let mut priors = HashMap::new();
+        let mut priors = HashMap::default();
         for &m in &moves {
             priors.insert(m, 1.0 / moves.len() as f64);
         }
@@ -307,12 +397,122 @@ mod tests {
         let selection = simulate_select(&mut root, Some(action), 50, 1.0).unwrap();
 
         // Simulate network eval: provide priors and value for the leaf
-        let leaf_priors = HashMap::from([((0, 0), 0.5), ((1, 1), 0.5)]);
+        let leaf_priors = [((0, 0), 0.5), ((1, 1), 0.5)].into_iter().collect::<HashMap<_,_>>();
         complete_simulation(&mut root, &selection, leaf_priors, 0.3);
 
         assert_eq!(root.visit_count, 1);
         let child = root.children.get(&action).unwrap();
         assert_eq!(child.visit_count, 1);
         assert!(child.is_expanded());
+    }
+
+    #[test]
+    fn apply_virtual_loss_zero_magnitude_is_noop() {
+        let mut root = make_root();
+        let moves: Vec<Coord> = root.child_priors.keys().copied().collect();
+        let action = moves[0];
+        let selection = simulate_select(&mut root, Some(action), 50, 1.0).unwrap();
+
+        let pre_root_visits = root.visit_count;
+        let pre_root_sum = root.value_sum;
+        let pre_child_visits = root.children[&action].visit_count;
+
+        apply_virtual_loss(&mut root, &selection, 0.0);
+
+        assert_eq!(root.visit_count, pre_root_visits);
+        assert_eq!(root.value_sum, pre_root_sum);
+        assert_eq!(root.virtual_loss_count, 0);
+        assert_eq!(root.children[&action].visit_count, pre_child_visits);
+        assert_eq!(root.children[&action].virtual_loss_count, 0);
+    }
+
+    #[test]
+    fn apply_virtual_loss_increments_counts_along_path() {
+        let mut root = make_root();
+        let moves: Vec<Coord> = root.child_priors.keys().copied().collect();
+        let action = moves[0];
+        let selection = simulate_select(&mut root, Some(action), 50, 1.0).unwrap();
+
+        apply_virtual_loss(&mut root, &selection, 1.0);
+
+        assert_eq!(root.visit_count, 1);
+        assert_eq!(root.virtual_loss_count, 1);
+        let child = root.children.get(&action).unwrap();
+        assert_eq!(child.visit_count, 1);
+        assert_eq!(child.virtual_loss_count, 1);
+    }
+
+    #[test]
+    fn apply_then_revert_virtual_loss_restores_state() {
+        // Apply VL on a path, then revert; counts and sums must match pre-apply state.
+        let mut root = make_root();
+        let moves: Vec<Coord> = root.child_priors.keys().copied().collect();
+        let action = moves[0];
+        let selection = simulate_select(&mut root, Some(action), 50, 1.0).unwrap();
+
+        // Snapshot every node touched by the would-be VL path.
+        let pre_root_visits = root.visit_count;
+        let pre_root_sum = root.value_sum;
+        let pre_child_visits = root.children[&action].visit_count;
+        let pre_child_sum = root.children[&action].value_sum;
+
+        apply_virtual_loss(&mut root, &selection, 0.75);
+        // Sanity: state must have changed.
+        assert_ne!(root.visit_count, pre_root_visits);
+
+        revert_virtual_loss(&mut root, &selection, 0.75);
+
+        assert_eq!(root.visit_count, pre_root_visits);
+        assert!((root.value_sum - pre_root_sum).abs() < 1e-12);
+        assert_eq!(root.virtual_loss_count, 0);
+        let child = root.children.get(&action).unwrap();
+        assert_eq!(child.visit_count, pre_child_visits);
+        assert!((child.value_sum - pre_child_sum).abs() < 1e-12);
+        assert_eq!(child.virtual_loss_count, 0);
+    }
+
+    #[test]
+    fn virtual_loss_changes_select_child_decision() {
+        // With equal priors and no real visits, select_child picks deterministically.
+        // After applying VL to that pick, select_child must pick something else
+        // (the previous winner is now visited+pessimised).
+        let mut root = make_root();
+        let moves: Vec<Coord> = root.child_priors.keys().copied().collect();
+        assert!(moves.len() >= 2, "test needs >=2 legal moves");
+
+        // Baseline: select_child without VL.
+        let baseline = super::super::select::select_child(&root, 50, 1.0);
+
+        // Force a descent to `baseline` so we get a real LeafSelection and the
+        // child node exists on the tree (required for apply_virtual_loss).
+        let selection =
+            simulate_select(&mut root, Some(baseline), 50, 1.0).unwrap();
+        apply_virtual_loss(&mut root, &selection, 1.0);
+
+        let after_vl = super::super::select::select_child(&root, 50, 1.0);
+        assert_ne!(
+            after_vl, baseline,
+            "VL applied to {baseline:?} should diversify the next selection",
+        );
+    }
+
+    #[test]
+    fn virtual_loss_single_legal_move_still_selects_it() {
+        // Single-legal-move node: even with VL applied, select_child must return it.
+        let mut root = MCTSNode::new(1.0, None, Player::P1);
+        root.game_state = Some(GameState::with_config(small_config()));
+        let only_action = (0, 0);
+        root.expand([(only_action, 1.0)].into_iter().collect::<HashMap<_,_>>(), 0.0);
+        // Manually create the child without descending the game tree (the
+        // game_state at root for small_config has multiple legal moves; we
+        // only care about the select_child invariant here).
+        let mut child = MCTSNode::new(1.0, Some(only_action), Player::P2);
+        child.visit_count = 5;
+        child.value_sum = -5.0; // simulate severe VL pessimism
+        child.virtual_loss_count = 5;
+        root.children.insert(only_action, child);
+
+        let action = super::super::select::select_child(&root, 50, 1.0);
+        assert_eq!(action, only_action);
     }
 }

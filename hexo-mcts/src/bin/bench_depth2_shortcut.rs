@@ -19,9 +19,12 @@
 //! projected per-MCTS-call overhead.
 
 use hexo_engine::{Coord, GameConfig, GameState, Player};
+use hexo_rs::mcts::MCTSConfig;
+use hexo_rs::mcts::gumbel_mcts::gumbel_mcts;
 use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
+use rustc_hash::FxHashMap as HashMap;
 use std::env;
 use std::fs::File;
 use std::hint::black_box;
@@ -92,6 +95,174 @@ fn shortcut_candidate_only(
         }
     }
 
+    None
+}
+
+/// Step 1 of the production optimisation: axis-pruned m2 search with the
+/// engine's cached legal_moves_set as the legality guard. m2 is constrained
+/// to cells on the same WIN_AXIS as m1 within (win_length - 1) cells.
+#[inline]
+fn shortcut_candidate_axis_pruned(
+    game: &GameState,
+    coords: &[Coord],
+    candidate_indices: &[usize],
+) -> Option<Coord> {
+    use hexo_engine::types::WIN_AXES;
+    let me = game.current_player();
+    if me.is_none() {
+        return None;
+    }
+
+    for &idx in candidate_indices {
+        let coord = coords[idx];
+        let mut g = game.clone();
+        if g.apply_move(coord).is_ok() && g.is_terminal() && g.winner() == me {
+            return Some(coord);
+        }
+    }
+
+    if game.moves_remaining_this_turn() < 2 {
+        return None;
+    }
+
+    let max_dist = (game.config().win_length - 1) as i32;
+
+    for &idx in candidate_indices {
+        let m1 = coords[idx];
+        let mut g1 = game.clone();
+        if g1.apply_move(m1).is_err() {
+            continue;
+        }
+        if g1.is_terminal() {
+            continue;
+        }
+        if g1.current_player() != me {
+            continue;
+        }
+        let legal = g1.legal_moves_set();
+        let (q1, r1) = m1;
+        for &(dq, dr) in &WIN_AXES {
+            for sign in [1i32, -1] {
+                for d in 1..=max_dist {
+                    let m2 = (q1 + sign * d * dq, r1 + sign * d * dr);
+                    if !legal.contains(&m2) {
+                        continue;
+                    }
+                    let mut g2 = g1.clone();
+                    if g2.apply_move(m2).is_ok() && g2.is_terminal() && g2.winner() == me {
+                        return Some(m1);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Step 2 of the production optimisation: step 1 + a per-m1 pre-check on BOTH
+/// Phase A (depth-1) and Phase B (depth-2). Counts own stones along each
+/// WIN_AXIS within (win_length - 1) cells of m1; Phase A needs ≥ (win_length - 1),
+/// Phase B needs ≥ (win_length - 2). Mirrors the production gumbel_mcts.rs.
+#[inline]
+fn shortcut_candidate_pre_checked(
+    game: &GameState,
+    coords: &[Coord],
+    candidate_indices: &[usize],
+) -> Option<Coord> {
+    use hexo_engine::types::WIN_AXES;
+    let me = game.current_player();
+    let me_player = match me {
+        Some(p) => p,
+        None => return None,
+    };
+
+    let max_dist = (game.config().win_length - 1) as i32;
+    let min_own_d1 = (game.config().win_length as usize).saturating_sub(1);
+    let min_own_d2 = (game.config().win_length as usize).saturating_sub(2);
+    let stones_ref = game.stones();
+
+    // Phase A with pre-check
+    for &idx in candidate_indices {
+        let m1 = coords[idx];
+        let (q1, r1) = m1;
+        let mut axis_viable = false;
+        for &(dq, dr) in &WIN_AXES {
+            let mut count = 0usize;
+            for d in 1..=max_dist {
+                if stones_ref.get(&(q1 + d * dq, r1 + d * dr)) == Some(&me_player) {
+                    count += 1;
+                }
+                if stones_ref.get(&(q1 - d * dq, r1 - d * dr)) == Some(&me_player) {
+                    count += 1;
+                }
+            }
+            if count >= min_own_d1 {
+                axis_viable = true;
+                break;
+            }
+        }
+        if !axis_viable {
+            continue;
+        }
+        let mut g = game.clone();
+        if g.apply_move(m1).is_ok() && g.is_terminal() && g.winner() == me {
+            return Some(m1);
+        }
+    }
+
+    if game.moves_remaining_this_turn() < 2 {
+        return None;
+    }
+
+    for &idx in candidate_indices {
+        let m1 = coords[idx];
+        let (q1, r1) = m1;
+        let mut axis_viable = false;
+        for &(dq, dr) in &WIN_AXES {
+            let mut count = 0usize;
+            for d in 1..=max_dist {
+                if stones_ref.get(&(q1 + d * dq, r1 + d * dr)) == Some(&me_player) {
+                    count += 1;
+                }
+                if stones_ref.get(&(q1 - d * dq, r1 - d * dr)) == Some(&me_player) {
+                    count += 1;
+                }
+            }
+            if count >= min_own_d2 {
+                axis_viable = true;
+                break;
+            }
+        }
+        if !axis_viable {
+            continue;
+        }
+
+        let mut g1 = game.clone();
+        if g1.apply_move(m1).is_err() {
+            continue;
+        }
+        if g1.is_terminal() {
+            continue;
+        }
+        if g1.current_player() != me {
+            continue;
+        }
+        let legal = g1.legal_moves_set();
+        for &(dq, dr) in &WIN_AXES {
+            for sign in [1i32, -1] {
+                for d in 1..=max_dist {
+                    let m2 = (q1 + sign * d * dq, r1 + sign * d * dr);
+                    if !legal.contains(&m2) {
+                        continue;
+                    }
+                    let mut g2 = g1.clone();
+                    if g2.apply_move(m2).is_ok() && g2.is_terminal() && g2.winner() == me {
+                        return Some(m1);
+                    }
+                }
+            }
+        }
+    }
     None
 }
 
@@ -347,6 +518,8 @@ struct BucketStats {
     label: &'static str,
     n: usize,
     cand_total_ns: u128,
+    axis_total_ns: u128,
+    prechk_total_ns: u128,
     all_total_ns: u128,
     iters_per_pos: u128,
     cand_d1: usize,
@@ -416,7 +589,7 @@ fn run_bench(positions: &[Position], config: GameConfig, mode: CandidateMode) ->
             }
         };
 
-        // Time candidate-only
+        // Time candidate-only (baseline: pre-axis-pruning, pre-pre-check)
         let t = Instant::now();
         let mut last_cand: Option<Coord> = None;
         for _ in 0..ITERS_PER_POSITION {
@@ -424,6 +597,24 @@ fn run_bench(positions: &[Position], config: GameConfig, mode: CandidateMode) ->
             black_box(&last_cand);
         }
         let cand_ns = t.elapsed().as_nanos();
+
+        // Time axis-pruned candidate (step-1 optimisation: bounded m2 + HashSet guard)
+        let t = Instant::now();
+        let mut last_axis: Option<Coord> = None;
+        for _ in 0..ITERS_PER_POSITION {
+            last_axis = shortcut_candidate_axis_pruned(&game, &coords, &cand);
+            black_box(&last_axis);
+        }
+        let axis_ns = t.elapsed().as_nanos();
+
+        // Time pre-checked candidate (step-2 optimisation: + per-m1 own-stone pre-check)
+        let t = Instant::now();
+        let mut last_prechk: Option<Coord> = None;
+        for _ in 0..ITERS_PER_POSITION {
+            last_prechk = shortcut_candidate_pre_checked(&game, &coords, &cand);
+            black_box(&last_prechk);
+        }
+        let prechk_ns = t.elapsed().as_nanos();
 
         // Time all-legal
         let t = Instant::now();
@@ -433,6 +624,14 @@ fn run_bench(positions: &[Position], config: GameConfig, mode: CandidateMode) ->
             black_box(&last_all);
         }
         let all_ns = t.elapsed().as_nanos();
+
+        // Correctness: all candidate variants must return identical results.
+        if last_cand != last_axis || last_cand != last_prechk {
+            panic!(
+                "variant divergence: cand={last_cand:?} axis={last_axis:?} prechk={last_prechk:?} on pos with {} stones",
+                pos.stones.len()
+            );
+        }
 
         let bucket = if pos.stones.len() < 30 {
             &mut early
@@ -445,6 +644,8 @@ fn run_bench(positions: &[Position], config: GameConfig, mode: CandidateMode) ->
         for s in [bucket, &mut all] {
             s.n += 1;
             s.cand_total_ns += cand_ns;
+            s.axis_total_ns += axis_ns;
+            s.prechk_total_ns += prechk_ns;
             s.all_total_ns += all_ns;
             s.iters_per_pos = ITERS_PER_POSITION as u128;
             s.legal_sum += coords.len();
@@ -471,10 +672,93 @@ fn run_bench(positions: &[Position], config: GameConfig, mode: CandidateMode) ->
     vec![early, mid, late, all]
 }
 
+/// Run full gumbel_mcts on each position with a uniform-prior dummy eval.
+/// Designed for `perf record` / flamegraph profiling of the MCTS body
+/// (selection / simulation / virtual-loss / backup / softmax) — eval is
+/// near-free so the profile shows CPU work in the tree search, not in the
+/// learned policy network.
+fn run_mcts_bench(
+    positions: &[Position],
+    config: GameConfig,
+    n_simulations: u32,
+    virtual_loss: f64,
+) {
+    let mcts_config = MCTSConfig {
+        n_simulations,
+        m_actions: M_ACTIONS,
+        c_visit: 50,
+        c_scale: 1.0,
+        virtual_loss,
+        ..Default::default()
+    };
+    let mut rng = ChaCha8Rng::seed_from_u64(123);
+    let mut dummy_eval = |states: &[GameState]| -> (Vec<HashMap<Coord, f64>>, Vec<f64>) {
+        let mut logits_list = Vec::with_capacity(states.len());
+        let mut values = Vec::with_capacity(states.len());
+        for s in states {
+            let legal = s.legal_moves();
+            let mut m = HashMap::with_capacity_and_hasher(legal.len(), Default::default());
+            for c in legal {
+                m.insert(c, 0.0);
+            }
+            logits_list.push(m);
+            values.push(0.0);
+        }
+        (logits_list, values)
+    };
+
+    let mut total_calls: u64 = 0;
+    let mut skipped_terminal: u64 = 0;
+    let mut skipped_shortcut: u64 = 0;
+    let start = Instant::now();
+    for pos in positions {
+        let game = GameState::from_state(&pos.stones, pos.current_player, pos.moves_remaining, config);
+        if game.is_terminal() {
+            skipped_terminal += 1;
+            continue;
+        }
+        let result = match gumbel_mcts(&game, &mcts_config, &mut rng, &mut dummy_eval) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        // Detect whether the call exited via the one-hot shortcut path.
+        let one_hot = result.improved_policy.iter().any(|&p| p > 0.999);
+        if one_hot {
+            skipped_shortcut += 1;
+        }
+        black_box(&result);
+        total_calls += 1;
+    }
+    let elapsed = start.elapsed();
+    let n_body = total_calls.saturating_sub(skipped_shortcut);
+    let per_call_us = elapsed.as_micros() as f64 / total_calls.max(1) as f64;
+    let per_body_us = if n_body > 0 {
+        // Subtract estimated shortcut-path time using the bench's prechk
+        // measurement (~3 μs); approximate, but small relative to body cost.
+        let body_total_us = elapsed.as_micros() as f64 - (skipped_shortcut as f64 * 3.5);
+        body_total_us / n_body as f64
+    } else {
+        0.0
+    };
+
+    println!();
+    println!("MCTS bench results:");
+    println!("  positions input:        {}", positions.len());
+    println!("  skipped (terminal):     {}", skipped_terminal);
+    println!("  calls completed:        {}", total_calls);
+    println!("  - via shortcut (~one-hot): {}", skipped_shortcut);
+    println!("  - via MCTS body:        {}", n_body);
+    println!("  wall-clock total:       {:.2} ms", elapsed.as_secs_f64() * 1000.0);
+    println!("  μs / call (all):        {:.1}", per_call_us);
+    println!("  μs / call (body only):  {:.1}  (approx; shortcut subtracted)", per_body_us);
+    println!("  n_simulations:          {}", n_simulations);
+    println!("  virtual_loss:           {}", virtual_loss);
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: {} <games.bin> [--max=N] [--radius=R] [--win=W]", args[0]);
+        eprintln!("usage: {} <games.bin> [--max=N] [--radius=R] [--win=W] [--mcts] [--sims=N] [--vl=F]", args[0]);
         std::process::exit(1);
     }
     let path = &args[1];
@@ -482,6 +766,9 @@ fn main() {
     let mut radius: i32 = 2;
     let mut win_length: u8 = 6;
     let mut mode = CandidateMode::Gumbel;
+    let mut do_mcts = false;
+    let mut n_simulations: u32 = 128;
+    let mut virtual_loss: f64 = 1.0;
     for a in &args[2..] {
         if let Some(v) = a.strip_prefix("--max=") {
             max_positions = v.parse().expect("--max value");
@@ -495,8 +782,15 @@ fn main() {
                 "gumbel" => CandidateMode::Gumbel,
                 other => panic!("--candidates must be random|gumbel (got {other})"),
             };
+        } else if a == "--mcts" {
+            do_mcts = true;
+        } else if let Some(v) = a.strip_prefix("--sims=") {
+            n_simulations = v.parse().expect("--sims value");
+        } else if let Some(v) = a.strip_prefix("--vl=") {
+            virtual_loss = v.parse().expect("--vl value");
         }
     }
+    let _ = mode; // unused in mcts mode
 
     println!(
         "Loading positions from {path} (max={max_positions}, radius={radius}, win={win_length}, candidates={mode:?})"
@@ -510,34 +804,44 @@ fn main() {
         max_moves: 200,
     };
 
+    if do_mcts {
+        run_mcts_bench(&positions, config, n_simulations, virtual_loss);
+        return;
+    }
+
     let buckets = run_bench(&positions, config, mode);
 
     println!();
     println!(
-        "{:<22} {:>8} {:>8} {:>14} {:>14} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8}",
-        "bucket", "n", "L_mean", "cand_ns_mean", "all_ns_mean", "ratio", "cand_d1", "cand_d2", "all_d1", "all_d2", "missed",
+        "{:<22} {:>6} {:>7} {:>11} {:>11} {:>11} {:>11} {:>6} {:>6}",
+        "bucket", "n", "L_mean", "cand_ns", "axis_ns", "prechk_ns", "all_ns", "spd_a", "spd_p",
     );
     for s in &buckets {
         if s.n == 0 {
             continue;
         }
-        let cand_mean = s.cand_total_ns as f64 / (s.n as u128 * s.iters_per_pos) as f64;
-        let all_mean = s.all_total_ns as f64 / (s.n as u128 * s.iters_per_pos) as f64;
-        let ratio = all_mean / cand_mean.max(1.0);
+        let denom = (s.n as u128 * s.iters_per_pos) as f64;
+        let cand_mean = s.cand_total_ns as f64 / denom;
+        let axis_mean = s.axis_total_ns as f64 / denom;
+        let prechk_mean = s.prechk_total_ns as f64 / denom;
+        let all_mean = s.all_total_ns as f64 / denom;
         let l_mean = s.legal_sum as f64 / s.n as f64;
+        let spd_axis = cand_mean / axis_mean.max(1.0);
+        let spd_prechk = cand_mean / prechk_mean.max(1.0);
         println!(
-            "{:<22} {:>8} {:>8.1} {:>14.0} {:>14.0} {:>8.2} {:>8} {:>8} {:>8} {:>8} {:>8}",
+            "{:<22} {:>6} {:>7.1} {:>11.0} {:>11.0} {:>11.0} {:>11.0} {:>6.2}x {:>5.2}x",
             s.label,
             s.n,
             l_mean,
             cand_mean,
+            axis_mean,
+            prechk_mean,
             all_mean,
-            ratio,
-            s.cand_d1,
-            s.cand_d2,
-            s.all_d1,
-            s.all_d2,
-            s.missed_by_cand,
+            spd_axis,
+            spd_prechk,
         );
     }
+    println!();
+    println!("spd_a = cand/axis speedup (step 1: axis-prune + HashSet guard)");
+    println!("spd_p = cand/prechk speedup (step 1 + step 2: + per-m1 pre-check)");
 }

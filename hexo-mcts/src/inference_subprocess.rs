@@ -1,11 +1,32 @@
 //! `SubprocessModel` — spawns a Python inference subprocess and communicates
 //! via a binary protocol over stdin/stdout.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 use std::io::{BufRead, BufReader, BufWriter, Write as _};
+use std::os::fd::AsRawFd;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, SystemTime};
+
+/// Per-request inference payloads are several MB (features + edges for a
+/// 60k-node batch ≈ 5 MB). Linux's default pipe buffer is 64 KB, forcing
+/// ~80 read/write cycles per request. Bumping to 1 MB cuts this to ~5
+/// cycles and removes the bulk of pipe-blocking overhead.
+const TARGET_PIPE_SIZE: libc::c_int = 1 << 20; // 1 MB
+
+fn try_resize_pipe(raw_fd: libc::c_int, label: &str) {
+    // SAFETY: raw_fd is the kernel-side pipe FD owned by the child handle;
+    // F_SETPIPE_SZ is the documented resize op. Kernel caps at
+    // /proc/sys/fs/pipe-max-size; on failure we just log and keep the
+    // default — never fatal.
+    let rc = unsafe { libc::fcntl(raw_fd, libc::F_SETPIPE_SZ, TARGET_PIPE_SIZE) };
+    if rc < 0 {
+        let err = std::io::Error::last_os_error();
+        eprintln!("warning: failed to resize {label} pipe to {TARGET_PIPE_SIZE} bytes: {err}");
+    } else {
+        eprintln!("inference subprocess {label} pipe sized to {rc} bytes");
+    }
+}
 
 use hexo_engine::types::Coord;
 
@@ -41,6 +62,16 @@ impl SubprocessModel {
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| format!("failed to spawn inference subprocess: {e}"))?;
+
+        // Bump both pipes to 1 MB before any traffic — per-request payloads
+        // are multi-MB (features+edges for ~60k-node batches), so the 64 KB
+        // default forces dozens of write/read syscalls per request.
+        if let Some(stdin) = child.stdin.as_ref() {
+            try_resize_pipe(stdin.as_raw_fd(), "rust→python (stdin)");
+        }
+        if let Some(stdout) = child.stdout.as_ref() {
+            try_resize_pipe(stdout.as_raw_fd(), "python→rust (stdout)");
+        }
 
         let stderr = child.stderr.take().expect("stderr was piped");
 
@@ -254,7 +285,7 @@ impl SubprocessModel {
         let mut logit_offset = 0usize;
         for (i, g) in graphs.iter().enumerate() {
             let count = legal_counts[i] as usize;
-            let mut policy = HashMap::with_capacity(count);
+            let mut policy = HashMap::with_capacity_and_hasher(count, Default::default());
             for j in 0..count {
                 let coord = g.legal_coords[j];
                 policy.insert(coord, logits[logit_offset + j] as f64);

@@ -62,7 +62,7 @@ pub fn select_child(node: &MCTSNode, c_visit: u32, c_scale: f64) -> Coord {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use rustc_hash::FxHashMap as HashMap;
 
     use super::*;
     use hexo_engine::Player;

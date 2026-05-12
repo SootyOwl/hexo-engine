@@ -4,7 +4,7 @@
 //! separately), this module synchronises them so leaf evaluations from
 //! all N searches are collected into a single eval_fn call per halving round.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 
 use hexo_engine::{Coord, GameState};
 use rand::Rng;

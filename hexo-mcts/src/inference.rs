@@ -5,7 +5,7 @@
 
 #![cfg(feature = "torch")]
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 use std::sync::Mutex;
 
 use tch::{CModule, Device, Kind, Tensor};
@@ -257,14 +257,14 @@ impl TorchModel {
                     Ok(r) => r,
                     Err(e2) => {
                         eprintln!("Model forward failed on retry: {e2}");
-                        let dummy_logits = (0..n).map(|_| HashMap::new()).collect();
+                        let dummy_logits = (0..n).map(|_| HashMap::default()).collect();
                         return (dummy_logits, vec![0.0; n]);
                     }
                 }
             }
             Err(e) => {
                 eprintln!("Model forward failed: {e}");
-                let dummy_logits = (0..n).map(|_| HashMap::new()).collect();
+                let dummy_logits = (0..n).map(|_| HashMap::default()).collect();
                 return (dummy_logits, vec![0.0; n]);
             }
         };
@@ -278,14 +278,14 @@ impl TorchModel {
                     }
                     _ => {
                         eprintln!("Unexpected tensor types in model output");
-                        let dummy = (0..n).map(|_| HashMap::new()).collect();
+                        let dummy = (0..n).map(|_| HashMap::default()).collect();
                         return (dummy, vec![0.0; n]);
                     }
                 }
             }
             _ => {
                 eprintln!("Unexpected model output format");
-                let dummy = (0..n).map(|_| HashMap::new()).collect();
+                let dummy = (0..n).map(|_| HashMap::default()).collect();
                 return (dummy, vec![0.0; n]);
             }
         };
@@ -295,7 +295,7 @@ impl TorchModel {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("Failed to extract values: {e}");
-                return ((0..n).map(|_| HashMap::new()).collect(), vec![0.0; n]);
+                return ((0..n).map(|_| HashMap::default()).collect(), vec![0.0; n]);
             }
         };
 
@@ -304,14 +304,14 @@ impl TorchModel {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("Failed to extract counts: {e}");
-                return ((0..n).map(|_| HashMap::new()).collect(), vec![0.0; n]);
+                return ((0..n).map(|_| HashMap::default()).collect(), vec![0.0; n]);
             }
         };
         let all_logits_vec: Vec<f64> = match Vec::<f64>::try_from(all_logits_tensor.to_device(Device::Cpu)) {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("Failed to extract logits: {e}");
-                return ((0..n).map(|_| HashMap::new()).collect(), vec![0.0; n]);
+                return ((0..n).map(|_| HashMap::default()).collect(), vec![0.0; n]);
             }
         };
 
@@ -504,14 +504,14 @@ impl TorchModel {
                     Ok(r) => r,
                     Err(e2) => {
                         eprintln!("Padded model forward failed on retry: {e2}");
-                        let dummy_logits = (0..n).map(|_| HashMap::new()).collect();
+                        let dummy_logits = (0..n).map(|_| HashMap::default()).collect();
                         return (dummy_logits, vec![0.0; n]);
                     }
                 }
             }
             Err(e) => {
                 eprintln!("Padded model forward failed: {e}");
-                let dummy_logits = (0..n).map(|_| HashMap::new()).collect();
+                let dummy_logits = (0..n).map(|_| HashMap::default()).collect();
                 return (dummy_logits, vec![0.0; n]);
             }
         };
@@ -523,13 +523,13 @@ impl TorchModel {
                 }
                 _ => {
                     eprintln!("Unexpected tensor types in padded model output");
-                    let dummy = (0..n).map(|_| HashMap::new()).collect();
+                    let dummy = (0..n).map(|_| HashMap::default()).collect();
                     return (dummy, vec![0.0; n]);
                 }
             },
             _ => {
                 eprintln!("Unexpected padded model output format");
-                let dummy = (0..n).map(|_| HashMap::new()).collect();
+                let dummy = (0..n).map(|_| HashMap::default()).collect();
                 return (dummy, vec![0.0; n]);
             }
         };
@@ -539,7 +539,7 @@ impl TorchModel {
                 Ok(v) => v,
                 Err(e) => {
                     eprintln!("Failed to extract padded values: {e}");
-                    return ((0..n).map(|_| HashMap::new()).collect(), vec![0.0; n]);
+                    return ((0..n).map(|_| HashMap::default()).collect(), vec![0.0; n]);
                 }
             };
         let values_vec: Vec<f64> = values_vec_full[..n].to_vec();
@@ -549,7 +549,7 @@ impl TorchModel {
                 Ok(v) => v,
                 Err(e) => {
                     eprintln!("Failed to extract padded counts: {e}");
-                    return ((0..n).map(|_| HashMap::new()).collect(), vec![0.0; n]);
+                    return ((0..n).map(|_| HashMap::default()).collect(), vec![0.0; n]);
                 }
             };
         debug_assert_eq!(counts_vec.len(), n + 1);
@@ -560,7 +560,7 @@ impl TorchModel {
                 Ok(v) => v,
                 Err(e) => {
                     eprintln!("Failed to extract padded logits: {e}");
-                    return ((0..n).map(|_| HashMap::new()).collect(), vec![0.0; n]);
+                    return ((0..n).map(|_| HashMap::default()).collect(), vec![0.0; n]);
                 }
             };
 

@@ -110,21 +110,55 @@ where
         let sims_per_action =
             (n_simulations / (num_phases * remaining.len() as u32)).max(1);
 
-        for _ in 0..sims_per_action {
-            if total_sims_used >= n_simulations {
-                break;
+        // Two paths:
+        //
+        //   `virtual_loss > 0.0` — fused inner loop. Collect
+        //   `sims_per_action × remaining.len()` leaves into a single batch
+        //   per phase, with VL applied between leaf selections so descents
+        //   diversify. Reduces `eval_fn` dispatches by `sims_per_action`x.
+        //
+        //   `virtual_loss == 0.0` — original serial loop. Each iteration
+        //   submits one batch of `remaining.len()` graphs to `eval_fn` and
+        //   relies on real Q-backups from prior iterations to drive
+        //   descent diversification.
+        //
+        // Clean 2026-05-13 same-binary A/B at production batcher settings
+        // (mb=128, t=5ms, 31 workers, sims=128, full HeXO, n=50 games):
+        // fusion alone +6% games/s (within noise), fusion + vl=0.5 +19%
+        // games/s. Moves/game trended longer under fusion but n=50 is too
+        // small to call it. Path gated pending SPRT vs serial.
+        if config.virtual_loss > 0.0 {
+            let mut batch_actions: Vec<Coord> =
+                Vec::with_capacity(sims_per_action as usize * remaining.len());
+            'budget: for _ in 0..sims_per_action {
+                for &idx in &remaining {
+                    if total_sims_used >= n_simulations {
+                        break 'budget;
+                    }
+                    batch_actions.push(coords[idx]);
+                    total_sims_used += 1;
+                }
             }
-
-            let mut batch_actions: Vec<Coord> = Vec::new();
-            for &idx in &remaining {
+            if !batch_actions.is_empty() {
+                eval_fn(root, &batch_actions, c_visit, c_scale);
+            }
+        } else {
+            for _ in 0..sims_per_action {
                 if total_sims_used >= n_simulations {
                     break;
                 }
-                batch_actions.push(coords[idx]);
-                total_sims_used += 1;
+                let mut batch_actions: Vec<Coord> = Vec::with_capacity(remaining.len());
+                for &idx in &remaining {
+                    if total_sims_used >= n_simulations {
+                        break;
+                    }
+                    batch_actions.push(coords[idx]);
+                    total_sims_used += 1;
+                }
+                if !batch_actions.is_empty() {
+                    eval_fn(root, &batch_actions, c_visit, c_scale);
+                }
             }
-
-            eval_fn(root, &batch_actions, c_visit, c_scale);
         }
 
         // Eliminate bottom half by Gumbel score
@@ -165,7 +199,7 @@ fn gumbel_score(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use rustc_hash::FxHashMap as HashMap;
 
     use super::*;
     use hexo_engine::Player;
@@ -241,6 +275,8 @@ mod tests {
             m_actions: 4,
             c_visit: 50,
             c_scale: 1.0,
+            virtual_loss: 0.0,
+            ..Default::default()
         };
         let candidates = vec![0, 1, 2, 3];
         let gumbels = vec![1.0, 2.0, 3.0, 4.0];
@@ -267,6 +303,8 @@ mod tests {
             m_actions: 1,
             c_visit: 50,
             c_scale: 1.0,
+            virtual_loss: 0.0,
+            ..Default::default()
         };
         let candidates = vec![0];
         let gumbels = vec![1.0];
@@ -298,6 +336,8 @@ mod tests {
             m_actions: 4,
             c_visit: 50,
             c_scale: 1.0,
+            virtual_loss: 0.0,
+            ..Default::default()
         };
         let candidates = vec![0, 1, 2, 3];
         // Different gumbels so elimination has a preference
@@ -330,6 +370,8 @@ mod tests {
             m_actions: 4,
             c_visit: 50,
             c_scale: 1.0,
+            virtual_loss: 0.0,
+            ..Default::default()
         };
         let candidates = vec![0, 1, 2, 3];
         let gumbels = vec![1.0; 4];

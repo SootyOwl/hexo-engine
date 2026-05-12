@@ -15,7 +15,7 @@
 
 use hexo_engine::{Coord, GameState, Player};
 use rustc_hash::{FxHashMap, FxHashSet};
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 use xxhash_rust::xxh3::xxh3_128;
 
 /// Marker bytes embedded in the serialised buffer.

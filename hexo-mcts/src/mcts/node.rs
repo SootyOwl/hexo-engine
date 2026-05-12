@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 
 use hexo_engine::{Coord, GameState, Player};
 
@@ -15,6 +15,12 @@ pub struct MCTSNode {
     pub value_estimate: f64,
     pub visit_count: u32,
     pub value_sum: f64,
+    /// Number of in-flight virtual-loss applications at this node. Used by
+    /// Sequential Halving inner-loop fusion (Phase 2 of the VL prototype).
+    /// When > 0, this node has unresolved VL bumps included in its
+    /// `visit_count` and `value_sum`; reverting must zero this back out
+    /// before the real backup is applied.
+    pub virtual_loss_count: u32,
     pub children: HashMap<Coord, MCTSNode>,
     pub game_state: Option<GameState>,
     pub child_priors: HashMap<Coord, f64>,
@@ -30,9 +36,10 @@ impl MCTSNode {
             value_estimate: 0.0,
             visit_count: 0,
             value_sum: 0.0,
-            children: HashMap::new(),
+            virtual_loss_count: 0,
+            children: HashMap::default(),
             game_state: None,
-            child_priors: HashMap::new(),
+            child_priors: HashMap::default(),
             expanded: false,
         }
     }
@@ -51,6 +58,10 @@ impl MCTSNode {
     /// Mark this node as expanded after network evaluation.
     /// Stores the prior probabilities and value estimate.
     pub fn expand(&mut self, child_priors: HashMap<Coord, f64>, value_estimate: f64) {
+        // Pre-size children to the eventual maximum to avoid HashMap rehash
+        // as get_or_create_child inserts new children incrementally during
+        // tree descent.
+        self.children.reserve(child_priors.len());
         self.child_priors = child_priors;
         self.value_estimate = value_estimate;
         self.expanded = true;
@@ -133,7 +144,7 @@ mod tests {
     #[test]
     fn expand_sets_expanded() {
         let mut node = MCTSNode::new(0.5, None, Player::P1);
-        let priors = HashMap::from([((1, 0), 0.6), ((0, 1), 0.4)]);
+        let priors = [((1, 0), 0.6), ((0, 1), 0.4)].into_iter().collect::<HashMap<_,_>>();
         node.expand(priors, 0.3);
         assert!(node.is_expanded());
         assert_eq!(node.value_estimate, 0.3);
@@ -142,7 +153,7 @@ mod tests {
     #[test]
     fn expand_stores_priors() {
         let mut node = MCTSNode::new(0.5, None, Player::P1);
-        let priors = HashMap::from([((1, 0), 0.6), ((0, 1), 0.4)]);
+        let priors = [((1, 0), 0.6), ((0, 1), 0.4)].into_iter().collect::<HashMap<_,_>>();
         node.expand(priors, 0.3);
         assert_eq!(node.child_priors.len(), 2);
         assert!((node.child_priors[&(1, 0)] - 0.6).abs() < 1e-10);
@@ -155,7 +166,7 @@ mod tests {
         // Game starts with P2 to move
         let moves = game.legal_moves();
         let action = moves[0];
-        let mut priors = HashMap::new();
+        let mut priors = HashMap::default();
         for &m in &moves {
             priors.insert(m, 1.0 / moves.len() as f64);
         }
@@ -175,7 +186,7 @@ mod tests {
         let game = GameState::with_config(small_config());
         let moves = game.legal_moves();
         let action = moves[0];
-        let mut priors = HashMap::new();
+        let mut priors = HashMap::default();
         for &m in &moves {
             priors.insert(m, 1.0 / moves.len() as f64);
         }
@@ -195,7 +206,7 @@ mod tests {
         let mut node = MCTSNode::new(1.0, None, Player::P2);
         let game = GameState::with_config(small_config());
         node.game_state = Some(game);
-        node.expand(HashMap::new(), 0.0);
+        node.expand(HashMap::default(), 0.0);
 
         // (99, 99) is not in child_priors
         node.get_or_create_child((99, 99));
@@ -207,7 +218,7 @@ mod tests {
         let game = GameState::with_config(small_config());
         let moves = game.legal_moves();
         let action = moves[0];
-        let priors = HashMap::from([(action, 1.0)]);
+        let priors = [(action, 1.0)].into_iter().collect::<HashMap<_,_>>();
         node.game_state = Some(game);
         node.expand(priors, 0.0);
 

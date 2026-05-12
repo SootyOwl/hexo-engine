@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -17,7 +17,7 @@ fn player_str(p: Player) -> &'static str {
     }
 }
 
-#[pyclass(name = "GameConfig", skip_from_py_object)]
+#[pyclass(name = "GameConfig", module = "hexo_rs", skip_from_py_object)]
 #[derive(Clone)]
 struct PyGameConfig {
     inner: GameConfig,
@@ -67,9 +67,20 @@ impl PyGameConfig {
             self.inner.win_length, self.inner.placement_radius, self.inner.max_moves,
         )
     }
+
+    /// Pickle support: reconstruct via the regular constructor.
+    fn __reduce__(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let cls = py.get_type::<PyGameConfig>();
+        let args = (
+            self.inner.win_length,
+            self.inner.placement_radius,
+            self.inner.max_moves,
+        );
+        Ok((cls, args).into_pyobject(py)?.unbind().into())
+    }
 }
 
-#[pyclass(name = "GameState")]
+#[pyclass(name = "GameState", module = "hexo_rs")]
 struct PyGameState {
     inner: GameState,
 }
@@ -176,6 +187,41 @@ impl PyGameState {
         PyGameConfig { inner: *self.inner.config() }
     }
 
+    /// Pickle support. Reconstructs the state via `from_state`, which only
+    /// supports non-terminal positions (the engine's `from_state` doesn't run a
+    /// win check). Reanalyze never targets terminal positions anyway — the
+    /// trainer catches the resulting MCTS failure — so refusing to pickle them
+    /// is a safe limitation.
+    fn __reduce__(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        if self.inner.is_terminal() {
+            return Err(PyValueError::new_err(
+                "Cannot pickle a terminal GameState (from_state cannot reconstruct \
+                 terminal positions; reanalyze never targets terminals).",
+            ));
+        }
+        let current_player = self
+            .inner
+            .current_player()
+            .map(player_str)
+            .expect("non-terminal state has a current player")
+            .to_string();
+        let moves_remaining = self.inner.moves_remaining_this_turn();
+        let stones: Vec<((i32, i32), String)> = self
+            .inner
+            .placed_stones()
+            .into_iter()
+            .map(|(coord, player)| (coord, player_str(player).to_string()))
+            .collect();
+        let config = PyGameConfig { inner: *self.inner.config() };
+
+        // Resolve the bound constructor at pickle time so unpickling does not
+        // depend on lookup details of the module attribute.
+        let cls = py.get_type::<PyGameState>();
+        let constructor = cls.getattr("from_state")?;
+        let args = (stones, current_player, moves_remaining, config);
+        Ok((constructor, args).into_pyobject(py)?.unbind().into())
+    }
+
     #[allow(clippy::unnecessary_wraps)]
     fn clone(&self) -> Self {
         PyGameState { inner: self.inner.clone() }
@@ -217,12 +263,46 @@ struct PyMCTSConfig {
 #[pymethods]
 impl PyMCTSConfig {
     #[new]
-    fn new(n_simulations: u32, m_actions: usize, c_visit: u32, c_scale: f64) -> PyResult<Self> {
+    #[pyo3(signature = (
+        n_simulations,
+        m_actions,
+        c_visit,
+        c_scale,
+        virtual_loss=0.0,
+        root_dirichlet_alpha=0.0,
+        root_dirichlet_fraction=0.0,
+    ))]
+    fn new(
+        n_simulations: u32,
+        m_actions: usize,
+        c_visit: u32,
+        c_scale: f64,
+        virtual_loss: f64,
+        root_dirichlet_alpha: f64,
+        root_dirichlet_fraction: f64,
+    ) -> PyResult<Self> {
         if m_actions < 1 {
             return Err(PyValueError::new_err("m_actions must be >= 1"));
         }
         if !c_scale.is_finite() || c_scale <= 0.0 {
             return Err(PyValueError::new_err("c_scale must be a positive finite number"));
+        }
+        if !virtual_loss.is_finite() || virtual_loss < 0.0 {
+            return Err(PyValueError::new_err(
+                "virtual_loss must be a non-negative finite number",
+            ));
+        }
+        if !root_dirichlet_alpha.is_finite() || root_dirichlet_alpha < 0.0 {
+            return Err(PyValueError::new_err(
+                "root_dirichlet_alpha must be a non-negative finite number",
+            ));
+        }
+        if !root_dirichlet_fraction.is_finite()
+            || !(0.0..=1.0).contains(&root_dirichlet_fraction)
+        {
+            return Err(PyValueError::new_err(
+                "root_dirichlet_fraction must be in [0, 1]",
+            ));
         }
         Ok(PyMCTSConfig {
             inner: MCTSConfig {
@@ -230,6 +310,9 @@ impl PyMCTSConfig {
                 m_actions,
                 c_visit,
                 c_scale,
+                virtual_loss,
+                root_dirichlet_alpha,
+                root_dirichlet_fraction,
             },
         })
     }
@@ -276,7 +359,7 @@ fn py_gumbel_mcts(
             Ok(r) => r,
             Err(e) => {
                 eval_error = Some(e);
-                let dummy = states.iter().map(|_| HashMap::new()).collect();
+                let dummy = states.iter().map(|_| HashMap::default()).collect();
                 return (dummy, vec![0.0; states.len()]);
             }
         };
@@ -287,7 +370,7 @@ fn py_gumbel_mcts(
             Ok(v) => v,
             Err(e) => {
                 eval_error = Some(e.into());
-                let dummy = states.iter().map(|_| HashMap::new()).collect();
+                let dummy = states.iter().map(|_| HashMap::default()).collect();
                 return (dummy, vec![0.0; states.len()]);
             }
         };
@@ -314,6 +397,193 @@ fn py_gumbel_mcts(
     }
 
     Ok((result.action, result.improved_policy))
+}
+
+/// Run Gumbel MCTS and return root visit counts alongside the standard outputs.
+///
+/// Equivalent to `gumbel_mcts` except the returned tuple also contains a
+/// per-legal-move visit-count vector aligned with `legal_moves()`. Useful for
+/// tooling that wants a smoother readout of the search than the σ-amplified
+/// improved policy (which collapses to near-one-hot under default c_visit=50).
+///
+/// Args:
+///     game: hexo_rs.GameState (non-terminal)
+///     eval_fn: callable(list[GameState]) -> tuple[list[list[float]], list[float]]
+///     config: hexo_rs.MCTSConfig
+///     seed: optional int for deterministic RNG
+///
+/// Returns:
+///     tuple[tuple[int,int], list[float], list[int]]
+///       — (action, improved_policy, visit_counts)
+#[pyfunction(name = "gumbel_mcts_with_stats")]
+#[pyo3(signature = (game, eval_fn, config, seed=None))]
+fn py_gumbel_mcts_with_stats(
+    py: Python<'_>,
+    game: &PyGameState,
+    eval_fn: Py<PyAny>,
+    config: &PyMCTSConfig,
+    seed: Option<u64>,
+) -> PyResult<((i32, i32), Vec<f64>, Vec<u32>)> {
+    use rand::SeedableRng;
+    use rand_chacha::ChaCha8Rng;
+
+    let mut rng = match seed {
+        Some(s) => ChaCha8Rng::seed_from_u64(s),
+        None => ChaCha8Rng::from_os_rng(),
+    };
+
+    let mut eval_error: Option<PyErr> = None;
+
+    let mut eval = |states: &[GameState]| -> (Vec<HashMap<Coord, f64>>, Vec<f64>) {
+        let py_states: Vec<PyGameState> = states
+            .iter()
+            .map(|s| PyGameState { inner: s.clone() })
+            .collect();
+
+        let result = match eval_fn.call1(py, (py_states,)) {
+            Ok(r) => r,
+            Err(e) => {
+                eval_error = Some(e);
+                let dummy = states.iter().map(|_| HashMap::default()).collect();
+                return (dummy, vec![0.0; states.len()]);
+            }
+        };
+
+        let parsed: Result<(Vec<Vec<f64>>, Vec<f64>), _> = result.extract(py);
+        let (logits_per_state, values_raw) = match parsed {
+            Ok(v) => v,
+            Err(e) => {
+                eval_error = Some(e.into());
+                let dummy = states.iter().map(|_| HashMap::default()).collect();
+                return (dummy, vec![0.0; states.len()]);
+            }
+        };
+
+        let logits_maps: Vec<HashMap<Coord, f64>> = states
+            .iter()
+            .zip(logits_per_state)
+            .map(|(state, logits)| {
+                let moves = state.legal_moves();
+                moves.into_iter().zip(logits).collect()
+            })
+            .collect();
+
+        (logits_maps, values_raw)
+    };
+
+    let result = gumbel_mcts::gumbel_mcts(&game.inner, &config.inner, &mut rng, &mut eval)
+        .map_err(PyValueError::new_err)?;
+
+    if let Some(e) = eval_error {
+        return Err(e);
+    }
+
+    Ok((result.action, result.improved_policy, result.visit_counts))
+}
+
+/// Run Gumbel MCTS and return per-child diagnostics alongside the standard outputs.
+///
+/// Extends `gumbel_mcts_with_stats` with three vectors aligned with the
+/// legal-move ordering returned by `GameState.legal_moves()`:
+///
+/// - `per_child_q`: Q(root, action) from the root player's perspective.
+///   Visited children use empirical Q; unvisited children use the `v_mix`
+///   fallback that σ(Q) sees during sequential halving, so the vector can be
+///   consumed uniformly without branching on visit count.
+/// - `per_child_prior`: the network prior π(action) at the root — softmax of
+///   the policy logits restricted to legal moves, after any root Dirichlet
+///   mixing, before Gumbel noise and σ(Q) sharpening.
+/// - `candidate_indices`: indices into `legal_moves()` of the Gumbel-Top-K
+///   survivors at the root (length `min(m_actions, len(legal_moves))`).
+///
+/// Args:
+///     game: hexo_rs.GameState (non-terminal)
+///     eval_fn: callable(list[GameState]) -> tuple[list[list[float]], list[float]]
+///     config: hexo_rs.MCTSConfig
+///     seed: optional int for deterministic RNG
+///
+/// Returns:
+///     tuple[tuple[int,int], list[float], list[int], list[float], list[float], list[int]]
+///       — (action, improved_policy, visit_counts, per_child_q, per_child_prior,
+///          candidate_indices)
+#[pyfunction(name = "gumbel_mcts_with_diagnostics")]
+#[pyo3(signature = (game, eval_fn, config, seed=None))]
+fn py_gumbel_mcts_with_diagnostics(
+    py: Python<'_>,
+    game: &PyGameState,
+    eval_fn: Py<PyAny>,
+    config: &PyMCTSConfig,
+    seed: Option<u64>,
+) -> PyResult<(
+    (i32, i32),
+    Vec<f64>,
+    Vec<u32>,
+    Vec<f64>,
+    Vec<f64>,
+    Vec<usize>,
+)> {
+    use rand::SeedableRng;
+    use rand_chacha::ChaCha8Rng;
+
+    let mut rng = match seed {
+        Some(s) => ChaCha8Rng::seed_from_u64(s),
+        None => ChaCha8Rng::from_os_rng(),
+    };
+
+    let mut eval_error: Option<PyErr> = None;
+
+    let mut eval = |states: &[GameState]| -> (Vec<HashMap<Coord, f64>>, Vec<f64>) {
+        let py_states: Vec<PyGameState> = states
+            .iter()
+            .map(|s| PyGameState { inner: s.clone() })
+            .collect();
+
+        let result = match eval_fn.call1(py, (py_states,)) {
+            Ok(r) => r,
+            Err(e) => {
+                eval_error = Some(e);
+                let dummy = states.iter().map(|_| HashMap::default()).collect();
+                return (dummy, vec![0.0; states.len()]);
+            }
+        };
+
+        let parsed: Result<(Vec<Vec<f64>>, Vec<f64>), _> = result.extract(py);
+        let (logits_per_state, values_raw) = match parsed {
+            Ok(v) => v,
+            Err(e) => {
+                eval_error = Some(e.into());
+                let dummy = states.iter().map(|_| HashMap::default()).collect();
+                return (dummy, vec![0.0; states.len()]);
+            }
+        };
+
+        let logits_maps: Vec<HashMap<Coord, f64>> = states
+            .iter()
+            .zip(logits_per_state)
+            .map(|(state, logits)| {
+                let moves = state.legal_moves();
+                moves.into_iter().zip(logits).collect()
+            })
+            .collect();
+
+        (logits_maps, values_raw)
+    };
+
+    let result = gumbel_mcts::gumbel_mcts(&game.inner, &config.inner, &mut rng, &mut eval)
+        .map_err(PyValueError::new_err)?;
+
+    if let Some(e) = eval_error {
+        return Err(e);
+    }
+
+    Ok((
+        result.action,
+        result.improved_policy,
+        result.visit_counts,
+        result.per_child_q,
+        result.per_child_prior,
+        result.candidate_indices,
+    ))
 }
 
 /// Build graph arrays from a game state (Rust-accelerated game_to_graph).
@@ -632,7 +902,7 @@ fn py_batched_self_play(
                             -> (Vec<HashMap<Coord, f64>>, Vec<f64>)
                         {
                             if abort_ref.load(Ordering::Relaxed) {
-                                let dummy = states.iter().map(|_| HashMap::new()).collect();
+                                let dummy = states.iter().map(|_| HashMap::default()).collect();
                                 return (dummy, vec![0.0; states.len()]);
                             }
                             let (resp_tx, resp_rx) = mpsc::sync_channel::<EvalResponse>(1);
@@ -644,14 +914,14 @@ fn py_batched_self_play(
                                 Ok(()) => {}
                                 Err(_) => {
                                     // Batcher has exited (abort or finished)
-                                    let dummy = states.iter().map(|_| HashMap::new()).collect();
+                                    let dummy = states.iter().map(|_| HashMap::default()).collect();
                                     return (dummy, vec![0.0; states.len()]);
                                 }
                             }
                             match resp_rx.recv() {
                                 Ok(resp) => (resp.logits, resp.values),
                                 Err(_) => {
-                                    let dummy = states.iter().map(|_| HashMap::new()).collect();
+                                    let dummy = states.iter().map(|_| HashMap::default()).collect();
                                     (dummy, vec![0.0; states.len()])
                                 }
                             }
@@ -697,7 +967,7 @@ fn py_batched_self_play(
                                     let mut chosen_idx = 0;
                                     for (k, &p) in policy.iter().enumerate() {
                                         cumsum += p;
-                                        if cumsum >= r {
+                                        if cumsum > r {
                                             chosen_idx = k;
                                             break;
                                         }
@@ -745,8 +1015,23 @@ fn py_batched_self_play(
                 });
 
                 // If batcher failed (e.g. KeyboardInterrupt), signal game threads to stop
+                // and unblock any threads currently waiting on eval responses.
                 if batcher_result.is_err() {
                     abort.store(true, Ordering::Relaxed);
+
+                    loop {
+                        match request_rx.try_recv() {
+                            Ok(req) => {
+                                let n = req.states.len();
+                                let _ = req.response_tx.send(EvalResponse {
+                                    logits: (0..n).map(|_| HashMap::default()).collect(),
+                                    values: vec![0.0; n],
+                                });
+                            }
+                            Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                            Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                        }
+                    }
                 }
 
                 // Collect results from all game threads (they will exit quickly if aborted)
@@ -884,7 +1169,7 @@ fn py_native_self_play(
                     let mut chosen_idx = 0;
                     for (i, &p) in policy.iter().enumerate() {
                         cumsum += p;
-                        if cumsum >= r {
+                        if cumsum > r {
                             chosen_idx = i;
                             break;
                         }
@@ -1014,6 +1299,8 @@ fn hexo_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyGameState>()?;
     m.add_class::<PyMCTSConfig>()?;
     m.add_function(wrap_pyfunction!(py_gumbel_mcts, m)?)?;
+    m.add_function(wrap_pyfunction!(py_gumbel_mcts_with_stats, m)?)?;
+    m.add_function(wrap_pyfunction!(py_gumbel_mcts_with_diagnostics, m)?)?;
     m.add_function(wrap_pyfunction!(py_game_to_graph_raw, m)?)?;
     m.add_function(wrap_pyfunction!(py_game_to_graph_batch, m)?)?;
     m.add_function(wrap_pyfunction!(py_game_states_to_batch, m)?)?;

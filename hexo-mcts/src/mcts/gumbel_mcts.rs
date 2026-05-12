@@ -1,13 +1,16 @@
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 
 use hexo_engine::{Coord, GameState};
+use hexo_engine::types::WIN_AXES;
 use rand::Rng;
 
 use super::MCTSConfig;
 use super::halving::{compute_improved_policy, gumbel_top_k, sequential_halving};
 use super::node::MCTSNode;
 use super::scoring::{QContext, sigma};
-use super::simulate::{complete_simulation, simulate_select};
+use super::simulate::{
+    apply_virtual_loss, complete_simulation, revert_virtual_loss, simulate_select,
+};
 
 /// Result of a Gumbel MCTS search.
 pub struct MCTSResult {
@@ -17,6 +20,33 @@ pub struct MCTSResult {
     pub improved_policy: Vec<f64>,
     /// Legal move coordinates (same order as `improved_policy`).
     pub coords: Vec<Coord>,
+    /// Root visit counts per legal move (same order as `coords`).
+    /// Unexpanded moves contribute 0. Sum equals total simulations spent at
+    /// the root minus any that failed to reach a child (rare). Provides a
+    /// soft alternative to `improved_policy` for inspection: visit counts
+    /// reflect cumulative search effort and are smooth in a way the
+    /// σ-amplified `improved_policy` is not.
+    pub visit_counts: Vec<u32>,
+    /// Per-child Q value at the root (same order as `coords`), from the root
+    /// player's perspective. Visited children use their empirical Q; unvisited
+    /// children use the `v_mix` fallback from `QContext` — i.e. the same value
+    /// σ(Q) sees during sequential halving — so consumers can interpret the
+    /// vector uniformly without branching on visit count. For the shortcut /
+    /// early-exit paths the root has zero visited children, so every entry
+    /// equals the root's network value estimate.
+    pub per_child_q: Vec<f64>,
+    /// Per-child network prior π(a) at the root (same order as `coords`).
+    /// This is the softmax over the root policy logits restricted to legal
+    /// moves — the same distribution the root expand step stores — i.e.
+    /// *after* any root Dirichlet mixing but *before* Gumbel noise and
+    /// σ(Q) sharpening.
+    pub per_child_prior: Vec<f64>,
+    /// Indices into `coords` of the m=`m_actions` Gumbel-Top-K survivors at
+    /// the root (sorted by descending gumbel+logit score, as returned by
+    /// `gumbel_top_k`). Length is `min(m_actions, coords.len())`. For the
+    /// shortcut / early-exit paths this is the candidate set the shortcut
+    /// scanned; the chosen action is guaranteed to lie inside it.
+    pub candidate_indices: Vec<usize>,
 }
 
 /// Run Gumbel MCTS from a game state.
@@ -88,10 +118,41 @@ where
 
     // Build coords and logits arrays (sorted order matching legal_moves)
     let coords: Vec<Coord> = legal_moves.clone();
-    let logits: Vec<f64> = coords
+    let mut logits: Vec<f64> = coords
         .iter()
         .map(|c| root_logits_map.get(c).copied().unwrap_or(0.0))
         .collect();
+
+    // Root Dirichlet noise (AlphaZero-style exploration applied before
+    // Gumbel-Top-k candidate sampling). Mixes the noise into prior
+    // probability space and converts back to logits so that both
+    // Gumbel-Top-k (which sees `logits`) and the root priors used by the
+    // search (computed by softmax(logits) below) are consistent.
+    // Disabled when `root_dirichlet_alpha == 0.0` — the legacy code path
+    // is bit-equivalent in that case.
+    if config.root_dirichlet_alpha > 0.0
+        && config.root_dirichlet_fraction > 0.0
+        && !logits.is_empty()
+    {
+        use rand_distr::{Distribution, Gamma};
+        let n = logits.len();
+        let gamma = Gamma::new(config.root_dirichlet_alpha, 1.0)
+            .expect("root_dirichlet_alpha must be > 0 here");
+        let mut gamma_samples: Vec<f64> = (0..n).map(|_| gamma.sample(rng)).collect();
+        let gamma_sum: f64 = gamma_samples.iter().sum();
+        if gamma_sum > 0.0 {
+            for g in gamma_samples.iter_mut() {
+                *g /= gamma_sum;
+            }
+            let priors = super::scoring::softmax(&logits);
+            let frac = config.root_dirichlet_fraction.clamp(0.0, 1.0);
+            for i in 0..n {
+                let mixed = (1.0 - frac) * priors[i] + frac * gamma_samples[i];
+                // Convert back to logit space; eps guards against log(0).
+                logits[i] = (mixed + 1e-30).ln();
+            }
+        }
+    }
 
     // Compute priors via softmax of raw logits
     let priors_vec = super::scoring::softmax(&logits);
@@ -138,25 +199,96 @@ where
     // network's own learning concentrates priors on gap squares over time
     // (depth-1 supervision already works this way for own_5).
     let me = game.current_player();
+    let me_player = me.expect("non-terminal game guaranteed Some(current_player)");
+    let stones_ref = game.stones();
+    let max_dist = (game.config().win_length - 1) as i32;
+
+    // Phase A pre-check: for m1 to be a depth-1 win, the (win_length)-window
+    // containing m1 must already hold (win_length - 1) own stones; equivalently,
+    // some axis through m1 has ≥ (win_length - 1) own stones within max_dist
+    // cells. Skip the clone otherwise.
+    let min_own_d1 = (game.config().win_length as usize).saturating_sub(1);
     for &idx in &candidate_indices {
-        let coord = coords[idx];
+        let m1 = coords[idx];
+        let (q1, r1) = m1;
+        let mut axis_viable = false;
+        for &(dq, dr) in &WIN_AXES {
+            let mut count = 0usize;
+            for d in 1..=max_dist {
+                if stones_ref.get(&(q1 + d * dq, r1 + d * dr)) == Some(&me_player) {
+                    count += 1;
+                }
+                if stones_ref.get(&(q1 - d * dq, r1 - d * dr)) == Some(&me_player) {
+                    count += 1;
+                }
+            }
+            if count >= min_own_d1 {
+                axis_viable = true;
+                break;
+            }
+        }
+        if !axis_viable {
+            continue;
+        }
         let mut test_game = game.clone();
-        if test_game.apply_move(coord).is_ok() && test_game.is_terminal() {
+        if test_game.apply_move(m1).is_ok() && test_game.is_terminal() {
             if test_game.winner() == me {
                 let mut improved_policy = vec![0.0; coords.len()];
                 improved_policy[idx] = 1.0;
+                let mut visit_counts = vec![0u32; coords.len()];
+                visit_counts[idx] = 1;
+                let qctx = QContext::new(&root, &coords);
+                let per_child_q: Vec<f64> =
+                    coords.iter().map(|c| qctx.completed_q[c]).collect();
+                let per_child_prior = priors_vec.clone();
                 return Ok(MCTSResult {
-                    action: coord,
+                    action: m1,
                     improved_policy,
                     coords,
+                    visit_counts,
+                    per_child_q,
+                    per_child_prior,
+                    candidate_indices: candidate_indices.clone(),
                 });
             }
         }
     }
 
     if game.moves_remaining_this_turn() == 2 {
+        // For (m1, m2) to make a (win_length)-in-a-row in one turn, the
+        // winning run consists of pre-existing own stones + m1 + m2 on a
+        // single axis. m1 and m2 must therefore lie on the same axis within
+        // (win_length - 1) cells of each other. Restricting the m2 scan to
+        // axis neighbours of m1 prunes the inner loop from O(|legal_moves|)
+        // (~N at large placement_radius) to O(3 × 2 × (win_length - 1)).
+        //
+        // Phase B pre-check (parallel to Phase A's, threshold one lower):
+        // m1 needs ≥ (win_length - 2) own stones along some axis within
+        // max_dist cells, since the (win_length)-window holds 4 pre-existing
+        // own stones + m1 + m2 at win_length=6.
+        let min_own_d2 = (game.config().win_length as usize).saturating_sub(2);
         for &idx in &candidate_indices {
             let m1 = coords[idx];
+            let (q1, r1) = m1;
+            let mut axis_viable = false;
+            for &(dq, dr) in &WIN_AXES {
+                let mut count = 0usize;
+                for d in 1..=max_dist {
+                    if stones_ref.get(&(q1 + d * dq, r1 + d * dr)) == Some(&me_player) {
+                        count += 1;
+                    }
+                    if stones_ref.get(&(q1 - d * dq, r1 - d * dr)) == Some(&me_player) {
+                        count += 1;
+                    }
+                }
+                if count >= min_own_d2 {
+                    axis_viable = true;
+                    break;
+                }
+            }
+            if !axis_viable {
+                continue;
+            }
             let mut g1 = game.clone();
             if g1.apply_move(m1).is_err() {
                 continue;
@@ -172,22 +304,47 @@ where
             if g1.current_player() != me {
                 continue;
             }
-            for m2 in g1.legal_moves() {
-                let mut g2 = g1.clone();
-                if g2.apply_move(m2).is_ok() && g2.is_terminal() && g2.winner() == me {
-                    let mut improved_policy = vec![0.0; coords.len()];
-                    improved_policy[idx] = 1.0;
-                    return Ok(MCTSResult {
-                        action: m1,
-                        improved_policy,
-                        coords,
-                    });
+            // Guard with the engine's cached legal-moves set (O(1) lookup)
+            // before paying the GameState clone for the win check.
+            let legal = g1.legal_moves_set();
+            for &(dq, dr) in &WIN_AXES {
+                for sign in [1i32, -1] {
+                    for d in 1..=max_dist {
+                        let m2 = (q1 + sign * d * dq, r1 + sign * d * dr);
+                        if !legal.contains(&m2) {
+                            continue;
+                        }
+                        let mut g2 = g1.clone();
+                        if g2.apply_move(m2).is_ok()
+                            && g2.is_terminal()
+                            && g2.winner() == me
+                        {
+                            let mut improved_policy = vec![0.0; coords.len()];
+                            improved_policy[idx] = 1.0;
+                            let mut visit_counts = vec![0u32; coords.len()];
+                            visit_counts[idx] = 1;
+                            let qctx = QContext::new(&root, &coords);
+                            let per_child_q: Vec<f64> =
+                                coords.iter().map(|c| qctx.completed_q[c]).collect();
+                            let per_child_prior = priors_vec.clone();
+                            return Ok(MCTSResult {
+                                action: m1,
+                                improved_policy,
+                                coords,
+                                visit_counts,
+                                per_child_q,
+                                per_child_prior,
+                                candidate_indices: candidate_indices.clone(),
+                            });
+                        }
+                    }
                 }
             }
         }
     }
 
     // Step 4: Sequential halving with batched evaluation
+    let vl_magnitude = config.virtual_loss;
     let surviving_indices = sequential_halving(
         &mut root,
         &candidate_indices,
@@ -196,7 +353,14 @@ where
         &logits,
         config,
         &mut |root_node, batch_actions, c_visit, c_scale| {
-            simulate_batch_with_eval(root_node, batch_actions, c_visit, c_scale, eval_fn);
+            simulate_batch_with_eval(
+                root_node,
+                batch_actions,
+                c_visit,
+                c_scale,
+                vl_magnitude,
+                eval_fn,
+            );
         },
     );
 
@@ -224,40 +388,74 @@ where
         }
     }
 
+    let visit_counts: Vec<u32> = coords
+        .iter()
+        .map(|c| root.children.get(c).map(|n| n.visit_count).unwrap_or(0))
+        .collect();
+
+    // Diagnostic fields: reuse the QContext already built for action
+    // selection above. `per_child_q` mirrors what σ(Q) sees during halving
+    // (visited → empirical Q from root POV; unvisited → v_mix fallback).
+    let per_child_q: Vec<f64> = coords.iter().map(|c| qctx.completed_q[c]).collect();
+    // `per_child_prior` is the root expand-time prior (post-Dirichlet,
+    // pre-Gumbel, pre-σ(Q)). `priors_vec` is aligned with `coords` by
+    // construction (built from the same `logits` indexing).
+    let per_child_prior = priors_vec.clone();
+
     Ok(MCTSResult {
         action: selected_coord,
         improved_policy,
         coords,
+        visit_counts,
+        per_child_q,
+        per_child_prior,
+        candidate_indices,
     })
 }
 
 /// Run a batch of forced-action simulations, calling eval_fn for non-terminal leaves.
+///
+/// `batch_actions` may contain the same action repeated `sims_per_action` times
+/// when SH inner-loop fusion is active. `vl_magnitude > 0.0` enables virtual
+/// loss: each selected non-terminal leaf gets a virtual-loss bump applied to
+/// its path *before* the next selection runs, so descents below the forced root
+/// child diversify within the fused batch. After the batched `eval_fn` returns,
+/// each path's VL is reverted before the real backup runs.
 fn simulate_batch_with_eval<F>(
     root: &mut MCTSNode,
     batch_actions: &[Coord],
     c_visit: u32,
     c_scale: f64,
+    vl_magnitude: f64,
     eval_fn: &mut F,
 ) where
     F: FnMut(&[GameState]) -> (Vec<HashMap<Coord, f64>>, Vec<f64>),
 {
-    // Phase 1: Select leaves for each forced action
+    // Phase 1: Select leaves for each forced action, applying virtual loss
+    // between selections so subsequent descents see prior selections' paths
+    // as in-flight (visited + pessimised) rather than fresh.
     let mut pending_selections = Vec::new();
     let mut pending_states = Vec::new();
 
     for &action in batch_actions {
         match simulate_select(root, Some(action), c_visit, c_scale) {
             None => {
-                // Terminal leaf — backup already applied
+                // Terminal leaf — backup already applied; no VL needed since
+                // no batched eval will be performed for this slot.
             }
             Some(selection) => {
-                // Navigate to leaf and get its game state for evaluation
-                let mut node: &MCTSNode = root;
-                for &a in &selection.path_actions {
-                    node = node.children.get(&a).expect("path broken");
-                }
-                if let Some(game_state) = &node.game_state {
-                    pending_states.push(game_state.clone());
+                // Resolve the leaf game state (shared borrow scope), then drop
+                // it so we can take a mutable borrow for VL bookkeeping.
+                let leaf_state: Option<GameState> = {
+                    let mut node: &MCTSNode = root;
+                    for &a in &selection.path_actions {
+                        node = node.children.get(&a).expect("path broken");
+                    }
+                    node.game_state.clone()
+                };
+                if let Some(game_state) = leaf_state {
+                    pending_states.push(game_state);
+                    apply_virtual_loss(root, &selection, vl_magnitude);
                     pending_selections.push(selection);
                 }
             }
@@ -340,8 +538,14 @@ fn simulate_batch_with_eval<F>(
     #[cfg(not(feature = "dedup_skip"))]
     let (logits_list, values) = eval_fn(&pending_states);
 
-    // Phase 3: Convert logits to priors via softmax, expand leaves, and backup
+    // Phase 3: Revert virtual loss along each path, then convert logits to
+    // priors and apply the real backup. Revert MUST happen before
+    // `complete_simulation`'s `apply_backup` so the path's `visit_count` /
+    // `value_sum` end up reflecting only the real sim, not the in-flight VL
+    // adjustment.
     for (i, selection) in pending_selections.iter().enumerate() {
+        revert_virtual_loss(root, selection, vl_magnitude);
+
         let logits_map = &logits_list[i];
         // Convert logits to priors via softmax
         let coords: Vec<Coord> = logits_map.keys().copied().collect();
@@ -414,6 +618,8 @@ mod tests {
             m_actions: 4,
             c_visit: 50,
             c_scale: 1.0,
+            virtual_loss: 0.0,
+            ..Default::default()
         };
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
@@ -429,6 +635,8 @@ mod tests {
             m_actions: 4,
             c_visit: 50,
             c_scale: 1.0,
+            virtual_loss: 0.0,
+            ..Default::default()
         };
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
@@ -446,6 +654,8 @@ mod tests {
             m_actions: 4,
             c_visit: 50,
             c_scale: 1.0,
+            virtual_loss: 0.0,
+            ..Default::default()
         };
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
@@ -471,6 +681,8 @@ mod tests {
             m_actions: 4,
             c_visit: 50,
             c_scale: 1.0,
+            virtual_loss: 0.0,
+            ..Default::default()
         };
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
@@ -486,6 +698,8 @@ mod tests {
             m_actions: 4,
             c_visit: 50,
             c_scale: 1.0,
+            virtual_loss: 0.0,
+            ..Default::default()
         };
 
         let mut rng1 = ChaCha8Rng::seed_from_u64(42);
@@ -504,6 +718,8 @@ mod tests {
             m_actions: 4,
             c_visit: 50,
             c_scale: 1.0,
+            virtual_loss: 0.0,
+            ..Default::default()
         };
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
@@ -550,6 +766,8 @@ mod tests {
             m_actions: 16,
             c_visit: 50,
             c_scale: 1.0,
+            virtual_loss: 0.0,
+            ..Default::default()
         };
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
@@ -593,6 +811,8 @@ mod tests {
             m_actions: 16,
             c_visit: 50,
             c_scale: 1.0,
+            virtual_loss: 0.0,
+            ..Default::default()
         };
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
@@ -635,6 +855,8 @@ mod tests {
             m_actions: 16,
             c_visit: 50,
             c_scale: 1.0,
+            virtual_loss: 0.0,
+            ..Default::default()
         };
 
         // Run multiple seeds to cover both early-exit and full-search paths
@@ -718,6 +940,8 @@ mod tests {
             m_actions: 64,
             c_visit: 50,
             c_scale: 1.0,
+            virtual_loss: 0.0,
+            ..Default::default()
         };
 
         for seed in 0..20 {
@@ -775,6 +999,8 @@ mod tests {
             m_actions: 64,
             c_visit: 50,
             c_scale: 1.0,
+            virtual_loss: 0.0,
+            ..Default::default()
         };
 
         let mut rng = ChaCha8Rng::seed_from_u64(0);
@@ -805,6 +1031,8 @@ mod tests {
             m_actions: 8,
             c_visit: 50,
             c_scale: 1.0,
+            virtual_loss: 0.0,
+            ..Default::default()
         };
 
         crate::mcts::dedup_count::set_skip_enabled_tls(true);
@@ -859,6 +1087,8 @@ mod tests {
             m_actions: 8,
             c_visit: 50,
             c_scale: 1.0,
+            virtual_loss: 0.0,
+            ..Default::default()
         };
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
@@ -867,5 +1097,84 @@ mod tests {
         assert!(result.is_ok());
         // Just verify it completes — early termination is an optimization,
         // correctness is preserved regardless.
+    }
+
+    #[test]
+    fn gumbel_mcts_with_virtual_loss_completes() {
+        // SH inner-loop fusion is active (virtual_loss > 0). The search must
+        // still return a valid action + improved policy with all probability
+        // mass on legal moves. This is the smoke test for Phase 2.
+        let game = GameState::with_config(small_config());
+        let legal = game.legal_moves();
+
+        let config = MCTSConfig {
+            n_simulations: 64,
+            m_actions: 8,
+            c_visit: 50,
+            c_scale: 1.0,
+            virtual_loss: 0.5,
+            ..Default::default()
+        };
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+
+        let result = gumbel_mcts(&game, &config, &mut rng, &mut dummy_eval).unwrap();
+        assert!(legal.contains(&result.action));
+        let sum: f64 = result.improved_policy.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-6);
+        assert_eq!(result.coords.len(), legal.len());
+    }
+
+    #[test]
+    fn gumbel_mcts_fused_sh_calls_eval_at_most_once_per_phase() {
+        // Fusion is gated on `virtual_loss > 0`. With VL > 0, each SH phase
+        // emits exactly one `eval_fn` call (1 root + ≤ num_phases calls).
+        // With VL = 0, the original serial loop runs (sims_per_action calls
+        // per phase), so call count is strictly higher.
+        let game = GameState::with_config(small_config());
+        let n_legal = game.legal_moves().len();
+        let num_candidates = n_legal.min(8);
+        let num_phases = (num_candidates as f64).log2().ceil() as u32;
+        let fused_expected_max = 1 + num_phases;
+
+        // VL > 0 → fused, bounded by 1 + num_phases.
+        let config_fused = MCTSConfig {
+            n_simulations: 32, m_actions: 8, c_visit: 50, c_scale: 1.0,
+            virtual_loss: 0.5,
+            ..Default::default()
+        };
+        let calls_fused = std::rc::Rc::new(std::cell::Cell::new(0u32));
+        let calls_clone = calls_fused.clone();
+        let mut eval_fused =
+            move |states: &[GameState]| -> (Vec<HashMap<Coord, f64>>, Vec<f64>) {
+                calls_clone.set(calls_clone.get() + 1);
+                dummy_eval(states)
+            };
+        let mut rng = ChaCha8Rng::seed_from_u64(7);
+        let _ = gumbel_mcts(&game, &config_fused, &mut rng, &mut eval_fused).unwrap();
+        let fused = calls_fused.get();
+        assert!(
+            fused <= fused_expected_max,
+            "fused: expected ≤ {fused_expected_max} eval calls, got {fused} (n_candidates={num_candidates}, num_phases={num_phases})",
+        );
+        assert!(fused >= 1, "fused: no eval calls at all");
+
+        // VL = 0 → serial, strictly more calls than the fused path (or equal
+        // in pathological tiny-budget cases). Use the SAME seed so the only
+        // difference is the inner-loop structure.
+        let config_serial = MCTSConfig { virtual_loss: 0.0, ..config_fused.clone() };
+        let calls_serial = std::rc::Rc::new(std::cell::Cell::new(0u32));
+        let calls_clone = calls_serial.clone();
+        let mut eval_serial =
+            move |states: &[GameState]| -> (Vec<HashMap<Coord, f64>>, Vec<f64>) {
+                calls_clone.set(calls_clone.get() + 1);
+                dummy_eval(states)
+            };
+        let mut rng = ChaCha8Rng::seed_from_u64(7);
+        let _ = gumbel_mcts(&game, &config_serial, &mut rng, &mut eval_serial).unwrap();
+        let serial = calls_serial.get();
+        assert!(
+            serial >= fused,
+            "serial path should emit at least as many eval calls as fused (serial={serial}, fused={fused})",
+        );
     }
 }
