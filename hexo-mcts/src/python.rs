@@ -271,7 +271,6 @@ impl PyMCTSConfig {
         virtual_loss=0.0,
         root_dirichlet_alpha=0.0,
         root_dirichlet_fraction=0.0,
-        lookahead_value_bonus=0.0,
     ))]
     fn new(
         n_simulations: u32,
@@ -281,7 +280,6 @@ impl PyMCTSConfig {
         virtual_loss: f64,
         root_dirichlet_alpha: f64,
         root_dirichlet_fraction: f64,
-        lookahead_value_bonus: f64,
     ) -> PyResult<Self> {
         if m_actions < 1 {
             return Err(PyValueError::new_err("m_actions must be >= 1"));
@@ -306,11 +304,6 @@ impl PyMCTSConfig {
                 "root_dirichlet_fraction must be in [0, 1]",
             ));
         }
-        if !lookahead_value_bonus.is_finite() || lookahead_value_bonus < 0.0 {
-            return Err(PyValueError::new_err(
-                "lookahead_value_bonus must be a non-negative finite number",
-            ));
-        }
         Ok(PyMCTSConfig {
             inner: MCTSConfig {
                 n_simulations,
@@ -320,7 +313,6 @@ impl PyMCTSConfig {
                 virtual_loss,
                 root_dirichlet_alpha,
                 root_dirichlet_fraction,
-                lookahead_value_bonus,
             },
         })
     }

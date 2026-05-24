@@ -74,11 +74,6 @@ use super::MCTSConfig;
 /// The evaluation callback `eval_fn` receives a list of game states that need
 /// network evaluation and returns `(priors_per_state, values)`.
 ///
-/// `candidate_value_bonus`: when `Some(values)`, each candidate's elimination
-/// score is biased by `config.lookahead_value_bonus * values[i_in_candidate_indices]`.
-/// `values.len()` must equal `candidate_indices.len()`. When `None`, the legacy
-/// (no-bonus) ranking is used.
-///
 /// Returns the list of surviving candidate indices.
 pub fn sequential_halving<F>(
     root: &mut MCTSNode,
@@ -87,19 +82,11 @@ pub fn sequential_halving<F>(
     coords: &[Coord],
     logits: &[f64],
     config: &MCTSConfig,
-    candidate_value_bonus: Option<&[f64]>,
     eval_fn: &mut F,
 ) -> Vec<usize>
 where
     F: FnMut(&mut MCTSNode, &[Coord], u32, f64) -> (),
 {
-    if let Some(values) = candidate_value_bonus {
-        debug_assert_eq!(
-            values.len(),
-            candidate_indices.len(),
-            "candidate_value_bonus must align with candidate_indices",
-        );
-    }
     let n_simulations = config.n_simulations;
     let c_visit = config.c_visit;
     let c_scale = config.c_scale;
@@ -174,32 +161,16 @@ where
             }
         }
 
-        // Eliminate bottom half by Gumbel score (plus optional α·v bonus).
+        // Eliminate bottom half by Gumbel score.
         let qctx = QContext::new(root, coords);
-        let bonus_alpha = config.lookahead_value_bonus;
-        let bonus_lookup = |idx: usize| -> f64 {
-            // Returns α · v_i where i is the position of `idx` within
-            // `candidate_indices` (which mirrors `candidate_value_bonus`).
-            // Returns 0.0 when no bonus is wired.
-            match candidate_value_bonus {
-                Some(values) => {
-                    if let Some(pos) = candidate_indices.iter().position(|&c| c == idx) {
-                        bonus_alpha * values[pos]
-                    } else {
-                        0.0
-                    }
-                }
-                None => 0.0,
-            }
-        };
 
         remaining.sort_by(|&a, &b| {
             let score_a = gumbel_score(
                 a, coords, candidate_gumbels, logits, &qctx, c_visit, c_scale,
-            ) + bonus_lookup(a);
+            );
             let score_b = gumbel_score(
                 b, coords, candidate_gumbels, logits, &qctx, c_visit, c_scale,
-            ) + bonus_lookup(b);
+            );
             score_b
                 .partial_cmp(&score_a)
                 .unwrap_or(std::cmp::Ordering::Equal)
@@ -319,7 +290,6 @@ mod tests {
             &coords,
             &logits,
             &config,
-            None,
             &mut |_, _, _, _| {},
         );
         assert_eq!(result, candidates);
@@ -348,7 +318,6 @@ mod tests {
             &coords,
             &logits,
             &config,
-            None,
             &mut |_, _, _, _| {},
         );
         assert_eq!(result, vec![0]);
@@ -383,7 +352,6 @@ mod tests {
             &coords,
             &logits,
             &config,
-            None,
             &mut |_, _, _, _| {},
         );
         assert!(result.len() < candidates.len());
@@ -417,123 +385,11 @@ mod tests {
             &coords,
             &logits,
             &config,
-            None,
             &mut |_, actions, _, _| {
                 total_eval_calls += actions.len() as u32;
             },
         );
         assert!(total_eval_calls <= 4);
-    }
-
-    /// `sequential_halving` accepts an optional per-candidate value-bonus
-    /// array. When provided and α > 0, the bonus α·v_i must bias
-    /// elimination toward higher-v candidates. Use unequal gumbels +
-    /// uniform priors so a sufficiently large bonus flips the
-    /// elimination order.
-    #[test]
-    fn sequential_halving_value_bonus_changes_elimination_order() {
-        let mut root_off = MCTSNode::new(1.0, None, Player::P1);
-        let mut root_on = MCTSNode::new(1.0, None, Player::P1);
-        let coords = vec![(1, 0), (0, 1), (-1, 0), (0, -1)];
-        let priors: HashMap<Coord, f64> = coords.iter().map(|&c| (c, 0.25)).collect();
-        root_off.expand(priors.clone(), 0.0);
-        root_on.expand(priors, 0.0);
-
-        let config = MCTSConfig {
-            n_simulations: 16,
-            m_actions: 4,
-            c_visit: 50,
-            c_scale: 1.0,
-            virtual_loss: 0.0,
-            lookahead_value_bonus: 10.0,
-            ..Default::default()
-        };
-
-        let candidates = vec![0, 1, 2, 3];
-        // Gumbels favour idx=0 by a small margin.
-        let gumbels = vec![1.1, 1.0, 0.9, 0.8];
-        let logits = vec![0.0; 4];
-        // Value bonus heavily favours idx=3 over idx=0.
-        let bonuses = vec![-1.0, 0.0, 0.0, 1.0];
-
-        let off = sequential_halving(
-            &mut root_off,
-            &candidates,
-            &gumbels,
-            &coords,
-            &logits,
-            &config,
-            None,
-            &mut |_, _, _, _| {},
-        );
-        let on = sequential_halving(
-            &mut root_on,
-            &candidates,
-            &gumbels,
-            &coords,
-            &logits,
-            &config,
-            Some(&bonuses),
-            &mut |_, _, _, _| {},
-        );
-
-        // Without bonus, idx=0 (highest gumbel) leads survivors.
-        assert!(off.contains(&0), "off-path survivors must include idx=0; got {:?}", off);
-        // With huge bonus and α=10, idx=3 (bonus +10) must beat idx=0
-        // (bonus -10). idx=0 must NOT be in survivors after halving.
-        assert!(!on.contains(&0),
-            "value bonus must eliminate idx=0 (gumbel high but v=-1); got {:?}", on);
-        assert!(on.contains(&3),
-            "value bonus must keep idx=3 (v=+1); got {:?}", on);
-    }
-
-    /// When `candidate_value_bonus` is `None`, the result must match
-    /// the legacy (no-bonus) behaviour exactly.
-    #[test]
-    fn sequential_halving_none_bonus_matches_legacy() {
-        let mut root_a = MCTSNode::new(1.0, None, Player::P1);
-        let mut root_b = MCTSNode::new(1.0, None, Player::P1);
-        let coords = vec![(1, 0), (0, 1), (-1, 0), (0, -1)];
-        let priors: HashMap<Coord, f64> = coords.iter().map(|&c| (c, 0.25)).collect();
-        root_a.expand(priors.clone(), 0.0);
-        root_b.expand(priors, 0.0);
-
-        let config = MCTSConfig {
-            n_simulations: 8,
-            m_actions: 4,
-            c_visit: 50,
-            c_scale: 1.0,
-            virtual_loss: 0.0,
-            lookahead_value_bonus: 5.0, // α set but bonuses=None
-            ..Default::default()
-        };
-        let candidates = vec![0, 1, 2, 3];
-        let gumbels = vec![4.0, 3.0, 2.0, 1.0];
-        let logits = vec![0.0; 4];
-
-        let r_a = sequential_halving(
-            &mut root_a,
-            &candidates,
-            &gumbels,
-            &coords,
-            &logits,
-            &config,
-            None,
-            &mut |_, _, _, _| {},
-        );
-        // Compare against an explicit `None` again to demonstrate
-        // determinism (no internal state changes).
-        let r_b = sequential_halving(
-            &mut root_b,
-            &candidates,
-            &gumbels,
-            &coords,
-            &logits,
-            &config,
-            None,
-            &mut |_, _, _, _| {},
-        );
-        assert_eq!(r_a, r_b);
     }
 
     #[test]
