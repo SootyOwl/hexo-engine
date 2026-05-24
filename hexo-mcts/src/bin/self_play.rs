@@ -1111,6 +1111,7 @@ fn reduced_sim_config(base: &MCTSConfig, divisor: u32) -> MCTSConfig {
         virtual_loss: base.virtual_loss,
         root_dirichlet_alpha: base.root_dirichlet_alpha,
         root_dirichlet_fraction: base.root_dirichlet_fraction,
+        lookahead_value_bonus: base.lookahead_value_bonus,
     }
 }
 
@@ -1614,6 +1615,10 @@ fn main() {
         virtual_loss,
         root_dirichlet_alpha,
         root_dirichlet_fraction,
+        // B.2 lookahead value bonus: not currently exposed as a self_play
+        // CLI flag; default 0.0 keeps current behaviour bit-equivalent.
+        // Python plumbing (a separate task) will surface this via PyMCTSConfig.
+        lookahead_value_bonus: 0.0,
     });
 
     let batch_timeout = if batch_timeout_ms > 0 {

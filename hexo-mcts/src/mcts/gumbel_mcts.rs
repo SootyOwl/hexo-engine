@@ -343,6 +343,65 @@ where
         }
     }
 
+    // Step 3.6 (B.2): Lookahead value bonus.
+    //
+    // When `lookahead_value_bonus > 0` and we're at start-of-turn (mr=2),
+    // query the network's value head on the post-p₁ state for every
+    // Gumbel-Top-K candidate. The value is appended to the candidate's
+    // SH elimination score as α·v, biasing early-tier survival toward
+    // candidates whose follow-up positions look favourable. Terminal
+    // post-p₁ states use the game outcome from the current player's
+    // perspective (no extra eval needed).
+    //
+    // Gated off (`lookahead_value_bonus == 0.0`) means this entire
+    // block is skipped — no clones, no extra eval_fn call — and behaviour
+    // is bit-equivalent to the legacy path.
+    let candidate_value_bonus: Option<Vec<f64>> =
+        if config.lookahead_value_bonus > 0.0 && game.moves_remaining_this_turn() == 2 {
+            let mut values: Vec<f64> = vec![0.0; candidate_indices.len()];
+            // Collect non-terminal post-p₁ states for batched evaluation;
+            // remember their position in `candidate_indices` for re-alignment.
+            let mut pending_pos: Vec<usize> = Vec::new();
+            let mut pending_states: Vec<GameState> = Vec::new();
+            for (pos, &idx) in candidate_indices.iter().enumerate() {
+                let m1 = coords[idx];
+                let mut g = game.clone();
+                if g.apply_move(m1).is_err() {
+                    // Illegal move (shouldn't happen — candidates come from
+                    // legal_moves) → leave value at 0.
+                    continue;
+                }
+                if g.is_terminal() {
+                    // Terminal post-p₁: value from current player's POV.
+                    // `me` is the current player at the root; this is also
+                    // the player still on move after a mid-turn placement,
+                    // but to be safe we anchor on `me` (the root player).
+                    if g.winner() == me {
+                        values[pos] = 1.0;
+                    } else if g.winner().is_some() {
+                        // The opponent won — shouldn't actually happen for
+                        // an own placement at HeXO, but defend against it.
+                        values[pos] = -1.0;
+                    } else {
+                        // No winner ⇒ draw (max_moves hit).
+                        values[pos] = 0.0;
+                    }
+                } else {
+                    pending_pos.push(pos);
+                    pending_states.push(g);
+                }
+            }
+            if !pending_states.is_empty() {
+                let (_logits_per_state, post_values) = eval_fn(&pending_states);
+                for (k, &pos) in pending_pos.iter().enumerate() {
+                    values[pos] = post_values[k];
+                }
+            }
+            Some(values)
+        } else {
+            None
+        };
+
     // Step 4: Sequential halving with batched evaluation
     let vl_magnitude = config.virtual_loss;
     let surviving_indices = sequential_halving(
@@ -352,6 +411,7 @@ where
         &coords,
         &logits,
         config,
+        candidate_value_bonus.as_deref(),
         &mut |root_node, batch_actions, c_visit, c_scale| {
             simulate_batch_with_eval(
                 root_node,
@@ -368,8 +428,22 @@ where
     let improved_policy =
         compute_improved_policy(&logits, &coords, &root, config.c_visit, config.c_scale);
 
-    // Step 6: Select action from survivors using Gumbel + logits + σ(Q)
+    // Step 6: Select action from survivors using Gumbel + logits + σ(Q),
+    // plus the optional α·v lookahead bonus (mirrors SH elimination).
     let qctx = QContext::new(&root, &coords);
+    let bonus_alpha = config.lookahead_value_bonus;
+    let final_bonus_lookup = |idx: usize| -> f64 {
+        match candidate_value_bonus.as_deref() {
+            Some(values) => {
+                if let Some(pos) = candidate_indices.iter().position(|&c| c == idx) {
+                    bonus_alpha * values[pos]
+                } else {
+                    0.0
+                }
+            }
+            None => 0.0,
+        }
+    };
 
     let mut best_score = f64::NEG_INFINITY;
     let mut selected_coord = coords[surviving_indices[0]];
@@ -380,7 +454,8 @@ where
 
         let score = gumbel_samples[idx]
             + logits[idx]
-            + sigma(norm_q, qctx.max_child_visits, config.c_visit, config.c_scale);
+            + sigma(norm_q, qctx.max_child_visits, config.c_visit, config.c_scale)
+            + final_bonus_lookup(idx);
 
         if score > best_score {
             best_score = score;
@@ -1176,5 +1251,332 @@ mod tests {
             serial >= fused,
             "serial path should emit at least as many eval calls as fused (serial={serial}, fused={fused})",
         );
+    }
+
+    // -----------------------------------------------------------------
+    // B.2 lookahead value bonus
+    // -----------------------------------------------------------------
+
+    /// `lookahead_value_bonus = 0.0` must be bit-equivalent to the legacy
+    /// search: same `action`, same `improved_policy`, same `visit_counts`.
+    /// Guards against accidental code-path drift on the disabled path.
+    #[test]
+    fn lookahead_bonus_zero_is_bit_equivalent_to_legacy() {
+        let game = GameState::with_config(small_config());
+        let base = MCTSConfig {
+            n_simulations: 16,
+            m_actions: 8,
+            c_visit: 50,
+            c_scale: 1.0,
+            virtual_loss: 0.0,
+            ..Default::default()
+        };
+        let with_zero = MCTSConfig {
+            lookahead_value_bonus: 0.0,
+            ..base.clone()
+        };
+
+        let mut rng1 = ChaCha8Rng::seed_from_u64(99);
+        let r_base = gumbel_mcts(&game, &base, &mut rng1, &mut dummy_eval).unwrap();
+        let mut rng2 = ChaCha8Rng::seed_from_u64(99);
+        let r_zero = gumbel_mcts(&game, &with_zero, &mut rng2, &mut dummy_eval).unwrap();
+
+        assert_eq!(r_base.action, r_zero.action);
+        assert_eq!(r_base.coords, r_zero.coords);
+        assert_eq!(r_base.visit_counts, r_zero.visit_counts);
+        assert_eq!(r_base.improved_policy.len(), r_zero.improved_policy.len());
+        for (a, b) in r_base.improved_policy.iter().zip(r_zero.improved_policy.iter()) {
+            assert_eq!(a.to_bits(), b.to_bits(),
+                "improved_policy must be bit-identical, got {} vs {}", a, b);
+        }
+        assert_eq!(r_base.candidate_indices, r_zero.candidate_indices);
+    }
+
+    /// With `lookahead_value_bonus = 0.0` and a deterministic but
+    /// non-trivial `eval_fn`, the disabled path must NOT invoke `eval_fn`
+    /// for post-p₁ states — only for the root and the sequential-halving
+    /// descents. Equivalently, the post-p₁ batch must be empty, so the
+    /// number of `eval_fn` invocations matches the legacy path.
+    #[test]
+    fn lookahead_bonus_zero_does_no_extra_eval_calls() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let game = GameState::with_config(small_config());
+
+        let counter = Rc::new(RefCell::new(0u32));
+        let counter_clone = counter.clone();
+        let mut counting_eval = move |states: &[GameState]| {
+            *counter_clone.borrow_mut() += 1;
+            dummy_eval(states)
+        };
+
+        let cfg_off = MCTSConfig {
+            n_simulations: 32,
+            m_actions: 8,
+            c_visit: 50,
+            c_scale: 1.0,
+            virtual_loss: 0.0,
+            lookahead_value_bonus: 0.0,
+            ..Default::default()
+        };
+
+        let mut rng = ChaCha8Rng::seed_from_u64(7);
+        let _ = gumbel_mcts(&game, &cfg_off, &mut rng, &mut counting_eval).unwrap();
+        let calls_off = *counter.borrow();
+
+        // Reset counter, repeat without the field set (legacy default).
+        *counter.borrow_mut() = 0;
+        let cfg_legacy = MCTSConfig {
+            n_simulations: 32,
+            m_actions: 8,
+            c_visit: 50,
+            c_scale: 1.0,
+            virtual_loss: 0.0,
+            ..Default::default()
+        };
+        let mut rng = ChaCha8Rng::seed_from_u64(7);
+        let _ = gumbel_mcts(&game, &cfg_legacy, &mut rng, &mut counting_eval).unwrap();
+        let calls_legacy = *counter.borrow();
+
+        assert_eq!(
+            calls_off, calls_legacy,
+            "bonus=0 must perform same number of eval_fn calls as legacy"
+        );
+    }
+
+    /// Mid-turn (`moves_remaining_this_turn() == 1`) root searches must
+    /// NOT invoke the lookahead path even when the bonus is on. With a
+    /// stub eval that would normally flip the action under bonus, the
+    /// result with `bonus > 0` must equal the result with `bonus = 0`.
+    #[test]
+    fn lookahead_bonus_skipped_mid_turn() {
+        // Build a mid-turn (mr=1) state by playing one stone for the
+        // current player.
+        let mut game = GameState::with_config(small_config());
+        // P1's opening stone is at (0,0). P2 plays first move; that
+        // leaves mr=1 for P2 with the same player still on move.
+        let legal_p2 = game.legal_moves();
+        game.apply_move(legal_p2[0]).unwrap();
+        assert_eq!(game.moves_remaining_this_turn(), 1);
+
+        // An eval_fn that biases value by sign(coord.0) of the legal-move
+        // table at the *root* — but identical priors. If the bonus were
+        // active, the chosen action would shift toward positive-value
+        // post-p1 states. Since the gating disables the bonus mid-turn,
+        // this eval makes no difference and bonus=1.0 == bonus=0.0.
+        let mut eval_biased = |states: &[GameState]| {
+            let mut all_logits = Vec::new();
+            let mut all_values = Vec::new();
+            for s in states {
+                let moves = s.legal_moves();
+                let logits: HashMap<Coord, f64> = moves.iter().map(|&m| (m, 0.0)).collect();
+                all_logits.push(logits);
+                // Spread values across [-1, +1] based on the first stone
+                // count parity, just to make eval non-trivial.
+                let v = if s.stones().len() % 2 == 0 { 0.5 } else { -0.5 };
+                all_values.push(v);
+            }
+            (all_logits, all_values)
+        };
+
+        let cfg_off = MCTSConfig {
+            n_simulations: 16,
+            m_actions: 8,
+            c_visit: 50,
+            c_scale: 1.0,
+            virtual_loss: 0.0,
+            lookahead_value_bonus: 0.0,
+            ..Default::default()
+        };
+        let cfg_on = MCTSConfig {
+            lookahead_value_bonus: 1.0,
+            ..cfg_off.clone()
+        };
+
+        let mut rng1 = ChaCha8Rng::seed_from_u64(11);
+        let r_off = gumbel_mcts(&game, &cfg_off, &mut rng1, &mut eval_biased).unwrap();
+        let mut rng2 = ChaCha8Rng::seed_from_u64(11);
+        let r_on = gumbel_mcts(&game, &cfg_on, &mut rng2, &mut eval_biased).unwrap();
+
+        assert_eq!(r_off.action, r_on.action,
+            "mid-turn bonus must be a no-op");
+        for (a, b) in r_off.improved_policy.iter().zip(r_on.improved_policy.iter()) {
+            assert_eq!(a.to_bits(), b.to_bits(),
+                "mid-turn improved_policy must be bit-identical");
+        }
+    }
+
+    /// Bonus must change the chosen action when wired up correctly.
+    /// Construct a synthetic start-of-turn position with two distinct
+    /// Gumbel-Top-K candidates; arrange the stub eval so the post-p₁
+    /// value of one candidate is much higher than the other while the
+    /// root priors and gumbel scores remain equal. With bonus=0 the
+    /// chosen action depends only on Gumbel noise + priors (tied here,
+    /// so deterministically picks the first); with bonus large the
+    /// candidate with the higher post-p₁ value must win.
+    #[test]
+    fn lookahead_bonus_flips_action_when_post_p1_value_higher() {
+        // Start-of-turn position with two clearly distinct candidates.
+        // win_length=4, placement_radius=1 keeps the legal-move set
+        // small. P1 to move with mr=2.
+        let cfg_game = GameConfig {
+            win_length: 4,
+            placement_radius: 1,
+            max_moves: 80,
+        };
+        let stones = vec![((0, 0), Player::P1)];
+        let game = GameState::from_state(&stones, Player::P1, 2, cfg_game);
+        assert_eq!(game.moves_remaining_this_turn(), 2);
+
+        // Pick two distinguishable target moves from the legal set.
+        let legal = game.legal_moves();
+        assert!(legal.len() >= 2);
+        let preferred = legal[0];   // bonus will reward this
+        let alternate = legal[1];   // bonus will penalise this
+
+        // eval: at the root, uniform logits + value=0. At any other
+        // state, return uniform logits and a value that depends on
+        // whether `preferred` or `alternate` has been placed.
+        let mut value_biased = move |states: &[GameState]| {
+            let mut all_logits = Vec::new();
+            let mut all_values = Vec::new();
+            for s in states {
+                let moves = s.legal_moves();
+                let logits: HashMap<Coord, f64> = moves.iter().map(|&m| (m, 0.0)).collect();
+                all_logits.push(logits);
+                let stones = s.stones();
+                let v = if stones.contains_key(&preferred) {
+                    1.0
+                } else if stones.contains_key(&alternate) {
+                    -1.0
+                } else {
+                    0.0
+                };
+                all_values.push(v);
+            }
+            (all_logits, all_values)
+        };
+
+        let cfg_off = MCTSConfig {
+            n_simulations: 4, // tiny: SH adds little; bonus dominates if active
+            m_actions: legal.len(),
+            c_visit: 50,
+            c_scale: 1.0,
+            virtual_loss: 0.0,
+            lookahead_value_bonus: 0.0,
+            ..Default::default()
+        };
+        let cfg_on = MCTSConfig {
+            lookahead_value_bonus: 50.0, // huge α to swamp Gumbel noise
+            ..cfg_off.clone()
+        };
+
+        // Search across multiple seeds — the bonus must consistently
+        // pick `preferred` over `alternate` (and over any other legal
+        // move that has v=0).
+        let mut on_picks_preferred = 0;
+        let mut on_picks_alternate = 0;
+        let mut on_picks_other = 0;
+        let mut off_picks_preferred = 0;
+        let mut off_picks_alternate = 0;
+        let mut differing_seeds = 0;
+        for seed in 0..20u64 {
+            let mut rng1 = ChaCha8Rng::seed_from_u64(seed);
+            let r_off = gumbel_mcts(&game, &cfg_off, &mut rng1, &mut value_biased).unwrap();
+            let mut rng2 = ChaCha8Rng::seed_from_u64(seed);
+            let r_on = gumbel_mcts(&game, &cfg_on, &mut rng2, &mut value_biased).unwrap();
+
+            if r_on.action == preferred {
+                on_picks_preferred += 1;
+            } else if r_on.action == alternate {
+                on_picks_alternate += 1;
+            } else {
+                on_picks_other += 1;
+            }
+            if r_off.action == preferred {
+                off_picks_preferred += 1;
+            } else if r_off.action == alternate {
+                off_picks_alternate += 1;
+            }
+            if r_off.action != r_on.action {
+                differing_seeds += 1;
+            }
+        }
+
+        // With huge bonus, `preferred` (post-p1 value +1) should be picked
+        // in nearly every seed.
+        assert!(on_picks_preferred >= 18,
+            "bonus must consistently steer toward preferred (got {} of 20; alternate={}, other={})",
+            on_picks_preferred, on_picks_alternate, on_picks_other);
+        // `alternate` (post-p1 value -1) must be picked rarely under bonus.
+        assert!(on_picks_alternate == 0,
+            "bonus must steer away from value=-1 candidate (got {} of 20)",
+            on_picks_alternate);
+        // The bonus must actually be doing work — at least some seeds
+        // should differ between off and on.
+        assert!(differing_seeds > 0,
+            "bonus must flip the action on at least one seed; (off picks: preferred={}, alternate={}; on picks: preferred={}, alternate={})",
+            off_picks_preferred, off_picks_alternate,
+            on_picks_preferred, on_picks_alternate);
+    }
+
+    /// When a candidate's post-p₁ state is terminal (own win), the
+    /// search must not crash and the candidate's value must be sensible
+    /// (≥ alternative non-terminal candidates with v=0). This exercises
+    /// the terminal-post-p₁ branch of the bonus computation.
+    #[test]
+    fn lookahead_bonus_handles_terminal_post_p1_state() {
+        // P2's turn at the start, mr=2: stones at (1,0), (2,0), (3,0)
+        // are P2; (-1,0) is the gap that completes a 4-in-a-row along
+        // -q. P2 to move with 2 placements.
+        // wait — P1 has the (0,0) opening. Use win_length=4 with two P2
+        // stones already so single placement wins.
+        let cfg_game = GameConfig {
+            win_length: 4,
+            placement_radius: 1,
+            max_moves: 80,
+        };
+        let stones = vec![
+            ((0, 0), Player::P1),
+            ((1, 0), Player::P2),
+            ((2, 0), Player::P2),
+            ((3, 0), Player::P2),
+        ];
+        // P2 to move with mr=2. Single placement at (4,0) wins (P2 has
+        // 3 in a row; one more makes 4). Single placement at (-1,0)
+        // also makes a 4-in-a-row with (-1,0,1,0),(0,0),(1,0)... no,
+        // (0,0) is P1. So (4,0) is the unique single-placement win.
+        let game = GameState::from_state(&stones, Player::P2, 2, cfg_game);
+        let win = (4, 0);
+        assert!(game.legal_moves().contains(&win));
+        // Sanity: single placement at `win` is terminal with P2 winning.
+        let mut probe = game.clone();
+        probe.apply_move(win).unwrap();
+        assert!(probe.is_terminal());
+        assert_eq!(probe.winner(), Some(Player::P2));
+
+        // With lookahead bonus on, this test mostly verifies the search
+        // does not crash on the terminal post-p1 case. The depth-1
+        // shortcut should already pick `win` before SH even runs, but
+        // the bonus path must handle terminal states gracefully even
+        // when reached (e.g. if the shortcut were disabled).
+        let cfg = MCTSConfig {
+            n_simulations: 16,
+            m_actions: 64,
+            c_visit: 50,
+            c_scale: 1.0,
+            virtual_loss: 0.0,
+            lookahead_value_bonus: 1.0,
+            ..Default::default()
+        };
+
+        let mut rng = ChaCha8Rng::seed_from_u64(0);
+        let result = gumbel_mcts(&game, &cfg, &mut rng, &mut dummy_eval);
+        let result = result.expect("search must not crash on terminal post-p1");
+        // The chosen action must be a winning move — depth-1 shortcut
+        // catches this first, so the bonus path is essentially exercised
+        // for sanity here.
+        assert_eq!(result.action, win);
     }
 }

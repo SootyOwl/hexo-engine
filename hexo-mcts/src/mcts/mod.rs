@@ -39,4 +39,10 @@ pub struct MCTSConfig {
     /// 0.0 disables (no noise applied regardless of α). Standard AlphaZero
     /// uses 0.25. Ignored when `root_dirichlet_alpha == 0.0`.
     pub root_dirichlet_fraction: f64,
+    /// Weight α on a lookahead value bonus applied at start-of-turn root SH
+    /// elimination. For each Gumbel-Top-K p₁ candidate, the network's value
+    /// head is queried on the post-p₁ state and the score is biased by α·v.
+    /// 0.0 (default) disables the bonus path entirely (bit-equivalent to
+    /// current behaviour). Only active when `game.moves_remaining_this_turn() == 2`.
+    pub lookahead_value_bonus: f64,
 }
