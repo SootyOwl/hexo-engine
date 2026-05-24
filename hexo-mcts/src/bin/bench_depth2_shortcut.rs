@@ -717,7 +717,7 @@ fn run_mcts_bench(
             skipped_terminal += 1;
             continue;
         }
-        let result = match gumbel_mcts(&game, &mcts_config, &mut rng, &mut dummy_eval) {
+        let result = match gumbel_mcts(&game, &mcts_config, &mut rng, None, &mut dummy_eval) {
             Ok(r) => r,
             Err(_) => continue,
         };

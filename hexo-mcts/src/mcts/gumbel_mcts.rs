@@ -47,6 +47,11 @@ pub struct MCTSResult {
     /// shortcut / early-exit paths this is the candidate set the shortcut
     /// scanned; the chosen action is guaranteed to lie inside it.
     pub candidate_indices: Vec<usize>,
+    /// At mr=2 roots with `forced_candidate_capture_k > 0`, the top-K p₂
+    /// coords (by conditional prior) for the chosen p₁'s post-state.
+    /// Empty otherwise (mr=1 roots, capture disabled, or chosen p₁ led to
+    /// terminal post-state).
+    pub chosen_action_forced_candidates: Vec<Coord>,
 }
 
 /// Run Gumbel MCTS from a game state.
@@ -56,12 +61,21 @@ pub struct MCTSResult {
 /// where logits_per_state[i] maps action → logit for state i,
 /// and values[i] is the scalar value estimate.
 ///
+/// `forced_candidates` (E.4-inject, p₂ side): when `Some(coords)` and the
+/// root is mr=1 (mid-turn), the supplied coordinates are guaranteed to appear
+/// in the root's Gumbel-Top-K candidate set. They get fresh independent
+/// Gumbel-noise draws so SH ranking treats them fairly, and they displace
+/// the lowest-Gumbel-scored non-forced candidates when not already present.
+/// Ignored at mr=2 roots — the mechanism is only meaningful for the p₂
+/// search (the second placement of a HeXO turn).
+///
 /// # Errors
 /// Returns `Err` if the game state is terminal.
 pub fn gumbel_mcts<R, F>(
     game: &GameState,
     config: &MCTSConfig,
     rng: &mut R,
+    forced_candidates: Option<&[Coord]>,
     eval_fn: &mut F,
 ) -> Result<MCTSResult, &'static str>
 where
@@ -177,8 +191,73 @@ where
     }
 
     // Step 3: Gumbel top-k sampling
-    let (candidate_indices, gumbel_samples) =
+    let (mut candidate_indices, mut gumbel_samples) =
         gumbel_top_k(&logits, config.m_actions, rng);
+
+    // Step 3.1 (E.4-inject consumer): forced candidate injection.
+    //
+    // When `forced_candidates` is supplied at a mr=1 root, guarantee that
+    // each of those coords (translated to its index in `coords`/legal_moves)
+    // appears in the final candidate set. If a forced coord is already
+    // among the Gumbel-Top-K winners, no change. Otherwise we replace the
+    // lowest-Gumbel-scored *non-forced* survivor with the forced index,
+    // keeping the total candidate count at `m_actions`. Each newly-injected
+    // index gets a fresh independent Gumbel(0,1) draw assigned in
+    // `gumbel_samples` so SH treats it on equal footing with the
+    // naturally-sampled candidates.
+    //
+    // Ignored at mr=2 roots: the mechanism's purpose is to plumb the p₂
+    // candidate set learned during the p₁ search into the p₂ search, which
+    // is the mr=1 root. Passing forced coords at a mr=2 root is silently
+    // a no-op (documented in the function comment).
+    if let Some(forced) = forced_candidates {
+        if game.moves_remaining_this_turn() == 1 && !forced.is_empty() {
+            use rand_distr::{Distribution, Uniform};
+            let uniform = Uniform::new(1e-20, 1.0 - 1e-20).unwrap();
+            let mut sample_gumbel = |rng: &mut R| -> f64 {
+                let u: f64 = uniform.sample(rng);
+                -(-u.ln()).ln()
+            };
+            // Translate forced coords to indices in `coords`; silently
+            // drop coords not present in `legal_moves` (they can't be
+            // candidates).
+            let mut forced_indices: Vec<usize> = Vec::new();
+            for &c in forced {
+                if let Some(idx) = coords.iter().position(|&x| x == c) {
+                    if !forced_indices.contains(&idx) {
+                        forced_indices.push(idx);
+                    }
+                }
+            }
+            // For each forced index NOT already in candidate_indices,
+            // draw a fresh Gumbel and inject by displacing the lowest-
+            // Gumbel-scored non-forced candidate.
+            for &fi in &forced_indices {
+                if candidate_indices.contains(&fi) {
+                    continue;
+                }
+                // Find the lowest-scored non-forced candidate.
+                // Score = gumbel_samples[idx] + logits[idx] (matches
+                // gumbel_top_k's ordering).
+                let mut worst_pos: Option<usize> = None;
+                let mut worst_score = f64::INFINITY;
+                for (pos, &idx) in candidate_indices.iter().enumerate() {
+                    if forced_indices.contains(&idx) {
+                        continue; // don't displace another forced index
+                    }
+                    let score = gumbel_samples[idx] + logits[idx];
+                    if score < worst_score {
+                        worst_score = score;
+                        worst_pos = Some(pos);
+                    }
+                }
+                let Some(pos) = worst_pos else { continue };
+                // Assign a fresh Gumbel draw to the injected index.
+                gumbel_samples[fi] = sample_gumbel(rng);
+                candidate_indices[pos] = fi;
+            }
+        }
+    }
 
     // Step 3.5: Forced-win shortcut over the candidate set.
     //
@@ -249,6 +328,9 @@ where
                     per_child_q,
                     per_child_prior,
                     candidate_indices: candidate_indices.clone(),
+                    // Depth-1 shortcut: chosen p₁ is terminal. The post-state
+                    // has no legal p₂s to capture priors from.
+                    chosen_action_forced_candidates: Vec::new(),
                 });
             }
         }
@@ -335,6 +417,12 @@ where
                                 per_child_q,
                                 per_child_prior,
                                 candidate_indices: candidate_indices.clone(),
+                                // Depth-2 shortcut: chosen p₁ leads to a
+                                // 1-turn forced win on the SECOND placement,
+                                // so the next search has no meaningful p₂
+                                // injection target (depth-1 shortcut will
+                                // close out the game). Leaving empty.
+                                chosen_action_forced_candidates: Vec::new(),
                             });
                         }
                     }
@@ -342,6 +430,74 @@ where
             }
         }
     }
+
+    // Step 3.6 (E.4-inject capture): conditional p₂ priors per Gumbel-Top-K
+    // candidate at mr=2 roots.
+    //
+    // When `forced_candidate_capture_k > 0` and we are at start-of-turn
+    // (mr=2), we re-embed the post-p₁ state for every candidate p₁ to read
+    // off the network's conditional prior over the legal p₂s. The chosen
+    // p₁'s top-K p₂s are returned in MCTSResult so the caller can pass them
+    // as `forced_candidates` to the next gumbel_mcts call (the p₂ search).
+    //
+    // The SH elimination and final argmax are NOT biased by this — only
+    // the *next* search benefits from the captured set. When capture is
+    // disabled (k=0) or we're at mr=1, no extra evaluation runs and
+    // `captured_p2_priors` stays `None`, leaving the existing search path
+    // bit-identical.
+    //
+    // `captured_p2_priors[pos]`: for the candidate at position `pos`
+    // within `candidate_indices`, either `Some(Vec<(Coord, f64)>)` of
+    // (p₂ coord, conditional prior) pairs over its legal p₂s, or `None`
+    // when the candidate's post-p₁ state was terminal (no p₂s exist).
+    let captured_p2_priors: Option<Vec<Option<Vec<(Coord, f64)>>>> =
+        if config.forced_candidate_capture_k > 0 && game.moves_remaining_this_turn() == 2 {
+            let mut per_candidate: Vec<Option<Vec<(Coord, f64)>>> =
+                vec![None; candidate_indices.len()];
+            // Collect non-terminal post-p₁ states for batched evaluation;
+            // remember each one's slot in `candidate_indices` so we can
+            // re-align after the eval returns.
+            let mut pending_pos: Vec<usize> = Vec::new();
+            let mut pending_states: Vec<GameState> = Vec::new();
+            for (pos, &idx) in candidate_indices.iter().enumerate() {
+                let m1 = coords[idx];
+                let mut g = game.clone();
+                if g.apply_move(m1).is_err() {
+                    // Should not happen — candidates come from legal_moves.
+                    continue;
+                }
+                if g.is_terminal() {
+                    // Terminal post-p₁: no p₂s to capture; leave as None.
+                    continue;
+                }
+                pending_pos.push(pos);
+                pending_states.push(g);
+            }
+            if !pending_states.is_empty() {
+                let (post_logits_per_state, _values) = eval_fn(&pending_states);
+                for (k, &pos) in pending_pos.iter().enumerate() {
+                    // Filter the candidate's logits to its legal p₂s and
+                    // convert to priors via softmax. We want the *full*
+                    // softmax over legal p₂s (not just the top-K logits)
+                    // because the same coord can appear with low logit but
+                    // be the top-K's K-th member after normalization.
+                    let p2_state = &pending_states[k];
+                    let p2_moves = p2_state.legal_moves();
+                    let map = &post_logits_per_state[k];
+                    let p2_logits: Vec<f64> =
+                        p2_moves.iter().map(|c| map.get(c).copied().unwrap_or(0.0)).collect();
+                    let p2_priors = super::scoring::softmax(&p2_logits);
+                    let pairs: Vec<(Coord, f64)> = p2_moves
+                        .into_iter()
+                        .zip(p2_priors.into_iter())
+                        .collect();
+                    per_candidate[pos] = Some(pairs);
+                }
+            }
+            Some(per_candidate)
+        } else {
+            None
+        };
 
     // Step 4: Sequential halving with batched evaluation
     let vl_magnitude = config.virtual_loss;
@@ -402,6 +558,33 @@ where
     // construction (built from the same `logits` indexing).
     let per_child_prior = priors_vec.clone();
 
+    // E.4-inject: if capture is enabled and the chosen action's post-p₁
+    // priors were computed (non-terminal post-state), take the top-K p₂s
+    // by prior magnitude. Deterministic top-K — no Gumbel sampling.
+    // Empty otherwise (capture disabled, mr=1 root, or terminal-post-p₁).
+    let chosen_action_forced_candidates: Vec<Coord> = match captured_p2_priors.as_ref() {
+        Some(per_candidate) => {
+            // Locate the chosen action's position within candidate_indices.
+            // SH always returns a survivor that was in candidate_indices,
+            // so this lookup must succeed.
+            let chosen_pos = candidate_indices
+                .iter()
+                .position(|&idx| coords[idx] == selected_coord);
+            match chosen_pos.and_then(|p| per_candidate[p].as_ref()) {
+                Some(pairs) => {
+                    let k = config.forced_candidate_capture_k.min(pairs.len());
+                    let mut sorted: Vec<(Coord, f64)> = pairs.clone();
+                    sorted.sort_by(|a, b| {
+                        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    sorted.into_iter().take(k).map(|(c, _)| c).collect()
+                }
+                None => Vec::new(),
+            }
+        }
+        None => Vec::new(),
+    };
+
     Ok(MCTSResult {
         action: selected_coord,
         improved_policy,
@@ -410,6 +593,7 @@ where
         per_child_q,
         per_child_prior,
         candidate_indices,
+        chosen_action_forced_candidates,
     })
 }
 
@@ -623,7 +807,7 @@ mod tests {
         };
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
-        let result = gumbel_mcts(&game, &config, &mut rng, &mut dummy_eval).unwrap();
+        let result = gumbel_mcts(&game, &config, &mut rng, None, &mut dummy_eval).unwrap();
         assert!(legal.contains(&result.action));
     }
 
@@ -640,7 +824,7 @@ mod tests {
         };
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
-        let result = gumbel_mcts(&game, &config, &mut rng, &mut dummy_eval).unwrap();
+        let result = gumbel_mcts(&game, &config, &mut rng, None, &mut dummy_eval).unwrap();
         let sum: f64 = result.improved_policy.iter().sum();
         assert!((sum - 1.0).abs() < 1e-6);
     }
@@ -659,7 +843,7 @@ mod tests {
         };
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
-        let result = gumbel_mcts(&game, &config, &mut rng, &mut dummy_eval).unwrap();
+        let result = gumbel_mcts(&game, &config, &mut rng, None, &mut dummy_eval).unwrap();
         assert_eq!(result.improved_policy.len(), n_legal);
         assert_eq!(result.coords.len(), n_legal);
     }
@@ -686,7 +870,7 @@ mod tests {
         };
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
-        let result = gumbel_mcts(&game, &config, &mut rng, &mut dummy_eval);
+        let result = gumbel_mcts(&game, &config, &mut rng, None, &mut dummy_eval);
         assert!(result.is_err());
     }
 
@@ -705,8 +889,8 @@ mod tests {
         let mut rng1 = ChaCha8Rng::seed_from_u64(42);
         let mut rng2 = ChaCha8Rng::seed_from_u64(42);
 
-        let r1 = gumbel_mcts(&game, &config, &mut rng1, &mut dummy_eval).unwrap();
-        let r2 = gumbel_mcts(&game, &config, &mut rng2, &mut dummy_eval).unwrap();
+        let r1 = gumbel_mcts(&game, &config, &mut rng1, None, &mut dummy_eval).unwrap();
+        let r2 = gumbel_mcts(&game, &config, &mut rng2, None, &mut dummy_eval).unwrap();
         assert_eq!(r1.action, r2.action);
     }
 
@@ -724,7 +908,7 @@ mod tests {
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
         // Should still return a valid action (based on Gumbel + logits alone)
-        let result = gumbel_mcts(&game, &config, &mut rng, &mut dummy_eval).unwrap();
+        let result = gumbel_mcts(&game, &config, &mut rng, None, &mut dummy_eval).unwrap();
         assert!(game.legal_moves().contains(&result.action));
     }
 
@@ -771,7 +955,7 @@ mod tests {
         };
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
-        let result = gumbel_mcts(&game, &config, &mut rng, &mut biased_eval).unwrap();
+        let result = gumbel_mcts(&game, &config, &mut rng, None, &mut biased_eval).unwrap();
 
         // The improved policy should strongly favor the target_move due to the
         // large logit advantage at the root.
@@ -818,7 +1002,7 @@ mod tests {
 
         // Uniform eval: all logits 0, value 0. MCTS must rely on terminal
         // detection to discover the win.
-        let result = gumbel_mcts(&game, &config, &mut rng, &mut dummy_eval).unwrap();
+        let result = gumbel_mcts(&game, &config, &mut rng, None, &mut dummy_eval).unwrap();
 
         // Any move adjacent to (0,0) wins with win_length=2.
         // Early termination should find one of them.
@@ -864,7 +1048,7 @@ mod tests {
         // candidates, which depends on the random sample).
         for seed in 0..20 {
             let mut rng = ChaCha8Rng::seed_from_u64(seed);
-            let result = gumbel_mcts(&game, &config, &mut rng, &mut dummy_eval).unwrap();
+            let result = gumbel_mcts(&game, &config, &mut rng, None, &mut dummy_eval).unwrap();
 
             // Find the winning action's index in the policy
             let action_idx = result.coords.iter()
@@ -946,7 +1130,7 @@ mod tests {
 
         for seed in 0..20 {
             let mut rng = ChaCha8Rng::seed_from_u64(seed);
-            let result = gumbel_mcts(&game, &config, &mut rng, &mut dummy_eval).unwrap();
+            let result = gumbel_mcts(&game, &config, &mut rng, None, &mut dummy_eval).unwrap();
 
             assert!(
                 result.action == (1, 0) || result.action == (2, 0),
@@ -1004,7 +1188,7 @@ mod tests {
         };
 
         let mut rng = ChaCha8Rng::seed_from_u64(0);
-        let result = gumbel_mcts(&game, &config, &mut rng, &mut dummy_eval).unwrap();
+        let result = gumbel_mcts(&game, &config, &mut rng, None, &mut dummy_eval).unwrap();
 
         // No single-placement win exists here, so depth-1 doesn't fire either.
         // Improved policy must therefore come from sequential halving — i.e.
@@ -1039,12 +1223,12 @@ mod tests {
         // Run 1: cache empty -> all real evals.
         crate::mcts::dedup_count::eval_cache_reset_tls();
         let mut rng1 = ChaCha8Rng::seed_from_u64(123);
-        let r1 = gumbel_mcts(&game, &config, &mut rng1, &mut dummy_eval).unwrap();
+        let r1 = gumbel_mcts(&game, &config, &mut rng1, None, &mut dummy_eval).unwrap();
         let (h1, m1, _) = crate::mcts::dedup_count::eval_cache_snapshot_tls();
 
         // Run 2: cache populated -> many cache hits, no resets.
         let mut rng2 = ChaCha8Rng::seed_from_u64(123);
-        let r2 = gumbel_mcts(&game, &config, &mut rng2, &mut dummy_eval).unwrap();
+        let r2 = gumbel_mcts(&game, &config, &mut rng2, None, &mut dummy_eval).unwrap();
         let (h2, m2, _) = crate::mcts::dedup_count::eval_cache_snapshot_tls();
 
         assert_eq!(r1.action, r2.action);
@@ -1093,7 +1277,7 @@ mod tests {
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
         let game = GameState::with_config(small_config());
-        let result = gumbel_mcts(&game, &config, &mut rng, &mut eval_fn);
+        let result = gumbel_mcts(&game, &config, &mut rng, None, &mut eval_fn);
         assert!(result.is_ok());
         // Just verify it completes — early termination is an optimization,
         // correctness is preserved regardless.
@@ -1117,7 +1301,7 @@ mod tests {
         };
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
-        let result = gumbel_mcts(&game, &config, &mut rng, &mut dummy_eval).unwrap();
+        let result = gumbel_mcts(&game, &config, &mut rng, None, &mut dummy_eval).unwrap();
         assert!(legal.contains(&result.action));
         let sum: f64 = result.improved_policy.iter().sum();
         assert!((sum - 1.0).abs() < 1e-6);
@@ -1150,7 +1334,7 @@ mod tests {
                 dummy_eval(states)
             };
         let mut rng = ChaCha8Rng::seed_from_u64(7);
-        let _ = gumbel_mcts(&game, &config_fused, &mut rng, &mut eval_fused).unwrap();
+        let _ = gumbel_mcts(&game, &config_fused, &mut rng, None, &mut eval_fused).unwrap();
         let fused = calls_fused.get();
         assert!(
             fused <= fused_expected_max,
@@ -1170,7 +1354,7 @@ mod tests {
                 dummy_eval(states)
             };
         let mut rng = ChaCha8Rng::seed_from_u64(7);
-        let _ = gumbel_mcts(&game, &config_serial, &mut rng, &mut eval_serial).unwrap();
+        let _ = gumbel_mcts(&game, &config_serial, &mut rng, None, &mut eval_serial).unwrap();
         let serial = calls_serial.get();
         assert!(
             serial >= fused,
@@ -1178,4 +1362,563 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------
+    // E.4-inject: joint p₂ candidate injection
+    // -----------------------------------------------------------------
+
+    /// Default `forced_candidate_capture_k = 0` must leave the legacy
+    /// search bit-identical: same action, same improved policy, same
+    /// candidate set, and `chosen_action_forced_candidates` empty.
+    /// Bonus guarantee: zero extra eval_fn calls. Anchors the disabled
+    /// path so the new field never silently grows side effects.
+    #[test]
+    fn e4_inject_capture_zero_bit_equivalent_to_legacy() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let game = GameState::with_config(small_config());
+        let cfg_off = MCTSConfig {
+            n_simulations: 16,
+            m_actions: 8,
+            c_visit: 50,
+            c_scale: 1.0,
+            virtual_loss: 0.0,
+            forced_candidate_capture_k: 0,
+            ..Default::default()
+        };
+
+        let counter1 = Rc::new(RefCell::new(0u32));
+        let cc1 = counter1.clone();
+        let mut counting_eval_1 = move |states: &[GameState]| {
+            *cc1.borrow_mut() += 1;
+            dummy_eval(states)
+        };
+
+        let mut rng1 = ChaCha8Rng::seed_from_u64(99);
+        let r_off = gumbel_mcts(&game, &cfg_off, &mut rng1, None, &mut counting_eval_1).unwrap();
+        let calls_off = *counter1.borrow();
+
+        // Run again with the legacy default (capture not set) using the
+        // same seed and confirm bit-equivalence.
+        let cfg_legacy = MCTSConfig {
+            n_simulations: 16,
+            m_actions: 8,
+            c_visit: 50,
+            c_scale: 1.0,
+            virtual_loss: 0.0,
+            ..Default::default()
+        };
+
+        let counter2 = Rc::new(RefCell::new(0u32));
+        let cc2 = counter2.clone();
+        let mut counting_eval_2 = move |states: &[GameState]| {
+            *cc2.borrow_mut() += 1;
+            dummy_eval(states)
+        };
+        let mut rng2 = ChaCha8Rng::seed_from_u64(99);
+        let r_legacy =
+            gumbel_mcts(&game, &cfg_legacy, &mut rng2, None, &mut counting_eval_2).unwrap();
+        let calls_legacy = *counter2.borrow();
+
+        assert_eq!(r_off.action, r_legacy.action);
+        assert_eq!(r_off.coords, r_legacy.coords);
+        assert_eq!(r_off.visit_counts, r_legacy.visit_counts);
+        for (a, b) in r_off
+            .improved_policy
+            .iter()
+            .zip(r_legacy.improved_policy.iter())
+        {
+            assert_eq!(a.to_bits(), b.to_bits(),
+                "improved_policy must be bit-identical");
+        }
+        assert_eq!(r_off.candidate_indices, r_legacy.candidate_indices);
+        assert_eq!(
+            r_off.chosen_action_forced_candidates,
+            Vec::<Coord>::new(),
+            "capture=0 must leave chosen_action_forced_candidates empty",
+        );
+        assert_eq!(
+            r_legacy.chosen_action_forced_candidates,
+            Vec::<Coord>::new(),
+            "legacy default must leave chosen_action_forced_candidates empty",
+        );
+        assert_eq!(calls_off, calls_legacy,
+            "capture=0 must do no extra eval_fn calls");
+    }
+
+    /// At a mr=1 root, capture is a no-op regardless of `capture_k`
+    /// because the next placement starts a new turn (opponent's). The
+    /// captured `chosen_action_forced_candidates` must be empty and the
+    /// extra eval batch must not run.
+    #[test]
+    fn e4_inject_no_capture_at_mr1() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        // Build a mr=1 state: P1's opening at (0,0), then play one P2
+        // stone so mr drops from 2 to 1 for P2.
+        let mut game = GameState::with_config(small_config());
+        let legal = game.legal_moves();
+        game.apply_move(legal[0]).unwrap();
+        assert_eq!(game.moves_remaining_this_turn(), 1);
+
+        let counter = Rc::new(RefCell::new(0u32));
+        let cc = counter.clone();
+        let mut counting_eval = move |states: &[GameState]| {
+            *cc.borrow_mut() += 1;
+            dummy_eval(states)
+        };
+
+        let cfg_on = MCTSConfig {
+            n_simulations: 32,
+            m_actions: 8,
+            c_visit: 50,
+            c_scale: 1.0,
+            virtual_loss: 0.0,
+            forced_candidate_capture_k: 4,
+            ..Default::default()
+        };
+
+        let mut rng = ChaCha8Rng::seed_from_u64(13);
+        let result = gumbel_mcts(&game, &cfg_on, &mut rng, None, &mut counting_eval).unwrap();
+        let calls_on = *counter.borrow();
+
+        assert!(
+            result.chosen_action_forced_candidates.is_empty(),
+            "mr=1 root must produce empty chosen_action_forced_candidates"
+        );
+
+        // Repeat with capture off and confirm the eval count matches.
+        let cfg_off = MCTSConfig {
+            forced_candidate_capture_k: 0,
+            ..cfg_on.clone()
+        };
+        *counter.borrow_mut() = 0;
+        let mut rng2 = ChaCha8Rng::seed_from_u64(13);
+        let _ = gumbel_mcts(&game, &cfg_off, &mut rng2, None, &mut counting_eval).unwrap();
+        let calls_off = *counter.borrow();
+        assert_eq!(
+            calls_on, calls_off,
+            "mr=1 capture must not do any extra eval_fn calls"
+        );
+    }
+
+    /// At a mr=2 root with `capture_k > 0` and `forced_candidates=None`,
+    /// the action and improved policy must be bit-identical to the
+    /// capture-off path (the extra eval happens but the result is
+    /// otherwise unchanged). `chosen_action_forced_candidates` is
+    /// non-empty and contains coords from the chosen action's post-state.
+    #[test]
+    fn e4_inject_capture_on_action_bit_identical_to_off() {
+        // Start-of-turn (mr=2) position with diverse legal moves so
+        // capture has multiple candidates to evaluate.
+        let cfg_game = GameConfig {
+            win_length: 4,
+            placement_radius: 2,
+            max_moves: 80,
+        };
+        let stones = vec![((0, 0), Player::P1)];
+        let game = GameState::from_state(&stones, Player::P2, 2, cfg_game);
+        assert_eq!(game.moves_remaining_this_turn(), 2);
+
+        let cfg_off = MCTSConfig {
+            n_simulations: 32,
+            m_actions: 8,
+            c_visit: 50,
+            c_scale: 1.0,
+            virtual_loss: 0.0,
+            forced_candidate_capture_k: 0,
+            ..Default::default()
+        };
+        let cfg_on = MCTSConfig {
+            forced_candidate_capture_k: 4,
+            ..cfg_off.clone()
+        };
+
+        let mut rng1 = ChaCha8Rng::seed_from_u64(77);
+        let r_off = gumbel_mcts(&game, &cfg_off, &mut rng1, None, &mut dummy_eval).unwrap();
+        let mut rng2 = ChaCha8Rng::seed_from_u64(77);
+        let r_on = gumbel_mcts(&game, &cfg_on, &mut rng2, None, &mut dummy_eval).unwrap();
+
+        assert_eq!(r_off.action, r_on.action,
+            "capture-on action must equal capture-off action when bonuses are not applied");
+        assert_eq!(r_off.coords, r_on.coords);
+        assert_eq!(r_off.visit_counts, r_on.visit_counts);
+        for (a, b) in r_off
+            .improved_policy
+            .iter()
+            .zip(r_on.improved_policy.iter())
+        {
+            assert_eq!(a.to_bits(), b.to_bits(),
+                "improved_policy must be bit-identical between capture-on and capture-off");
+        }
+        assert_eq!(r_off.candidate_indices, r_on.candidate_indices);
+
+        // Off path leaves the new field empty.
+        assert!(r_off.chosen_action_forced_candidates.is_empty());
+        // On path captures the chosen p₁'s top-K p₂s.
+        assert!(
+            !r_on.chosen_action_forced_candidates.is_empty(),
+            "capture-on must populate chosen_action_forced_candidates at mr=2"
+        );
+        assert!(
+            r_on.chosen_action_forced_candidates.len() <= 4,
+            "chosen_action_forced_candidates length must not exceed capture_k=4 (got {})",
+            r_on.chosen_action_forced_candidates.len(),
+        );
+    }
+
+    /// With a hand-crafted eval_fn that returns specific conditional priors
+    /// at each post-p₁ state, the captured top-K p₂s must equal the K
+    /// coords with the largest conditional priors at the chosen p₁'s
+    /// post-state. Tests the deterministic top-K-by-prior selection.
+    #[test]
+    fn e4_inject_capture_returns_correct_top_k_p2s() {
+        // Build a mr=2 position with a small legal-move set (so we know
+        // what coords appear). win_length=4, placement_radius=1 keeps
+        // legal moves down to a single ring around (0,0).
+        let cfg_game = GameConfig {
+            win_length: 4,
+            placement_radius: 1,
+            max_moves: 80,
+        };
+        let stones = vec![((0, 0), Player::P1)];
+        let game = GameState::from_state(&stones, Player::P2, 2, cfg_game);
+        assert_eq!(game.moves_remaining_this_turn(), 2);
+
+        // Pick a target post-p₁ coord we expect SH to select.
+        let legal = game.legal_moves();
+        assert!(legal.len() >= 4);
+        let target_p1 = legal[0];
+
+        // Designate which p₂ coords should have the highest priors when
+        // the post-p₁ state for `target_p1` is evaluated. We'll arrange
+        // logits so that {favored_a, favored_b, favored_c} have logit=10
+        // while all other p₂s have logit=0.
+        // The actual coord identities are determined by the post-state's
+        // legal_moves(); we'll query that and pick the first 3.
+        let mut target_game = game.clone();
+        target_game.apply_move(target_p1).unwrap();
+        let target_p2_legal = target_game.legal_moves();
+        assert!(target_p2_legal.len() >= 3,
+            "test setup: target_p1 post-state must have ≥3 legal p₂s");
+        let favored_a = target_p2_legal[0];
+        let favored_b = target_p2_legal[1];
+        let favored_c = target_p2_legal[2];
+
+        // eval_fn that heavily boosts the favored p₂s at any state whose
+        // stones contain target_p1 (and the original P1 opening). At the
+        // root and elsewhere, returns uniform logits.
+        let mut eval = move |states: &[GameState]| {
+            let mut all_logits = Vec::new();
+            let mut all_values = Vec::new();
+            for s in states {
+                let stones = s.stones();
+                let is_target_post = stones.contains_key(&target_p1);
+                let moves = s.legal_moves();
+                let logits: HashMap<Coord, f64> = moves
+                    .into_iter()
+                    .map(|m| {
+                        if is_target_post
+                            && (m == favored_a || m == favored_b || m == favored_c)
+                        {
+                            (m, 10.0)
+                        } else {
+                            (m, 0.0)
+                        }
+                    })
+                    .collect();
+                all_logits.push(logits);
+                all_values.push(0.0);
+            }
+            (all_logits, all_values)
+        };
+
+        // Force m_actions large enough that target_p1 (legal[0]) is in
+        // the Gumbel-Top-K. Also force enough sims that SH actually picks
+        // it. With uniform root logits and gumbel chooses what it chooses,
+        // we can't pin which p₁ SH picks — but we CAN verify that *if*
+        // the chosen action is `target_p1`, then the captured top-K p₂s
+        // are exactly {favored_a, favored_b, favored_c} (in some order;
+        // ranked by prior magnitude). We iterate seeds until we find one
+        // where SH picks target_p1, then assert.
+        let cfg = MCTSConfig {
+            n_simulations: 16,
+            m_actions: legal.len(), // all candidates Gumbel-Top-K survivors
+            c_visit: 50,
+            c_scale: 1.0,
+            virtual_loss: 0.0,
+            forced_candidate_capture_k: 3,
+            ..Default::default()
+        };
+
+        let mut found = false;
+        for seed in 0..200u64 {
+            let mut rng = ChaCha8Rng::seed_from_u64(seed);
+            let result = gumbel_mcts(&game, &cfg, &mut rng, None, &mut eval).unwrap();
+            if result.action != target_p1 {
+                continue;
+            }
+            // Capture should produce exactly the 3 favored p₂s.
+            let captured: std::collections::HashSet<Coord> =
+                result.chosen_action_forced_candidates.iter().copied().collect();
+            let expected: std::collections::HashSet<Coord> =
+                [favored_a, favored_b, favored_c].iter().copied().collect();
+            assert_eq!(
+                captured, expected,
+                "seed {seed}: captured top-3 must equal favored p₂ set (favored={favored_a:?},{favored_b:?},{favored_c:?}); got {:?}",
+                result.chosen_action_forced_candidates,
+            );
+            assert_eq!(
+                result.chosen_action_forced_candidates.len(),
+                3,
+                "seed {seed}: captured set length must equal capture_k=3"
+            );
+            found = true;
+            break;
+        }
+        assert!(found,
+            "test seed sweep failed to land on target_p1 — adjust seed range or m_actions");
+    }
+
+    /// When the chosen p₁ leads to a terminal post-state (own win via the
+    /// depth-1 shortcut), `chosen_action_forced_candidates` must be empty
+    /// — no priors are readable from a terminal state.
+    #[test]
+    fn e4_inject_no_capture_on_terminal_post_p1() {
+        // P2 already has 3 in a row; mr=2 means a single placement at
+        // (4,0) wins. The depth-1 shortcut catches this and returns
+        // immediately; the resulting MCTSResult must report an empty
+        // captured set regardless of capture_k.
+        let cfg_game = GameConfig {
+            win_length: 4,
+            placement_radius: 1,
+            max_moves: 80,
+        };
+        let stones = vec![
+            ((0, 0), Player::P1),
+            ((1, 0), Player::P2),
+            ((2, 0), Player::P2),
+            ((3, 0), Player::P2),
+        ];
+        let game = GameState::from_state(&stones, Player::P2, 2, cfg_game);
+        let win = (4, 0);
+        assert!(game.legal_moves().contains(&win));
+        let mut probe = game.clone();
+        probe.apply_move(win).unwrap();
+        assert!(probe.is_terminal());
+
+        let cfg = MCTSConfig {
+            n_simulations: 16,
+            m_actions: 64,
+            c_visit: 50,
+            c_scale: 1.0,
+            virtual_loss: 0.0,
+            forced_candidate_capture_k: 4,
+            ..Default::default()
+        };
+
+        let mut rng = ChaCha8Rng::seed_from_u64(0);
+        let result = gumbel_mcts(&game, &cfg, &mut rng, None, &mut dummy_eval).unwrap();
+        // The chosen action must be the win (depth-1 shortcut).
+        assert_eq!(result.action, win);
+        assert!(
+            result.chosen_action_forced_candidates.is_empty(),
+            "terminal-post-p₁ chosen action must leave captured set empty"
+        );
+    }
+
+    /// At a mr=1 root with `forced_candidates=Some(coords)` containing
+    /// coords that are NOT in the natural Gumbel-Top-K, the resulting
+    /// `candidate_indices` must include both forced coords' indices and
+    /// the lowest-Gumbel-scored non-forced candidates must be displaced.
+    /// Total candidate count remains `m_actions`.
+    #[test]
+    fn e4_inject_forced_candidates_displace_lowest_gumbel() {
+        // Build a mr=1 root. Use win_length=6, placement_radius=2 so the
+        // legal set is ~30 cells (large enough that m_actions < N and
+        // the lowest-Gumbel candidates are clearly distinguishable).
+        let cfg_game = GameConfig {
+            win_length: 6,
+            placement_radius: 2,
+            max_moves: 200,
+        };
+        // P1's opening at (0,0), one P2 stone, mr=1 means P2 has placed
+        // once and is on their second placement of the turn.
+        let stones = vec![
+            ((0, 0), Player::P1),
+            ((1, 0), Player::P2),
+        ];
+        let game = GameState::from_state(&stones, Player::P2, 1, cfg_game);
+        assert_eq!(game.moves_remaining_this_turn(), 1);
+
+        let legal = game.legal_moves();
+        let m = 8usize;
+        assert!(legal.len() >= m + 4,
+            "legal moves ({}) must exceed m+4 to leave room for displacement", legal.len());
+
+        // First run capture-off / no-forced to learn the natural
+        // Gumbel-Top-K. We use the same seed to inspect the natural
+        // candidate set, then construct forced coords that include both
+        // a member and a non-member to test merge behaviour.
+        let cfg = MCTSConfig {
+            n_simulations: 8,
+            m_actions: m,
+            c_visit: 50,
+            c_scale: 1.0,
+            virtual_loss: 0.0,
+            ..Default::default()
+        };
+
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let r_natural =
+            gumbel_mcts(&game, &cfg, &mut rng, None, &mut dummy_eval).unwrap();
+        let natural_candidates: std::collections::HashSet<Coord> =
+            r_natural.candidate_indices.iter().map(|&i| r_natural.coords[i]).collect();
+
+        // Pick 2 forced coords from outside the natural top-K, picking
+        // deterministically the first two non-members from `legal`.
+        let forced: Vec<Coord> = legal
+            .iter()
+            .copied()
+            .filter(|c| !natural_candidates.contains(c))
+            .take(2)
+            .collect();
+        assert_eq!(forced.len(), 2, "test setup: need 2 non-natural-candidate coords");
+
+        // Re-run with the same seed but forced_candidates=Some(forced).
+        let mut rng2 = ChaCha8Rng::seed_from_u64(42);
+        let r_forced =
+            gumbel_mcts(&game, &cfg, &mut rng2, Some(&forced), &mut dummy_eval).unwrap();
+
+        // Final candidate set must include both forced coords.
+        let final_candidates: std::collections::HashSet<Coord> =
+            r_forced.candidate_indices.iter().map(|&i| r_forced.coords[i]).collect();
+        for c in &forced {
+            assert!(
+                final_candidates.contains(c),
+                "forced coord {:?} must appear in candidate_indices; got {:?}",
+                c, final_candidates,
+            );
+        }
+
+        // Total candidate count must equal m (no growth).
+        assert_eq!(
+            r_forced.candidate_indices.len(),
+            m,
+            "forced injection must preserve candidate count = m_actions"
+        );
+        // No duplicates in candidate_indices.
+        let unique: std::collections::HashSet<usize> =
+            r_forced.candidate_indices.iter().copied().collect();
+        assert_eq!(unique.len(), r_forced.candidate_indices.len(),
+            "candidate_indices must have no duplicates");
+    }
+
+    /// When all forced coords are already in the natural Gumbel-Top-K,
+    /// passing them as `forced_candidates` must be a no-op: the final
+    /// candidate set (as a SET) is unchanged. No duplicates appear.
+    #[test]
+    fn e4_inject_forced_candidates_already_in_top_k_no_op() {
+        let cfg_game = GameConfig {
+            win_length: 6,
+            placement_radius: 2,
+            max_moves: 200,
+        };
+        let stones = vec![
+            ((0, 0), Player::P1),
+            ((1, 0), Player::P2),
+        ];
+        let game = GameState::from_state(&stones, Player::P2, 1, cfg_game);
+        assert_eq!(game.moves_remaining_this_turn(), 1);
+
+        let cfg = MCTSConfig {
+            n_simulations: 8,
+            m_actions: 8,
+            c_visit: 50,
+            c_scale: 1.0,
+            virtual_loss: 0.0,
+            ..Default::default()
+        };
+
+        let mut rng = ChaCha8Rng::seed_from_u64(99);
+        let r_natural =
+            gumbel_mcts(&game, &cfg, &mut rng, None, &mut dummy_eval).unwrap();
+        let natural_candidates: std::collections::HashSet<Coord> =
+            r_natural.candidate_indices.iter().map(|&i| r_natural.coords[i]).collect();
+
+        // Pick 2 coords that ARE in the natural top-K.
+        let forced: Vec<Coord> = natural_candidates.iter().copied().take(2).collect();
+        assert_eq!(forced.len(), 2);
+
+        // Re-run with the same seed but forced=Some(forced).
+        let mut rng2 = ChaCha8Rng::seed_from_u64(99);
+        let r_forced =
+            gumbel_mcts(&game, &cfg, &mut rng2, Some(&forced), &mut dummy_eval).unwrap();
+
+        // The set of candidates must be unchanged (the candidate_indices
+        // list order may shift if implementation chooses, but coord-set
+        // identity must hold).
+        let final_candidates: std::collections::HashSet<Coord> =
+            r_forced.candidate_indices.iter().map(|&i| r_forced.coords[i]).collect();
+        assert_eq!(
+            natural_candidates, final_candidates,
+            "forced coords already in top-K must produce unchanged candidate SET"
+        );
+        // No duplicates.
+        let unique: std::collections::HashSet<usize> =
+            r_forced.candidate_indices.iter().copied().collect();
+        assert_eq!(unique.len(), r_forced.candidate_indices.len(),
+            "candidate_indices must have no duplicates");
+    }
+
+    /// Passing `forced_candidates=Some(coords)` to a mr=2 root must be a
+    /// no-op (no injection, no Gumbel-draw differences). The mechanism is
+    /// only meaningful for the p₂ search (the mr=1 root). Same-seed runs
+    /// with and without forced_candidates must be bit-identical.
+    #[test]
+    fn e4_inject_forced_candidates_ignored_at_mr2() {
+        let cfg_game = GameConfig {
+            win_length: 6,
+            placement_radius: 2,
+            max_moves: 200,
+        };
+        let stones = vec![((0, 0), Player::P1)];
+        let game = GameState::from_state(&stones, Player::P2, 2, cfg_game);
+        assert_eq!(game.moves_remaining_this_turn(), 2);
+
+        let cfg = MCTSConfig {
+            n_simulations: 8,
+            m_actions: 8,
+            c_visit: 50,
+            c_scale: 1.0,
+            virtual_loss: 0.0,
+            ..Default::default()
+        };
+
+        // Pick 2 forced coords from legal moves (arbitrary).
+        let legal = game.legal_moves();
+        assert!(legal.len() >= 2);
+        let forced = vec![legal[0], legal[1]];
+
+        let mut rng1 = ChaCha8Rng::seed_from_u64(55);
+        let r_none = gumbel_mcts(&game, &cfg, &mut rng1, None, &mut dummy_eval).unwrap();
+        let mut rng2 = ChaCha8Rng::seed_from_u64(55);
+        let r_forced =
+            gumbel_mcts(&game, &cfg, &mut rng2, Some(&forced), &mut dummy_eval).unwrap();
+
+        assert_eq!(r_none.action, r_forced.action,
+            "forced_candidates at mr=2 must be a no-op");
+        assert_eq!(r_none.coords, r_forced.coords);
+        assert_eq!(r_none.visit_counts, r_forced.visit_counts);
+        assert_eq!(r_none.candidate_indices, r_forced.candidate_indices);
+        for (a, b) in r_none
+            .improved_policy
+            .iter()
+            .zip(r_forced.improved_policy.iter())
+        {
+            assert_eq!(a.to_bits(), b.to_bits(),
+                "mr=2 improved_policy must be bit-identical regardless of forced_candidates");
+        }
+    }
 }

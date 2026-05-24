@@ -39,4 +39,12 @@ pub struct MCTSConfig {
     /// 0.0 disables (no noise applied regardless of α). Standard AlphaZero
     /// uses 0.25. Ignored when `root_dirichlet_alpha == 0.0`.
     pub root_dirichlet_fraction: f64,
+    /// If > 0, at mr=2 roots, additionally batch-evaluates the post-p₁ state
+    /// for each Gumbel-Top-K candidate p₁ and exposes the *chosen* p₁'s
+    /// top-K p₂s by conditional prior in
+    /// `MCTSResult.chosen_action_forced_candidates`. The caller is expected
+    /// to pass these as `forced_candidates` to the next `gumbel_mcts` call
+    /// (the p₂ search). 0 (default) disables capture entirely (bit-equivalent
+    /// to current behaviour).
+    pub forced_candidate_capture_k: usize,
 }

@@ -1111,6 +1111,7 @@ fn reduced_sim_config(base: &MCTSConfig, divisor: u32) -> MCTSConfig {
         virtual_loss: base.virtual_loss,
         root_dirichlet_alpha: base.root_dirichlet_alpha,
         root_dirichlet_fraction: base.root_dirichlet_fraction,
+        forced_candidate_capture_k: base.forced_candidate_capture_k,
     }
 }
 
@@ -1212,7 +1213,7 @@ fn play_one_game(
         };
 
         let t = if profile { Some(Instant::now()) } else { None };
-        let result = match gumbel_mcts(&game, active_cfg, rng, &mut eval) {
+        let result = match gumbel_mcts(&game, active_cfg, rng, None, &mut eval) {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("MCTS failed: {e}, dropping game");
@@ -1614,6 +1615,11 @@ fn main() {
         virtual_loss,
         root_dirichlet_alpha,
         root_dirichlet_fraction,
+        // E.4-inject capture: not exposed as a self_play CLI flag.
+        // Self-play doesn't benefit from capture (the captured candidates
+        // would need to flow into the *next* search, which self-play
+        // doesn't track per-game-thread). Python eval harness uses it.
+        forced_candidate_capture_k: 0,
     });
 
     let batch_timeout = if batch_timeout_ms > 0 {

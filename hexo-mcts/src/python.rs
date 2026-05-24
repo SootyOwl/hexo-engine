@@ -271,6 +271,7 @@ impl PyMCTSConfig {
         virtual_loss=0.0,
         root_dirichlet_alpha=0.0,
         root_dirichlet_fraction=0.0,
+        forced_candidate_capture_k=0,
     ))]
     fn new(
         n_simulations: u32,
@@ -280,6 +281,7 @@ impl PyMCTSConfig {
         virtual_loss: f64,
         root_dirichlet_alpha: f64,
         root_dirichlet_fraction: f64,
+        forced_candidate_capture_k: usize,
     ) -> PyResult<Self> {
         if m_actions < 1 {
             return Err(PyValueError::new_err("m_actions must be >= 1"));
@@ -313,6 +315,7 @@ impl PyMCTSConfig {
                 virtual_loss,
                 root_dirichlet_alpha,
                 root_dirichlet_fraction,
+                forced_candidate_capture_k,
             },
         })
     }
@@ -328,6 +331,10 @@ impl PyMCTSConfig {
 ///
 /// Returns:
 ///     tuple[tuple[int,int], list[float]] — (action, improved_policy)
+///
+/// E.4-inject forced candidates: this wrapper does NOT expose
+/// `forced_candidates`. Callers that need the inject mechanism must use
+/// `gumbel_mcts_with_diagnostics`.
 #[pyfunction(name = "gumbel_mcts")]
 #[pyo3(signature = (game, eval_fn, config, seed=None))]
 fn py_gumbel_mcts(
@@ -388,7 +395,7 @@ fn py_gumbel_mcts(
         (logits_maps, values_raw)
     };
 
-    let result = gumbel_mcts::gumbel_mcts(&game.inner, &config.inner, &mut rng, &mut eval)
+    let result = gumbel_mcts::gumbel_mcts(&game.inner, &config.inner, &mut rng, None, &mut eval)
         .map_err(PyValueError::new_err)?;
 
     // Check if the eval callback encountered a Python error
@@ -471,7 +478,7 @@ fn py_gumbel_mcts_with_stats(
         (logits_maps, values_raw)
     };
 
-    let result = gumbel_mcts::gumbel_mcts(&game.inner, &config.inner, &mut rng, &mut eval)
+    let result = gumbel_mcts::gumbel_mcts(&game.inner, &config.inner, &mut rng, None, &mut eval)
         .map_err(PyValueError::new_err)?;
 
     if let Some(e) = eval_error {
@@ -483,8 +490,9 @@ fn py_gumbel_mcts_with_stats(
 
 /// Run Gumbel MCTS and return per-child diagnostics alongside the standard outputs.
 ///
-/// Extends `gumbel_mcts_with_stats` with three vectors aligned with the
-/// legal-move ordering returned by `GameState.legal_moves()`:
+/// Extends `gumbel_mcts_with_stats` with four vectors aligned with the
+/// legal-move ordering returned by `GameState.legal_moves()`, plus the
+/// E.4-inject capture output:
 ///
 /// - `per_child_q`: Q(root, action) from the root player's perspective.
 ///   Visited children use empirical Q; unvisited children use the `v_mix`
@@ -495,25 +503,32 @@ fn py_gumbel_mcts_with_stats(
 ///   mixing, before Gumbel noise and σ(Q) sharpening.
 /// - `candidate_indices`: indices into `legal_moves()` of the Gumbel-Top-K
 ///   survivors at the root (length `min(m_actions, len(legal_moves))`).
+/// - `chosen_action_forced_candidates`: at mr=2 roots with
+///   `forced_candidate_capture_k > 0`, the top-K p₂ coords (by conditional
+///   prior) for the chosen p₁'s post-state. Empty otherwise.
 ///
 /// Args:
 ///     game: hexo_rs.GameState (non-terminal)
 ///     eval_fn: callable(list[GameState]) -> tuple[list[list[float]], list[float]]
 ///     config: hexo_rs.MCTSConfig
 ///     seed: optional int for deterministic RNG
+///     forced_candidates: optional list of (q, r) coords (E.4-inject). When
+///         supplied at a mr=1 root, these coords are guaranteed to appear in
+///         the Gumbel-Top-K candidate set. Ignored at mr=2 roots.
 ///
 /// Returns:
-///     tuple[tuple[int,int], list[float], list[int], list[float], list[float], list[int]]
+///     tuple[tuple[int,int], list[float], list[int], list[float], list[float], list[int], list[tuple[int,int]]]
 ///       — (action, improved_policy, visit_counts, per_child_q, per_child_prior,
-///          candidate_indices)
+///          candidate_indices, chosen_action_forced_candidates)
 #[pyfunction(name = "gumbel_mcts_with_diagnostics")]
-#[pyo3(signature = (game, eval_fn, config, seed=None))]
+#[pyo3(signature = (game, eval_fn, config, seed=None, forced_candidates=None))]
 fn py_gumbel_mcts_with_diagnostics(
     py: Python<'_>,
     game: &PyGameState,
     eval_fn: Py<PyAny>,
     config: &PyMCTSConfig,
     seed: Option<u64>,
+    forced_candidates: Option<Vec<(i32, i32)>>,
 ) -> PyResult<(
     (i32, i32),
     Vec<f64>,
@@ -521,6 +536,7 @@ fn py_gumbel_mcts_with_diagnostics(
     Vec<f64>,
     Vec<f64>,
     Vec<usize>,
+    Vec<(i32, i32)>,
 )> {
     use rand::SeedableRng;
     use rand_chacha::ChaCha8Rng;
@@ -569,8 +585,15 @@ fn py_gumbel_mcts_with_diagnostics(
         (logits_maps, values_raw)
     };
 
-    let result = gumbel_mcts::gumbel_mcts(&game.inner, &config.inner, &mut rng, &mut eval)
-        .map_err(PyValueError::new_err)?;
+    let forced_ref: Option<&[Coord]> = forced_candidates.as_deref();
+    let result = gumbel_mcts::gumbel_mcts(
+        &game.inner,
+        &config.inner,
+        &mut rng,
+        forced_ref,
+        &mut eval,
+    )
+    .map_err(PyValueError::new_err)?;
 
     if let Some(e) = eval_error {
         return Err(e);
@@ -583,6 +606,7 @@ fn py_gumbel_mcts_with_diagnostics(
         result.per_child_q,
         result.per_child_prior,
         result.candidate_indices,
+        result.chosen_action_forced_candidates,
     ))
 }
 
@@ -946,7 +970,7 @@ fn py_batched_self_play(
                             };
 
                             let mcts_result = match gumbel_mcts::gumbel_mcts(
-                                &game, &effective_cfg, &mut rng, &mut eval_fn,
+                                &game, &effective_cfg, &mut rng, None, &mut eval_fn,
                             ) {
                                 Ok(r) => r,
                                 Err(_) => break, // terminal or no legal moves
