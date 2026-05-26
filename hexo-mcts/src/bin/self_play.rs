@@ -17,6 +17,14 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
+// Request channel uses crossbeam (MPMC): the `shared` inference-dispatch mode
+// clones one Receiver across N batcher workers so idle workers pull the next
+// batch, avoiding the round-robin load bifurcation. Per-request response
+// channels stay std mpsc (single-shot SPSC).
+use crossbeam_channel::{
+    Receiver as ReqReceiver, RecvTimeoutError as ReqRecvTimeoutError, Sender as ReqSender,
+    unbounded as req_unbounded,
+};
 #[cfg(feature = "torch")]
 use std::sync::mpsc::{SyncSender, TrySendError};
 use std::time::{Duration, Instant, SystemTime};
@@ -42,6 +50,31 @@ use rand_chacha::ChaCha8Rng;
 // ---------------------------------------------------------------------------
 
 static PROFILE_PLAY_ENABLED: AtomicBool = AtomicBool::new(false);
+
+// Opening-move exploration distribution toggle (set once from
+// `--exploration-distribution`). false (default) = sample ∝ improved_policy
+// π' (σ-sharpened completed-Q, near one-hot at low sims); true = sample ∝
+// root visit counts (paper-style, the broad Sequential-Halving staircase).
+// Read once per explored move (atomic load only when disabled).
+static EXPLORE_USE_VISIT_COUNTS: AtomicBool = AtomicBool::new(false);
+
+/// Build the sampling weights for an opening-exploration move.
+///
+/// `use_visit_counts == false` returns the improved policy π' (the default,
+/// matching prior HeXO behaviour). `true` returns the root visit counts cast
+/// to f64 (the Gumbel-AZ-paper acting distribution). Both are unnormalised;
+/// the caller normalises by the sum.
+fn exploration_weights(
+    improved_policy: &[f64],
+    visit_counts: &[u32],
+    use_visit_counts: bool,
+) -> Vec<f64> {
+    if use_visit_counts {
+        visit_counts.iter().map(|&n| n as f64).collect()
+    } else {
+        improved_policy.to_vec()
+    }
+}
 
 #[derive(Default)]
 struct PlayPerfCounters {
@@ -108,26 +141,41 @@ struct EvalRequest {
     response_tx: mpsc::Sender<(Vec<HashMap<Coord, f64>>, Vec<f64>)>,
 }
 
+/// How eval requests are distributed across the N inference batcher workers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DispatchMode {
+    /// Sender-side round-robin across N independent channels (one per worker).
+    /// Balances request *count*, not load — with variable per-batch service
+    /// time this is an unstable equilibrium: a transiently-slower worker
+    /// accumulates a deeper backlog → larger batches → slower, and so on,
+    /// bifurcating into one saturated worker + one starved tiny-batch worker.
+    RoundRobin,
+    /// One shared MPMC queue; every worker pulls the next available batch when
+    /// it frees up. Self-balances batch sizes (no per-worker affinity) while
+    /// preserving cross-worker latency hiding. Default for N>1.
+    Shared,
+}
+
 /// Handle held by game threads to submit eval requests.
 ///
-/// Holds one or more request channels — one per inference batcher worker.
-/// `evaluate()` does sender-side round-robin via a shared atomic counter,
-/// distributing requests evenly across workers so multiple Python
-/// inference subprocesses can hide each other's GPU sync latency.
+/// Holds one or more request channels. In [`DispatchMode::RoundRobin`] there is
+/// one channel per worker and `evaluate()` round-robins across them via a
+/// shared atomic counter. In [`DispatchMode::Shared`] there is a single channel
+/// (`request_txs.len() == 1`) feeding a queue that all workers pull from, so
+/// the counter trivially always selects index 0.
 ///
-/// At N=1 (the default), behaviour is observationally identical to the
-/// historical single-Sender client: the counter still increments but
-/// `index % 1 == 0`, so every request goes to the sole worker.
+/// At N=1 both modes — and the historical single-Sender client — are
+/// observationally identical: one channel, every request routed to it.
 #[derive(Clone)]
 struct InferenceClient {
-    request_txs: Arc<Vec<mpsc::Sender<EvalRequest>>>,
+    request_txs: Arc<Vec<ReqSender<EvalRequest>>>,
     counter: Arc<AtomicUsize>,
 }
 
 impl InferenceClient {
     /// Build a client over `request_txs.len()` worker channels. Panics if
     /// the vector is empty (callers always wire at least one worker).
-    fn new(request_txs: Vec<mpsc::Sender<EvalRequest>>) -> Self {
+    fn new(request_txs: Vec<ReqSender<EvalRequest>>) -> Self {
         assert!(
             !request_txs.is_empty(),
             "InferenceClient requires at least one worker channel"
@@ -150,12 +198,44 @@ impl InferenceClient {
     }
 }
 
+/// Build the request channels for `n_workers` inference batchers under the
+/// chosen [`DispatchMode`]. Returns `(client_txs, worker_rxs)` where
+/// `worker_rxs.len() == n_workers` (one receiver per batcher thread):
+///
+/// - [`DispatchMode::RoundRobin`]: `n_workers` independent channels; sender `i`
+///   goes to the client, receiver `i` to worker `i`.
+/// - [`DispatchMode::Shared`]: one channel; its single sender goes to the
+///   client and `n_workers` clones of the receiver go to the workers (crossbeam
+///   delivers each request to exactly one receiver, so workers pull-balance).
+fn build_inference_channels(
+    n_workers: usize,
+    dispatch: DispatchMode,
+) -> (Vec<ReqSender<EvalRequest>>, Vec<ReqReceiver<EvalRequest>>) {
+    match dispatch {
+        DispatchMode::RoundRobin => {
+            let mut txs = Vec::with_capacity(n_workers);
+            let mut rxs = Vec::with_capacity(n_workers);
+            for _ in 0..n_workers {
+                let (tx, rx) = req_unbounded::<EvalRequest>();
+                txs.push(tx);
+                rxs.push(rx);
+            }
+            (txs, rxs)
+        }
+        DispatchMode::Shared => {
+            let (tx, rx) = req_unbounded::<EvalRequest>();
+            let rxs = (0..n_workers).map(|_| rx.clone()).collect();
+            (vec![tx], rxs)
+        }
+    }
+}
+
 /// Run the inference server loop. Collects requests into batches and
 /// runs forward passes. Returns when all senders are dropped or `running`
 /// is set to false.
 #[cfg(feature = "torch")]
 fn inference_server(
-    request_rx: mpsc::Receiver<EvalRequest>,
+    request_rx: ReqReceiver<EvalRequest>,
     model: &mut TorchModel,
     max_batch: usize,
     batch_timeout: Duration,
@@ -181,7 +261,7 @@ fn inference_server(
         let t0 = Instant::now();
         let first = match request_rx.recv_timeout(Duration::from_millis(100)) {
             Ok(req) => req,
-            Err(mpsc::RecvTimeoutError::Timeout) => {
+            Err(ReqRecvTimeoutError::Timeout) => {
                 if !running.load(Ordering::Relaxed) {
                     break;
                 }
@@ -191,7 +271,7 @@ fn inference_server(
                 }
                 continue;
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(ReqRecvTimeoutError::Disconnected) => break,
         };
 
         // Collect more requests up to max_batch or timeout
@@ -274,7 +354,7 @@ fn inference_server(
 /// Run the inference server loop using a Python subprocess model.
 /// Same batching logic as `inference_server` but uses `SubprocessModel`.
 fn inference_server_subprocess(
-    request_rx: mpsc::Receiver<EvalRequest>,
+    request_rx: ReqReceiver<EvalRequest>,
     model: &mut SubprocessModel,
     max_batch: usize,
     batch_timeout: Duration,
@@ -285,7 +365,7 @@ fn inference_server_subprocess(
         // Block on first request (or check shutdown)
         let first = match request_rx.recv_timeout(Duration::from_millis(100)) {
             Ok(req) => req,
-            Err(mpsc::RecvTimeoutError::Timeout) => {
+            Err(ReqRecvTimeoutError::Timeout) => {
                 if !running.load(Ordering::Relaxed) {
                     break;
                 }
@@ -295,7 +375,7 @@ fn inference_server_subprocess(
                 }
                 continue;
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(ReqRecvTimeoutError::Disconnected) => break,
         };
 
         // Collect more requests up to max_batch or timeout
@@ -361,7 +441,7 @@ fn inference_server_subprocess(
 /// and waits for the pool loader to signal which checkpoint to load via a
 /// channel of file paths.
 fn pool_inference_server_subprocess(
-    request_rx: mpsc::Receiver<EvalRequest>,
+    request_rx: ReqReceiver<EvalRequest>,
     max_batch: usize,
     batch_timeout: Duration,
     running: &AtomicBool,
@@ -375,7 +455,7 @@ fn pool_inference_server_subprocess(
         Err(_) => return, // loader exited before producing a path
     };
 
-    let mut model = match SubprocessModel::spawn(python_bin, &first_path, model_args) {
+    let mut model = match SubprocessModel::spawn_labeled(python_bin, &first_path, model_args, "python pool") {
         Ok(m) => m,
         Err(e) => {
             eprintln!("Pool subprocess failed to spawn: {e}");
@@ -393,11 +473,11 @@ fn pool_inference_server_subprocess(
 
         let first = match request_rx.recv_timeout(Duration::from_millis(100)) {
             Ok(req) => req,
-            Err(mpsc::RecvTimeoutError::Timeout) => {
+            Err(ReqRecvTimeoutError::Timeout) => {
                 if !running.load(Ordering::Relaxed) { break; }
                 continue;
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(ReqRecvTimeoutError::Disconnected) => break,
         };
 
         let mut requests = vec![first];
@@ -599,7 +679,7 @@ fn try_replace<T>(tx: &SyncSender<T>, value: T) -> Result<(), TrySendError<T>> {
 /// gives up before staging anything (channel closed), the server exits
 /// cleanly without ever entering the main batch loop.
 fn pool_inference_server(
-    request_rx: mpsc::Receiver<EvalRequest>,
+    request_rx: ReqReceiver<EvalRequest>,
     max_batch: usize,
     batch_timeout: Duration,
     running: &AtomicBool,
@@ -627,13 +707,13 @@ fn pool_inference_server(
 
         let first = match request_rx.recv_timeout(Duration::from_millis(100)) {
             Ok(req) => req,
-            Err(mpsc::RecvTimeoutError::Timeout) => {
+            Err(ReqRecvTimeoutError::Timeout) => {
                 if !running.load(Ordering::Relaxed) {
                     break;
                 }
                 continue;
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(ReqRecvTimeoutError::Disconnected) => break,
         };
 
         let mut requests = vec![first];
@@ -1223,13 +1303,17 @@ fn play_one_game(
         let mcts_total_ns = t.map(|i| i.elapsed().as_nanos()).unwrap_or(0);
 
         let action = if move_count < exploration.load(Ordering::Relaxed) {
-            let policy = &result.improved_policy;
-            let total: f64 = policy.iter().sum();
+            let weights = exploration_weights(
+                &result.improved_policy,
+                &result.visit_counts,
+                EXPLORE_USE_VISIT_COUNTS.load(Ordering::Relaxed),
+            );
+            let total: f64 = weights.iter().sum();
             if total > 0.0 {
                 let r: f64 = rng.random::<f64>() * total;
                 let mut cumsum = 0.0;
                 let mut chosen = 0;
-                for (i, &p) in policy.iter().enumerate() {
+                for (i, &p) in weights.iter().enumerate() {
                     cumsum += p;
                     if cumsum >= r { chosen = i; break; }
                 }
@@ -1398,6 +1482,7 @@ fn main() {
     let mut exploration_max: Option<f64> = None; // adaptive exploration ceiling
     let mut exploration_window: u32 = 200; // EMA effective window for p1 decided rate
     let mut exploration_exponent: f64 = 1.0; // deviation curve: 1.0=linear, 2.0=squared
+    let mut exploration_distribution: String = "improved_policy".to_string(); // or "visit_counts"
     let mut draw_value: f32 = 0.0; // value target for drawn games (0.0=neutral, -0.1=penalty)
     let mut prune_empty_edges = false;
 
@@ -1412,6 +1497,12 @@ fn main() {
     // Only honored when --python-inference is set; the in-process torch
     // path is always single-worker.
     let mut python_inference_workers: usize = 1;
+    // How requests reach the N inference batchers. Default Shared (MPMC pull
+    // queue): idle workers pull the next batch, robust to any service-time
+    // asymmetry. Validated neutral vs round-robin on this APU (both workers
+    // ~67 graphs); strictly more general for future multi-GPU. Pass
+    // `--inference-dispatch round-robin` for the legacy push behaviour.
+    let mut inference_dispatch = DispatchMode::Shared;
     let mut checkpoint_path: Option<String> = None;
     let mut model_hidden_dim: usize = 256;
     let mut model_num_layers: usize = 3;
@@ -1419,6 +1510,8 @@ fn main() {
     let mut model_policy_hidden: usize = 128;
     let mut model_value_hidden: usize = 128;
     let mut model_conv_type = String::from("gine");
+    let mut model_use_jk: bool = false;
+    let mut model_jk_mode = String::from("sum");
 
     // Sequential Halving inner-loop fusion (virtual-loss leaf-parallel MCTS).
     // 0.0 = disabled (serial sims, current behaviour). 0.3–1.0 enables fusion.
@@ -1456,6 +1549,7 @@ fn main() {
             "--exploration-max" => { exploration_max = Some(args[i + 1].parse().unwrap()); i += 2; }
             "--exploration-window" => { exploration_window = args[i + 1].parse().unwrap(); i += 2; }
             "--exploration-exponent" => { exploration_exponent = args[i + 1].parse().unwrap(); i += 2; }
+            "--exploration-distribution" => { exploration_distribution = args[i + 1].clone(); i += 2; }
             "--draw-value" => { draw_value = args[i + 1].parse().unwrap(); i += 2; }
             "--output" => { output_path = args[i + 1].clone(); i += 2; }
             "--output-dir" => { output_dir = Some(args[i + 1].clone()); i += 2; }
@@ -1505,6 +1599,19 @@ fn main() {
                 }
                 i += 2;
             }
+            "--inference-dispatch" => {
+                inference_dispatch = match args[i + 1].as_str() {
+                    "round-robin" => DispatchMode::RoundRobin,
+                    "shared" => DispatchMode::Shared,
+                    other => {
+                        eprintln!(
+                            "--inference-dispatch must be 'round-robin' or 'shared', got '{other}'"
+                        );
+                        std::process::exit(1);
+                    }
+                };
+                i += 2;
+            }
             "--python-bin" => { python_bin = args[i + 1].clone(); i += 2; }
             "--checkpoint" => { checkpoint_path = Some(args[i + 1].clone()); i += 2; }
             "--model-hidden-dim" => { model_hidden_dim = args[i + 1].parse().unwrap(); i += 2; }
@@ -1513,6 +1620,8 @@ fn main() {
             "--model-policy-hidden" => { model_policy_hidden = args[i + 1].parse().unwrap(); i += 2; }
             "--model-value-hidden" => { model_value_hidden = args[i + 1].parse().unwrap(); i += 2; }
             "--model-conv-type" => { model_conv_type = args[i + 1].clone(); i += 2; }
+            "--model-use-jk" => { model_use_jk = true; i += 1; }
+            "--model-jk-mode" => { model_jk_mode = args[i + 1].clone(); i += 2; }
             "--virtual-loss" => {
                 virtual_loss = args[i + 1].parse().unwrap();
                 if !virtual_loss.is_finite() || virtual_loss < 0.0 {
@@ -1606,6 +1715,18 @@ fn main() {
 
     PROFILE_PLAY_ENABLED.store(profile_play, Ordering::Relaxed);
 
+    let explore_use_visit_counts = match exploration_distribution.as_str() {
+        "visit_counts" => true,
+        "improved_policy" => false,
+        other => {
+            eprintln!(
+                "--exploration-distribution must be 'improved_policy' or 'visit_counts', got {other:?}"
+            );
+            std::process::exit(1);
+        }
+    };
+    EXPLORE_USE_VISIT_COUNTS.store(explore_use_visit_counts, Ordering::Relaxed);
+
     let game_config = GameConfig { win_length, placement_radius: radius, max_moves };
     let mcts_config = Arc::new(MCTSConfig {
         n_simulations: n_sims,
@@ -1646,8 +1767,9 @@ fn main() {
             n_games, n_sims, m_actions, exploration, n_threads, omp_threads, max_batch, warmup_games,
         );
 
-        // Create inference channel (batch mode is always single-worker).
-        let (request_tx, request_rx) = mpsc::channel::<EvalRequest>();
+        // Create inference channel (batch mode is always single-worker, so
+        // dispatch mode is irrelevant — one channel either way).
+        let (request_tx, request_rx) = req_unbounded::<EvalRequest>();
         let client = InferenceClient::new(vec![request_tx]);
 
         // Each inference branch returns (all_games, measurement_elapsed).
@@ -1662,6 +1784,7 @@ fn main() {
                 model_policy_hidden, model_value_hidden,
                 &graph_type_str, &model_conv_type, device_str,
                 padded_inference,
+                model_use_jk, &model_jk_mode,
             );
             eprintln!("Spawning Python inference subprocess...");
             let mut model = SubprocessModel::spawn(&python_bin, ckpt, &model_args)
@@ -1771,20 +1894,20 @@ fn main() {
 
         let game_counter = Arc::new(AtomicU64::new(0));
 
-        // Create main inference channels — one per python_inference_workers.
-        // N=1 (default) is byte-for-byte equivalent to the historical
-        // single-Sender path. N>1 spawns N independent Python inference
-        // subprocesses; the InferenceClient round-robins requests across
-        // their batcher threads so multiple GPU forward passes can overlap.
+        // Create main inference channels — one batcher thread per
+        // python_inference_workers. N=1 (default) is byte-for-byte equivalent
+        // to the historical single-Sender path under either dispatch mode.
+        // N>1 spawns N Python inference subprocesses; `inference_dispatch`
+        // selects how requests reach their batcher threads:
+        //   RoundRobin — N channels, sender-side `fetch_add%N` (legacy default)
+        //   Shared     — one MPMC queue, workers pull-balance (see DispatchMode)
         let n_workers = python_inference_workers.max(1);
-        let mut main_request_txs: Vec<mpsc::Sender<EvalRequest>> = Vec::with_capacity(n_workers);
-        let mut main_request_rxs: Vec<Option<mpsc::Receiver<EvalRequest>>> =
-            Vec::with_capacity(n_workers);
-        for _ in 0..n_workers {
-            let (tx, rx) = mpsc::channel::<EvalRequest>();
-            main_request_txs.push(tx);
-            main_request_rxs.push(Some(rx));
-        }
+        let (main_request_txs, worker_rxs) =
+            build_inference_channels(n_workers, inference_dispatch);
+        // Wrap receivers in Option so the spawn loop / torch path can `.take()`
+        // each exactly once (unchanged downstream).
+        let mut main_request_rxs: Vec<Option<ReqReceiver<EvalRequest>>> =
+            worker_rxs.into_iter().map(Some).collect();
         let client = InferenceClient::new(main_request_txs);
 
         // Past-self opponent pool (optional, torch-only). Always single-worker.
@@ -1795,7 +1918,7 @@ fn main() {
         // can clone the client into game threads inside the scope.
         let (pool_client_opt, pool_request_rx_opt) =
             if pool_fraction > 0.0 && pool_dir.is_some() {
-                let (ptx, prx) = mpsc::channel::<EvalRequest>();
+                let (ptx, prx) = req_unbounded::<EvalRequest>();
                 (Some(InferenceClient::new(vec![ptx])), Some(prx))
             } else {
                 (None, None)
@@ -1808,11 +1931,16 @@ fn main() {
                 model_policy_hidden, model_value_hidden,
                 &graph_type_str, &model_conv_type, device_str,
                 padded_inference,
+                model_use_jk, &model_jk_mode,
             );
             if n_workers > 1 {
+                let dispatch_label = match inference_dispatch {
+                    DispatchMode::RoundRobin => "round-robin",
+                    DispatchMode::Shared => "shared queue",
+                };
                 eprintln!(
-                    "Spawning {} Python inference subprocesses (round-robin)...",
-                    n_workers,
+                    "Spawning {} Python inference subprocesses ({})...",
+                    n_workers, dispatch_label,
                 );
             } else {
                 eprintln!("Spawning Python inference subprocess...");
@@ -1822,7 +1950,11 @@ fn main() {
             // inside the thread scope below.
             let mut models: Vec<SubprocessModel> = Vec::with_capacity(n_workers);
             for wid in 0..n_workers {
-                match SubprocessModel::spawn(&python_bin, ckpt, &model_args) {
+                // Tag each worker's stderr (incl. its `[perf]` line) `[python wN]`
+                // so concurrent workers are distinguishable in the log. At N=1
+                // this is still `[python w0]`; harmless and explicit.
+                let label = format!("python w{wid}");
+                match SubprocessModel::spawn_labeled(&python_bin, ckpt, &model_args, &label) {
                     Ok(m) => models.push(m),
                     Err(e) => {
                         eprintln!("Failed to spawn Python inference worker {wid}: {e}");
@@ -1964,6 +2096,7 @@ fn main() {
 }
 
 /// Build the model args vector for `SubprocessModel::spawn`.
+#[allow(clippy::too_many_arguments)]
 fn subprocess_model_args(
     hidden_dim: usize,
     num_layers: usize,
@@ -1974,6 +2107,8 @@ fn subprocess_model_args(
     conv_type: &str,
     device: &str,
     padded_inference: bool,
+    use_jk: bool,
+    jk_mode: &str,
 ) -> Vec<String> {
     let mut v = vec![
         "--hidden-dim".into(), hidden_dim.to_string(),
@@ -1987,6 +2122,13 @@ fn subprocess_model_args(
     ];
     if padded_inference {
         v.push("--padded-inference".into());
+    }
+    // Only emit JK flags when JK is enabled — keeps the subprocess CLI
+    // byte-identical for the (overwhelming majority of) no-JK runs.
+    if use_jk {
+        v.push("--use-jk".into());
+        v.push("--jk-mode".into());
+        v.push(jk_mode.to_string());
     }
     v
 }
@@ -2360,6 +2502,31 @@ mod tests {
     }
 
     #[test]
+    fn exploration_weights_improved_policy_default() {
+        // Default (use_visit_counts=false): returns π' verbatim.
+        let pi = vec![0.7, 0.2, 0.1];
+        let visits = vec![30u32, 14, 6];
+        let w = exploration_weights(&pi, &visits, false);
+        assert_eq!(w, pi);
+    }
+
+    #[test]
+    fn exploration_weights_visit_counts() {
+        // use_visit_counts=true: returns visit counts cast to f64, NOT π'.
+        // This is the broad Sequential-Halving staircase the paper samples.
+        let pi = vec![0.99, 0.005, 0.005];
+        let visits = vec![30u32, 14, 6];
+        let w = exploration_weights(&pi, &visits, true);
+        assert_eq!(w, vec![30.0, 14.0, 6.0]);
+        // The two distributions are genuinely different: π' is near one-hot
+        // while the visit-count weights spread mass across the survivors.
+        let pi_top = pi[0] / pi.iter().sum::<f64>();
+        let vc_top = w[0] / w.iter().sum::<f64>();
+        assert!(pi_top > 0.9, "π' should be peaky, got {pi_top}");
+        assert!(vc_top < 0.7, "visit counts should be broad, got {vc_top}");
+    }
+
+    #[test]
     fn value_targets_win() {
         let game = GameState::with_config(small_game_config());
         let (g1, _) = build_position_graph(&game, GraphType::Hex, false);
@@ -2632,7 +2799,7 @@ mod tests {
     /// when `running` is cleared or when all senders are dropped.
     fn spawn_stub_batcher(
         worker_id: usize,
-        rx: mpsc::Receiver<EvalRequest>,
+        rx: ReqReceiver<EvalRequest>,
         running: Arc<AtomicBool>,
         seen: Arc<AtomicUsize>,
     ) -> std::thread::JoinHandle<()> {
@@ -2660,12 +2827,12 @@ mod tests {
                             .collect();
                         let _ = req.response_tx.send((logits, values));
                     }
-                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                    Err(ReqRecvTimeoutError::Timeout) => {
                         if !running.load(Ordering::Relaxed) {
                             break;
                         }
                     }
-                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(ReqRecvTimeoutError::Disconnected) => break,
                 }
             }
         })
@@ -2679,7 +2846,7 @@ mod tests {
         let running = Arc::new(AtomicBool::new(true));
         let seen = Arc::new(AtomicUsize::new(0));
 
-        let (tx, rx) = mpsc::channel::<EvalRequest>();
+        let (tx, rx) = req_unbounded::<EvalRequest>();
         let stub = spawn_stub_batcher(0, rx, running.clone(), seen.clone());
 
         let client = InferenceClient::new(vec![tx]);
@@ -2706,11 +2873,11 @@ mod tests {
         // round-robin pattern starting from 0: [0,1,2,0,1,2].
         let running = Arc::new(AtomicBool::new(true));
 
-        let mut txs: Vec<mpsc::Sender<EvalRequest>> = Vec::new();
+        let mut txs: Vec<ReqSender<EvalRequest>> = Vec::new();
         let mut handles: Vec<std::thread::JoinHandle<()>> = Vec::new();
         let mut seens: Vec<Arc<AtomicUsize>> = Vec::new();
         for wid in 0..3 {
-            let (tx, rx) = mpsc::channel::<EvalRequest>();
+            let (tx, rx) = req_unbounded::<EvalRequest>();
             let seen = Arc::new(AtomicUsize::new(0));
             handles.push(spawn_stub_batcher(wid, rx, running.clone(), seen.clone()));
             txs.push(tx);
@@ -2749,10 +2916,10 @@ mod tests {
         const N_CALLS: usize = 50;
 
         let running = Arc::new(AtomicBool::new(true));
-        let mut txs: Vec<mpsc::Sender<EvalRequest>> = Vec::new();
+        let mut txs: Vec<ReqSender<EvalRequest>> = Vec::new();
         let mut handles: Vec<std::thread::JoinHandle<()>> = Vec::new();
         for wid in 0..N_WORKERS {
-            let (tx, rx) = mpsc::channel::<EvalRequest>();
+            let (tx, rx) = req_unbounded::<EvalRequest>();
             let seen = Arc::new(AtomicUsize::new(0));
             handles.push(spawn_stub_batcher(wid, rx, running.clone(), seen));
             txs.push(tx);
@@ -2798,10 +2965,10 @@ mod tests {
         // regressions.
         const N_WORKERS: usize = 3;
         let running = Arc::new(AtomicBool::new(true));
-        let mut txs: Vec<mpsc::Sender<EvalRequest>> = Vec::new();
+        let mut txs: Vec<ReqSender<EvalRequest>> = Vec::new();
         let mut handles: Vec<std::thread::JoinHandle<()>> = Vec::new();
         for wid in 0..N_WORKERS {
-            let (tx, rx) = mpsc::channel::<EvalRequest>();
+            let (tx, rx) = req_unbounded::<EvalRequest>();
             let seen = Arc::new(AtomicUsize::new(0));
             handles.push(spawn_stub_batcher(wid, rx, running.clone(), seen));
             txs.push(tx);
@@ -2828,5 +2995,80 @@ mod tests {
             assert!(remaining > Duration::ZERO, "worker {i} exceeded shutdown deadline");
             h.join().expect("stub batcher must exit cleanly");
         }
+    }
+
+    #[test]
+    fn test_build_inference_channels_shapes() {
+        // RoundRobin: one channel per worker (N senders, N receivers).
+        let (txs, rxs) = build_inference_channels(3, DispatchMode::RoundRobin);
+        assert_eq!(txs.len(), 3, "round-robin: one sender per worker");
+        assert_eq!(rxs.len(), 3, "round-robin: one receiver per worker");
+
+        // Shared: a single sender feeding N cloned receivers off one queue.
+        let (txs, rxs) = build_inference_channels(3, DispatchMode::Shared);
+        assert_eq!(txs.len(), 1, "shared: single sender");
+        assert_eq!(rxs.len(), 3, "shared: one receiver clone per worker");
+
+        // N=1 is identical under both modes.
+        for mode in [DispatchMode::RoundRobin, DispatchMode::Shared] {
+            let (txs, rxs) = build_inference_channels(1, mode);
+            assert_eq!(txs.len(), 1);
+            assert_eq!(rxs.len(), 1);
+        }
+    }
+
+    #[test]
+    fn test_shared_dispatch_pull_balances_no_crosstalk() {
+        // Shared mode: 3 stub batchers pull from ONE queue (the client holds a
+        // single sender). Every request must be served exactly once with its
+        // sentinel intact (no crosstalk, no drops), and the load must spread
+        // across more than one worker — the property round-robin can't
+        // guarantee under skewed service time but a pull queue gives for free.
+        const N_WORKERS: usize = 3;
+        const N_THREADS: usize = 8;
+        const N_CALLS: usize = 100;
+
+        let running = Arc::new(AtomicBool::new(true));
+        let (txs, rxs) = build_inference_channels(N_WORKERS, DispatchMode::Shared);
+        assert_eq!(txs.len(), 1);
+
+        let mut handles = Vec::new();
+        let mut seens: Vec<Arc<AtomicUsize>> = Vec::new();
+        for (wid, rx) in rxs.into_iter().enumerate() {
+            let seen = Arc::new(AtomicUsize::new(0));
+            handles.push(spawn_stub_batcher(wid, rx, running.clone(), seen.clone()));
+            seens.push(seen);
+        }
+
+        let client = InferenceClient::new(txs);
+
+        let mut callers: Vec<std::thread::JoinHandle<usize>> = Vec::new();
+        for tid in 0..N_THREADS {
+            let client = client.clone();
+            callers.push(std::thread::spawn(move || {
+                let mut ok = 0usize;
+                for i in 0..N_CALLS {
+                    let sentinel = tid * N_CALLS + i + 1;
+                    let (_logits, values) =
+                        client.evaluate(vec![dummy_graph_with_sentinel(sentinel)]);
+                    let echoed = (values[0] as u64 >> 32) as usize;
+                    assert_eq!(echoed, sentinel, "shared dispatch crosstalk/drop");
+                    ok += 1;
+                }
+                ok
+            }));
+        }
+        let total_ok: usize = callers.into_iter().map(|h| h.join().unwrap()).sum();
+        assert_eq!(total_ok, N_THREADS * N_CALLS, "every request served once");
+
+        drop(client);
+        running.store(false, Ordering::Relaxed);
+        for h in handles { h.join().expect("stub batcher must exit"); }
+
+        let total_seen: usize = seens.iter().map(|s| s.load(Ordering::Relaxed)).sum();
+        assert_eq!(total_seen, N_THREADS * N_CALLS, "no requests lost");
+        let workers_used = seens.iter().filter(|s| s.load(Ordering::Relaxed) > 0).count();
+        assert!(workers_used > 1,
+            "shared queue should spread load across workers, used {workers_used}");
     }
 }

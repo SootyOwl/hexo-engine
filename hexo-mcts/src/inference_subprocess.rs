@@ -49,11 +49,26 @@ pub struct SubprocessModel {
 }
 
 impl SubprocessModel {
-    /// Spawn the Python inference subprocess.
+    /// Spawn the Python inference subprocess (stderr tagged `[python]`).
     ///
     /// Waits up to 600 seconds for the "READY" signal on stderr (torch.compile
     /// can take minutes on first run).
     pub fn spawn(python_bin: &str, model_path: &str, model_args: &[String]) -> Result<Self, String> {
+        Self::spawn_labeled(python_bin, model_path, model_args, "python")
+    }
+
+    /// Like [`spawn`](Self::spawn) but tags every stderr line `[{label}]`
+    /// instead of `[python]`, so logs from multiple concurrent inference
+    /// workers (e.g. `python w0`, `python w1`) are distinguishable. Keep
+    /// `python` in the label so existing log greps still match.
+    pub fn spawn_labeled(
+        python_bin: &str,
+        model_path: &str,
+        model_args: &[String],
+        label: &str,
+    ) -> Result<Self, String> {
+        let startup_label = label.to_string();
+        let drain_label = label.to_string();
         let mut child = Command::new(python_bin)
             .args(["-m", "hexo_a0.inference_server", "--checkpoint", model_path])
             .args(model_args)
@@ -86,7 +101,7 @@ impl SubprocessModel {
                     Ok(0) => break,  // EOF
                     Ok(_) => {
                         let trimmed = line.trim();
-                        eprintln!("[python] {trimmed}");
+                        eprintln!("[{startup_label}] {trimmed}");
                         if trimmed == "READY" {
                             let _ = tx.send(Ok(reader));
                             return;
@@ -120,7 +135,7 @@ impl SubprocessModel {
                 line.clear();
                 match reader.read_line(&mut line) {
                     Ok(0) => break,
-                    Ok(_) => eprintln!("[python] {}", line.trim()),
+                    Ok(_) => eprintln!("[{drain_label}] {}", line.trim()),
                     Err(_) => break,
                 }
             }
