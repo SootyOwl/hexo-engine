@@ -214,7 +214,7 @@ where
         if game.moves_remaining_this_turn() == 1 && !forced.is_empty() {
             use rand_distr::{Distribution, Uniform};
             let uniform = Uniform::new(1e-20, 1.0 - 1e-20).unwrap();
-            let mut sample_gumbel = |rng: &mut R| -> f64 {
+            let sample_gumbel = |rng: &mut R| -> f64 {
                 let u: f64 = uniform.sample(rng);
                 -(-u.ln()).ln()
             };
