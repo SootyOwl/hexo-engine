@@ -1458,6 +1458,8 @@ fn main() {
     let mut max_moves: u32 = 200;
     let mut n_sims: u32 = 8;
     let mut m_actions: usize = 8;
+    let mut c_visit: u32 = 50;
+    let mut c_scale: f64 = 1.0;
     let mut exploration: usize = 16;
     let mut exploration_fraction: Option<f64> = None;
     let mut output_path = "trajectories.json".to_string();
@@ -1544,6 +1546,8 @@ fn main() {
             "--max-moves" => { max_moves = args[i + 1].parse().unwrap(); i += 2; }
             "--sims" => { n_sims = args[i + 1].parse().unwrap(); i += 2; }
             "--m-actions" => { m_actions = args[i + 1].parse().unwrap(); i += 2; }
+            "--c-visit" => { c_visit = args[i + 1].parse().unwrap(); i += 2; }
+            "--c-scale" => { c_scale = args[i + 1].parse().unwrap(); i += 2; }
             "--exploration" => { exploration = args[i + 1].parse().unwrap(); i += 2; }
             "--exploration-fraction" => { exploration_fraction = Some(args[i + 1].parse().unwrap()); i += 2; }
             "--exploration-max" => { exploration_max = Some(args[i + 1].parse().unwrap()); i += 2; }
@@ -1731,8 +1735,8 @@ fn main() {
     let mcts_config = Arc::new(MCTSConfig {
         n_simulations: n_sims,
         m_actions,
-        c_visit: 50,
-        c_scale: 1.0,
+        c_visit,
+        c_scale,
         virtual_loss,
         root_dirichlet_alpha,
         root_dirichlet_fraction,
@@ -1763,8 +1767,8 @@ fn main() {
     if !continuous {
         // --- Batch mode ---
         eprintln!(
-            "Playing {} games (sims={}, m={}, explore={}, threads={}, omp={}, max_batch={}, warmup={})...",
-            n_games, n_sims, m_actions, exploration, n_threads, omp_threads, max_batch, warmup_games,
+            "Playing {} games (sims={}, m={}, c_visit={}, c_scale={}, explore={}, threads={}, omp={}, max_batch={}, warmup={})...",
+            n_games, n_sims, m_actions, c_visit, c_scale, exploration, n_threads, omp_threads, max_batch, warmup_games,
         );
 
         // Create inference channel (batch mode is always single-worker, so
