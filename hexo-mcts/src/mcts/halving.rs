@@ -127,6 +127,15 @@ where
         // fusion alone +6% games/s (within noise), fusion + vl=0.5 +19%
         // games/s. Moves/game trended longer under fusion but n=50 is too
         // small to call it. Path gated pending SPRT vs serial.
+        //
+        // NOTE: `virtual_loss` is EFFECTIVELY BOOLEAN — only its sign matters,
+        // not its magnitude (verified 2026-06-05, docs/research/2026-06-05-vl-
+        // fidelity). `apply_virtual_loss` diversifies via a magnitude-blind
+        // `visit_count += 1` feeding the Gumbel Eq.7 count penalty
+        // `N(a)/(1+sum_N)` (see select.rs); the `value_sum -= magnitude` channel
+        // is washed out by min-max Q normalisation + tiny sigma at low visits.
+        // So fused fidelity-vs-serial is a step function, flat across vl 0.001..25.
+        // (Unlike PUCT, where VL magnitude tunes parallel-descent repulsion.)
         if config.virtual_loss > 0.0 {
             let mut batch_actions: Vec<Coord> =
                 Vec::with_capacity(sims_per_action as usize * remaining.len());
