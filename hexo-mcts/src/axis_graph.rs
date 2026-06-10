@@ -14,7 +14,8 @@ use hexo_engine::GameState;
 /// Raw axis-window graph data ready to be wrapped into PyG Data on the Python side.
 #[derive(serde::Serialize)]
 pub struct AxisGraphData {
-    /// Node features, flattened: (N+1)×8 row-major (includes dummy node).
+    /// Node features, flattened: (N+1)×8 row-major (includes dummy node);
+    /// (N+1)×12 with threat features (dummy node keeps zeros in dims 8-11).
     pub features: Vec<f32>,
     /// Edge source indices.
     pub edge_src: Vec<i64>,
@@ -57,7 +58,9 @@ fn build_axis_graph(
     moves_feat: f32,
     win_length: u8,
     prune_empty_edges: bool,
+    threat_features: bool,
 ) -> AxisGraphData {
+    let fdim: usize = if threat_features { 12 } else { 8 };
     debug_assert!(win_length >= 2, "win_length must be >= 2, got {win_length}");
     let n_stones = stones.len();
     let n_legal = legal.len();
@@ -108,13 +111,13 @@ fn build_axis_graph(
 
     let stone_coords: Vec<Coord> = stones.iter().map(|&(c, _)| c).collect();
 
-    // --- Node features (N+1)×8 ---
+    // --- Node features (N+1)×fdim ---
 
-    let mut features = vec![0.0f32; n * 8];
+    let mut features = vec![0.0f32; n * fdim];
 
     // Stone features
     for (i, &(_, player)) in stones.iter().enumerate() {
-        let base = i * 8;
+        let base = i * fdim;
         match player {
             Player::P1 => features[base] = 1.0,
             Player::P2 => features[base + 1] = 1.0,
@@ -131,7 +134,7 @@ fn build_axis_graph(
     // Legal move features
     for j in 0..n_legal {
         let idx = n_stones + j;
-        let base = idx * 8;
+        let base = idx * fdim;
         features[base + 2] = 1.0; // empty one-hot
         features[base + 3] = player_feat;
         features[base + 4] = moves_feat;
@@ -150,7 +153,8 @@ fn build_axis_graph(
     }
 
     // Dummy node features: [0,0,0, player_feat, moves_feat, 0, 0, 0]
-    let dummy_base = dummy_idx * 8;
+    // (threat dims 8-11, if present, stay zero for the dummy node)
+    let dummy_base = dummy_idx * fdim;
     features[dummy_base + 3] = player_feat;
     features[dummy_base + 4] = moves_feat;
 
@@ -314,11 +318,16 @@ fn build_axis_graph(
 
 /// Build axis-window graph arrays from a GameState.
 pub fn game_to_axis_graph_raw(game: &GameState) -> AxisGraphData {
-    game_to_axis_graph_raw_opts(game, false)
+    game_to_axis_graph_raw_opts(game, false, false)
 }
 
-/// Build axis-window graph arrays with optional empty-edge pruning.
-pub fn game_to_axis_graph_raw_opts(game: &GameState, prune_empty_edges: bool) -> AxisGraphData {
+/// Build axis-window graph arrays with optional empty-edge pruning and
+/// optional 12-dim threat-encoding node features.
+pub fn game_to_axis_graph_raw_opts(
+    game: &GameState,
+    prune_empty_edges: bool,
+    threat_features: bool,
+) -> AxisGraphData {
     let mut stones = game.placed_stones();
     stones.sort_by_key(|&(coord, _)| coord);
     let legal = game.legal_moves(); // already sorted by engine
@@ -330,18 +339,40 @@ pub fn game_to_axis_graph_raw_opts(game: &GameState, prune_empty_edges: bool) ->
     let moves_feat: f32 = game.moves_remaining_this_turn() as f32 / 2.0;
     let win_length = game.config().win_length;
 
-    build_axis_graph(&stones, &legal, player_feat, moves_feat, win_length, prune_empty_edges)
+    let mut g = build_axis_graph(
+        &stones,
+        &legal,
+        player_feat,
+        moves_feat,
+        win_length,
+        prune_empty_edges,
+        threat_features,
+    );
+    if threat_features {
+        // Real nodes only — the dummy node (last) keeps zeros in dims 8-11.
+        let n_real = g.num_nodes - 1;
+        crate::graph::fill_threat_features(&mut g.features, &g.coords, n_real, game);
+    }
+    g
 }
 
 /// Build axis-window graph arrays for a batch of game states in parallel.
 pub fn game_to_axis_graph_batch(games: &[GameState]) -> Vec<AxisGraphData> {
-    game_to_axis_graph_batch_opts(games, false)
+    game_to_axis_graph_batch_opts(games, false, false)
 }
 
-/// Build axis-window graph arrays for a batch with optional empty-edge pruning.
-pub fn game_to_axis_graph_batch_opts(games: &[GameState], prune_empty_edges: bool) -> Vec<AxisGraphData> {
+/// Build axis-window graph arrays for a batch with optional empty-edge
+/// pruning and optional 12-dim threat-encoding node features.
+pub fn game_to_axis_graph_batch_opts(
+    games: &[GameState],
+    prune_empty_edges: bool,
+    threat_features: bool,
+) -> Vec<AxisGraphData> {
     use rayon::prelude::*;
-    games.par_iter().map(|g| game_to_axis_graph_raw_opts(g, prune_empty_edges)).collect()
+    games
+        .par_iter()
+        .map(|g| game_to_axis_graph_raw_opts(g, prune_empty_edges, threat_features))
+        .collect()
 }
 
 /// Produce 11 augmented axis-window graphs by applying the non-identity D6
@@ -387,7 +418,8 @@ pub fn augment_axis_graph_opts(game: &GameState, prune_empty_edges: bool) -> Vec
             let t_legal: Vec<Coord> = indexed_legal.iter().map(|&(c, _)| c).collect();
             let permutation: Vec<usize> = indexed_legal.iter().map(|&(_, i)| i).collect();
 
-            let graph = build_axis_graph(&t_stones, &t_legal, player_feat, moves_feat, win_length, prune_empty_edges);
+            // augmentation path does not support threat_features; always 8-dim
+            let graph = build_axis_graph(&t_stones, &t_legal, player_feat, moves_feat, win_length, prune_empty_edges, false);
             (graph, permutation)
         })
         .collect()
@@ -439,6 +471,32 @@ mod tests {
         assert_eq!(g.num_nodes, n_stones + n_legal + 1);
         assert_eq!(g.features.len(), g.num_nodes * 8);
         assert_eq!(g.coords.len(), g.num_nodes * 2);
+    }
+
+    #[test]
+    fn threat_features_widen_to_12() {
+        let game = small_game();
+        let g = game_to_axis_graph_raw_opts(&game, false, true);
+        assert_eq!(g.features.len(), g.num_nodes * 12);
+        let g8 = game_to_axis_graph_raw_opts(&game, false, false);
+        assert_eq!(g8.features.len(), g8.num_nodes * 8);
+        for node in 0..g8.num_nodes {
+            for d in 0..8 {
+                assert_eq!(g.features[node * 12 + d], g8.features[node * 8 + d]);
+            }
+        }
+        let dummy = g.num_nodes - 1;
+        for d in 8..12 {
+            assert_eq!(g.features[dummy * 12 + d], 0.0);
+        }
+        // Threat dims must actually be written: node 0 is the lone P1 stone at
+        // origin and P2 is to move ("own" = P2). The stone counts itself in a
+        // P2-clean window, so opp_max_line (dim 9) = 1/win_length = 1/4.
+        assert_eq!(
+            g.features[0 * 12 + 9],
+            0.25,
+            "threat dims must be populated for real nodes"
+        );
     }
 
     // AC-1b: All axis edges have |signed_distance| <= win_length

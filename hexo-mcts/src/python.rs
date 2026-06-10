@@ -679,7 +679,7 @@ fn py_game_to_axis_graph_raw(py: Python<'_>, game: &PyGameState, prune_empty_edg
         ));
     }
 
-    let g = crate::axis_graph::game_to_axis_graph_raw_opts(&game.inner, prune_empty_edges);
+    let g = crate::axis_graph::game_to_axis_graph_raw_opts(&game.inner, prune_empty_edges, false);
 
     let dict = pyo3::types::PyDict::new(py);
     dict.set_item("features", g.features)?;
@@ -718,7 +718,7 @@ fn py_game_to_axis_graph_batch(
         .collect::<PyResult<Vec<_>>>()?;
 
     // Parallel graph construction (no GIL needed — pure Rust)
-    let graphs = crate::axis_graph::game_to_axis_graph_batch_opts(&states, prune_empty_edges);
+    let graphs = crate::axis_graph::game_to_axis_graph_batch_opts(&states, prune_empty_edges, false);
 
     graphs
         .into_iter()

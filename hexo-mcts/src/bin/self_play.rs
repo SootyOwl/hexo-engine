@@ -1141,7 +1141,7 @@ fn build_position_graph(
 ) -> (GraphOutput, GraphTensors) {
     match graph_type {
         GraphType::Axis => {
-            let g = game_to_axis_graph_raw_opts(game, prune_empty_edges);
+            let g = game_to_axis_graph_raw_opts(game, prune_empty_edges, false);
             let t = GraphTensors::from_axis(&g);
             (GraphOutput::Axis(g), t)
         }
@@ -1255,7 +1255,7 @@ fn play_one_game(
                 // Leaf evals: build graphs on this game thread (CPU work)
                 let gs: Vec<_> = states.iter().map(|s| {
                     match graph_type {
-                        GraphType::Axis => GraphTensors::from(game_to_axis_graph_raw_opts(s, prune_empty_edges)),
+                        GraphType::Axis => GraphTensors::from(game_to_axis_graph_raw_opts(s, prune_empty_edges, false)),
                         GraphType::Hex => GraphTensors::from(game_to_graph_raw(s)),
                     }
                 }).collect();

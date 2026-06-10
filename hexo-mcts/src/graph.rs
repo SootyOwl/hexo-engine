@@ -13,7 +13,7 @@ use hexo_engine::GameState;
 /// Raw graph data ready to be wrapped into PyG Data on the Python side.
 #[derive(serde::Serialize)]
 pub struct GraphData {
-    /// Node features, flattened: N×8 row-major.
+    /// Node features, flattened: N×8 row-major (N×12 with threat features).
     pub features: Vec<f32>,
     /// Edge source indices.
     pub edge_src: Vec<i64>,
@@ -42,19 +42,24 @@ pub struct GraphData {
 ///   - Placed stones first, sorted by (q, r)
 ///   - Legal moves next, sorted by (q, r)
 ///
-/// Node features (8-dim):
+/// Node features (8-dim, or 12-dim when `threat_features` is set):
 ///   [0:3] Stone-type one-hot: [1,0,0]=P1, [0,1,0]=P2, [0,0,1]=empty
 ///   [3]   Current player: +1.0 if P1, -1.0 if P2
 ///   [4]   Moves remaining this turn / 2.0
 ///   [5]   Normalised q (relative to stone centroid)
 ///   [6]   Normalised r (relative to stone centroid)
 ///   [7]   Inverse distance to nearest stone (0 for stones themselves)
+///   [8:12] (optional) threat encoding, filled by `fill_threat_features`:
+///          [own_max_line, opp_max_line, own_threat_axes, opp_threat_axes]
+///          where "own" = current player to move. Zero-initialised here.
 fn build_graph(
     stones: &[(Coord, Player)],
     legal: &[Coord],
     player_feat: f32,
     moves_feat: f32,
+    threat_features: bool,
 ) -> GraphData {
+    let fdim: usize = if threat_features { 12 } else { 8 };
     let n_stones = stones.len();
     let n_legal = legal.len();
     let n = n_stones + n_legal;
@@ -88,12 +93,12 @@ fn build_graph(
     // Stone coords as a vec for fast nearest-stone lookup
     let stone_coords: Vec<Coord> = stones.iter().map(|&(c, _)| c).collect();
 
-    // Features (flattened N×8)
-    let mut features = vec![0.0f32; n * 8];
+    // Features (flattened N×fdim)
+    let mut features = vec![0.0f32; n * fdim];
 
     // Stone features
     for (i, &(_, player)) in stones.iter().enumerate() {
-        let base = i * 8;
+        let base = i * fdim;
         match player {
             Player::P1 => features[base] = 1.0,
             Player::P2 => features[base + 1] = 1.0,
@@ -110,7 +115,7 @@ fn build_graph(
     // Legal move features
     for j in 0..n_legal {
         let idx = n_stones + j;
-        let base = idx * 8;
+        let base = idx * fdim;
         features[base + 2] = 1.0; // empty one-hot
         features[base + 3] = player_feat;
         features[base + 4] = moves_feat;
@@ -193,11 +198,41 @@ fn build_graph(
     }
 }
 
+/// Fill threat-encoding dims 8-11 for the first `n_real` nodes of a 12-dim
+/// feature array. Dims 8-11 = [own_max_line, opp_max_line, own_threat_axes,
+/// opp_threat_axes], own = current player to move.
+///
+/// `features` must have stride 12 and `coords` must be the matching flat
+/// (q, r) array for the graph's node ordering.
+pub(crate) fn fill_threat_features(
+    features: &mut [f32],
+    coords: &[i32],
+    n_real: usize,
+    game: &GameState,
+) {
+    let to_move = game
+        .current_player()
+        .expect("fill_threat_features called on terminal GameState; current_player is None");
+    let wl = game.config().win_length;
+    let stone_map = game.stones();
+    for idx in 0..n_real {
+        let c = (coords[idx * 2], coords[idx * 2 + 1]);
+        let tf = hexo_engine::threat::node_threat_features(stone_map, c, to_move, wl);
+        let base = idx * 12;
+        features[base + 8..base + 12].copy_from_slice(&tf);
+    }
+}
+
 /// Build graph arrays from a GameState.
 ///
 /// Extracts stones, legal moves, and global features from the game state,
 /// then delegates to `build_graph`.
 pub fn game_to_graph_raw(game: &GameState) -> GraphData {
+    game_to_graph_raw_opts(game, false)
+}
+
+/// Build graph arrays with optional 12-dim threat-encoding node features.
+pub fn game_to_graph_raw_opts(game: &GameState, threat_features: bool) -> GraphData {
     let mut stones = game.placed_stones();
     stones.sort_by_key(|&(coord, _)| coord);
     let legal = game.legal_moves(); // already sorted by engine
@@ -208,7 +243,12 @@ pub fn game_to_graph_raw(game: &GameState) -> GraphData {
     };
     let moves_feat: f32 = game.moves_remaining_this_turn() as f32 / 2.0;
 
-    build_graph(&stones, &legal, player_feat, moves_feat)
+    let mut g = build_graph(&stones, &legal, player_feat, moves_feat, threat_features);
+    if threat_features {
+        // hex graph has no dummy node; all num_nodes are real
+        fill_threat_features(&mut g.features, &g.coords, g.num_nodes, game);
+    }
+    g
 }
 
 /// Apply all 11 non-identity D6 transforms to produce augmented graphs.
@@ -244,7 +284,8 @@ pub fn augment_graph(
             let t_legal: Vec<Coord> = indexed_legal.iter().map(|&(c, _)| c).collect();
             let permutation: Vec<usize> = indexed_legal.iter().map(|&(_, i)| i).collect();
 
-            let graph = build_graph(&t_stones, &t_legal, player_feat, moves_feat);
+            // augmentation path does not support threat_features; always 8-dim
+            let graph = build_graph(&t_stones, &t_legal, player_feat, moves_feat, false);
             (graph, permutation)
         })
         .collect()
@@ -278,6 +319,28 @@ mod tests {
         assert_eq!(g.num_nodes, expected);
         assert_eq!(g.features.len(), expected * 8);
         assert_eq!(g.coords.len(), expected * 2);
+    }
+
+    #[test]
+    fn threat_features_widen_to_12_hex() {
+        let game = small_game();
+        let g = game_to_graph_raw_opts(&game, true);
+        assert_eq!(g.features.len(), g.num_nodes * 12);
+        let g8 = game_to_graph_raw_opts(&game, false);
+        assert_eq!(g8.features.len(), g8.num_nodes * 8);
+        for node in 0..g8.num_nodes {
+            for d in 0..8 {
+                assert_eq!(g.features[node * 12 + d], g8.features[node * 8 + d]);
+            }
+        }
+        // Threat dims must actually be written: node 0 is the lone P1 stone at
+        // origin and P2 is to move ("own" = P2). The stone counts itself in a
+        // P2-clean window, so opp_max_line (dim 9) = 1/win_length = 1/4.
+        assert_eq!(
+            g.features[0 * 12 + 9],
+            0.25,
+            "threat dims must be populated for real nodes"
+        );
     }
 
     #[test]
@@ -422,7 +485,7 @@ mod tests {
     fn self_loops_present() {
         let stones = vec![((0, 0), Player::P1)];
         let legal = vec![(1, 0), (0, 1)];
-        let graph = build_graph(&stones, &legal, 1.0, 0.5);
+        let graph = build_graph(&stones, &legal, 1.0, 0.5, false);
 
         let n = graph.num_nodes;
         assert_eq!(n, 3);

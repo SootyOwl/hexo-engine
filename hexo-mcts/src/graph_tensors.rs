@@ -18,7 +18,7 @@ pub enum GraphType {
 
 /// Raw graph tensors for one game state.
 pub struct GraphTensors {
-    pub features: Vec<f32>,    // N*8 flat
+    pub features: Vec<f32>,    // N*fdim flat (8, or 12 with threat features)
     pub edge_src: Vec<i64>,
     pub edge_dst: Vec<i64>,
     pub edge_attr: Option<Vec<f32>>,  // E*5 flat, only for axis graphs
@@ -99,7 +99,7 @@ pub fn build_axis_graph_tensors(game: &GameState) -> GraphTensors {
 
 /// Build axis graph tensors with optional empty-edge pruning.
 pub fn build_axis_graph_tensors_opts(game: &GameState, prune_empty_edges: bool) -> GraphTensors {
-    let axis_data = game_to_axis_graph_raw_opts(game, prune_empty_edges);
+    let axis_data = game_to_axis_graph_raw_opts(game, prune_empty_edges, false);
 
     // Extract legal_coords from coords + legal_mask
     let legal_coords: Vec<Coord> = axis_data.legal_mask
