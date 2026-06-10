@@ -1669,19 +1669,6 @@ fn main() {
         std::process::exit(1);
     }
 
-    // The subprocess wire protocol (inference_subprocess.rs + Python
-    // inference_server.py) hardcodes 8-dim node features and carries no
-    // feature-dim field in its header; 12-dim threat graphs would be
-    // silently misparsed. Fail loudly until the protocol learns fdim.
-    if threat_features && python_inference {
-        eprintln!(
-            "--threat-features is not yet supported with --python-inference \
-             (subprocess wire protocol assumes 8-dim node features). \
-             Use in-process torch inference."
-        );
-        std::process::exit(1);
-    }
-
     // python_inference_workers > 1 is only meaningful for the Python
     // subprocess inference path. The in-process torch path always shares a
     // single TorchModel, so multiple batchers would just serialise on it.
@@ -1807,6 +1794,7 @@ fn main() {
                 &graph_type_str, &model_conv_type, device_str,
                 padded_inference,
                 model_use_jk, &model_jk_mode,
+                threat_features,
             );
             eprintln!("Spawning Python inference subprocess...");
             let mut model = SubprocessModel::spawn(&python_bin, ckpt, &model_args)
@@ -1956,6 +1944,7 @@ fn main() {
                 &graph_type_str, &model_conv_type, device_str,
                 padded_inference,
                 model_use_jk, &model_jk_mode,
+                threat_features,
             );
             if n_workers > 1 {
                 let dispatch_label = match inference_dispatch {
@@ -2121,6 +2110,10 @@ fn main() {
     }
 }
 
+/// Node-feature dim of threat-encoding graphs. Must match `fdim` in
+/// hexo-mcts/src/graph.rs (`build_graph`): 8 base dims + 4 threat dims.
+const THREAT_NODE_DIM: usize = 12;
+
 /// Build the model args vector for `SubprocessModel::spawn`.
 #[allow(clippy::too_many_arguments)]
 fn subprocess_model_args(
@@ -2135,6 +2128,7 @@ fn subprocess_model_args(
     padded_inference: bool,
     use_jk: bool,
     jk_mode: &str,
+    threat_features: bool,
 ) -> Vec<String> {
     let mut v = vec![
         "--hidden-dim".into(), hidden_dim.to_string(),
@@ -2155,6 +2149,14 @@ fn subprocess_model_args(
         v.push("--use-jk".into());
         v.push("--jk-mode".into());
         v.push(jk_mode.to_string());
+    }
+    // 12-dim threat-feature graphs need the server to build the model with
+    // node_features=12 and warm up with matching inputs. The server defaults
+    // to 8, so only emit the flag for threat runs (keeps the CLI byte-identical
+    // for plain 8-dim runs).
+    if threat_features {
+        v.push("--node-dim".into());
+        v.push(THREAT_NODE_DIM.to_string());
     }
     v
 }

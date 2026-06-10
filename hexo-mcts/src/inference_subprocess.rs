@@ -33,7 +33,11 @@ use hexo_engine::types::Coord;
 use crate::graph_tensors::GraphTensors;
 
 const MAGIC: u32 = 0x48583034;
-const VERSION: u8 = 1;
+/// Protocol version. v2 added a `node_dim: u8` field to the forward-message
+/// header (after `has_edge_attr`) so non-8-dim node features (e.g. 12-dim
+/// threat features) survive the wire. Both sides always come from the same
+/// checkout (the binary spawns the server), so no rolling compat is needed.
+const VERSION: u8 = 2;
 const MSG_FORWARD: u8 = 0x01;
 const MSG_RELOAD: u8 = 0x02;
 const MSG_SHUTDOWN: u8 = 0xFF;
@@ -175,21 +179,33 @@ impl SubprocessModel {
             total_edges += g.num_edges as u32;
         }
 
+        // Node-feature dim, derived per batch from the graph tensors. Batch
+        // uniformity is guaranteed upstream (all graphs in a request come from
+        // the same builder config); the debug_assert catches drift in tests.
+        let node_dim = graphs
+            .iter()
+            .find(|g| g.num_nodes > 0)
+            .map_or(8, |g| g.features.len() / g.num_nodes);
+        debug_assert!(
+            graphs.iter().all(|g| g.features.len() == g.num_nodes * node_dim),
+            "node feature dim must be uniform across the batch"
+        );
+
         // --- Build request into a single contiguous buffer ---
         //
-        // Layout: header (19 bytes) + features (N×8×4) + edge_src (E×8) +
+        // Layout: header (20 bytes) + features (N×node_dim×4) + edge_src (E×8) +
         //         edge_dst (E×8) + [edge_attr (E×5×4)] + legal_mask (N) +
         //         stone_mask (N) + batch (N×4)
-        let feat_bytes = total_nodes as usize * 8 * 4;
+        let feat_bytes = total_nodes as usize * node_dim * 4;
         let edge_idx_bytes = total_edges as usize * 8 * 2; // src + dst
         let edge_attr_bytes = if has_edge_attr { total_edges as usize * 5 * 4 } else { 0 };
         let mask_bytes = total_nodes as usize * 2; // legal + stone
         let batch_bytes = total_nodes as usize * 4;
-        let buf_size = 19 + feat_bytes + edge_idx_bytes + edge_attr_bytes + mask_bytes + batch_bytes;
+        let buf_size = 20 + feat_bytes + edge_idx_bytes + edge_attr_bytes + mask_bytes + batch_bytes;
 
         let mut buf = Vec::with_capacity(buf_size);
 
-        // Header (19 bytes)
+        // Header (20 bytes)
         buf.extend_from_slice(&MAGIC.to_le_bytes());
         buf.push(VERSION);
         buf.push(MSG_FORWARD);
@@ -197,6 +213,7 @@ impl SubprocessModel {
         buf.extend_from_slice(&total_edges.to_le_bytes());
         buf.extend_from_slice(&num_graphs.to_le_bytes());
         buf.push(has_edge_attr as u8);
+        buf.push(u8::try_from(node_dim).expect("node_dim exceeds u8"));
 
         // Features: copy each graph's feature slab as raw bytes
         for g in &graphs {
