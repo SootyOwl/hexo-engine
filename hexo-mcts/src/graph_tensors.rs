@@ -18,7 +18,7 @@ pub enum GraphType {
 
 /// Raw graph tensors for one game state.
 pub struct GraphTensors {
-    pub features: Vec<f32>,    // N*fdim flat (8, or 12 with threat features)
+    pub features: Vec<f32>,    // N*fdim flat (7/8 base, +4 with threat features)
     pub edge_src: Vec<i64>,
     pub edge_dst: Vec<i64>,
     pub edge_attr: Option<Vec<f32>>,  // E*5 flat, only for axis graphs
@@ -101,10 +101,11 @@ pub fn build_axis_graph_tensors(game: &GameState) -> GraphTensors {
 ///
 /// Only reachable via `TorchModel::build_graphs`/`evaluate` (the legacy
 /// `native_self_play` PyO3 path); the self_play binary builds its graphs on
-/// game threads with the threaded `--threat-features` flag instead, so this
-/// path stays 8-dim (threat_features = false).
+/// game threads with the threaded `--threat-features` / `--relative-stones`
+/// flags instead, so this path stays 8-dim absolute (threat_features = false,
+/// relative_stones = false).
 pub fn build_axis_graph_tensors_opts(game: &GameState, prune_empty_edges: bool) -> GraphTensors {
-    let axis_data = game_to_axis_graph_raw_opts(game, prune_empty_edges, false);
+    let axis_data = game_to_axis_graph_raw_opts(game, prune_empty_edges, false, false);
 
     // Extract legal_coords from coords + legal_mask
     let legal_coords: Vec<Coord> = axis_data.legal_mask

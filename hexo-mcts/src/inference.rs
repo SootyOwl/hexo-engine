@@ -142,8 +142,9 @@ impl TorchModel {
         }
         record_shape(total_nodes, total_edges);
 
-        // Node feature dim: 8 baseline, 12 with threat features. Derive from
-        // the actual graphs so --threat-features batches reshape correctly.
+        // Node feature dim: 7/8 base (relative/absolute stones), +4 with
+        // threat features. Derive from the actual graphs so non-8-dim batches
+        // reshape correctly.
         let fdim = graphs[0].features.len() / graphs[0].num_nodes.max(1);
         debug_assert!(
             graphs.iter().all(|g| g.features.len() / g.num_nodes.max(1) == fdim),
@@ -377,8 +378,8 @@ impl TorchModel {
         debug_assert!(ghost_nodes >= 1);
         debug_assert!(ghost_edges >= 1);
 
-        // Node feature dim: 8 baseline, 12 with threat features (ghost-node
-        // padding features stay all-zero either way).
+        // Node feature dim: 7/8 base (relative/absolute stones), +4 with
+        // threat features (ghost-node padding features stay all-zero either way).
         let fdim = graphs[0].features.len() / graphs[0].num_nodes.max(1);
         debug_assert!(
             graphs.iter().all(|g| g.features.len() / g.num_nodes.max(1) == fdim),

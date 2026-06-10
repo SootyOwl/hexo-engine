@@ -14,8 +14,10 @@ use hexo_engine::GameState;
 /// Raw axis-window graph data ready to be wrapped into PyG Data on the Python side.
 #[derive(serde::Serialize)]
 pub struct AxisGraphData {
-    /// Node features, flattened: (N+1)×8 row-major (includes dummy node);
-    /// (N+1)×12 with threat features (dummy node keeps zeros in dims 8-11).
+    /// Node features, flattened row-major, including the dummy node. Per-node
+    /// width is 8 (absolute) or 7 (`relative_stones`: to_move dropped), +4
+    /// with threat features — i.e. (N+1)×{7,8,11,12}. The dummy node keeps
+    /// zeros in the threat dims.
     pub features: Vec<f32>,
     /// Edge source indices.
     pub edge_src: Vec<i64>,
@@ -59,8 +61,17 @@ fn build_axis_graph(
     win_length: u8,
     prune_empty_edges: bool,
     threat_features: bool,
+    relative_stones: bool,
 ) -> AxisGraphData {
-    let fdim: usize = if threat_features { 12 } else { 8 };
+    // Node-feature layout mirrors graph.rs::build_graph: 8-dim absolute base
+    // or 7-dim side-to-move-relative base (own/opp one-hot, to_move dropped),
+    // +4 optional threat dims.
+    let base_dim: usize = if relative_stones { 7 } else { 8 };
+    let fdim: usize = base_dim + if threat_features { 4 } else { 0 };
+    let off: usize = usize::from(!relative_stones);
+    // Terminal fallback matches the absolute to_move fill: player_feat = -1.0
+    // when current_player() is None → own = P2.
+    let own_is_p1 = player_feat > 0.0;
     debug_assert!(win_length >= 2, "win_length must be >= 2, got {win_length}");
     let n_stones = stones.len();
     let n_legal = legal.len();
@@ -118,17 +129,25 @@ fn build_axis_graph(
     // Stone features
     for (i, &(_, player)) in stones.iter().enumerate() {
         let base = i * fdim;
-        match player {
-            Player::P1 => features[base] = 1.0,
-            Player::P2 => features[base + 1] = 1.0,
+        let col = if relative_stones {
+            // 0 = own (side to move), 1 = opp
+            usize::from((player == Player::P1) != own_is_p1)
+        } else {
+            match player {
+                Player::P1 => 0,
+                Player::P2 => 1,
+            }
+        };
+        features[base + col] = 1.0;
+        if !relative_stones {
+            features[base + 3] = player_feat;
         }
-        features[base + 3] = player_feat;
-        features[base + 4] = moves_feat;
+        features[base + 3 + off] = moves_feat;
         let q = coords[i * 2] as f64;
         let r = coords[i * 2 + 1] as f64;
-        features[base + 5] = ((q - centroid_q) / spread) as f32;
-        features[base + 6] = ((r - centroid_r) / spread) as f32;
-        // features[base + 7] = 0.0 (stones)
+        features[base + 4 + off] = ((q - centroid_q) / spread) as f32;
+        features[base + 5 + off] = ((r - centroid_r) / spread) as f32;
+        // features[base + 6 + off] = 0.0 (stones)
     }
 
     // Legal move features
@@ -136,12 +155,14 @@ fn build_axis_graph(
         let idx = n_stones + j;
         let base = idx * fdim;
         features[base + 2] = 1.0; // empty one-hot
-        features[base + 3] = player_feat;
-        features[base + 4] = moves_feat;
+        if !relative_stones {
+            features[base + 3] = player_feat;
+        }
+        features[base + 3 + off] = moves_feat;
         let q = coords[idx * 2] as f64;
         let r = coords[idx * 2 + 1] as f64;
-        features[base + 5] = ((q - centroid_q) / spread) as f32;
-        features[base + 6] = ((r - centroid_r) / spread) as f32;
+        features[base + 4 + off] = ((q - centroid_q) / spread) as f32;
+        features[base + 5 + off] = ((r - centroid_r) / spread) as f32;
 
         let coord = legal[j];
         let min_d = stone_coords
@@ -149,14 +170,18 @@ fn build_axis_graph(
             .map(|&sc| hex_distance(coord, sc))
             .min()
             .unwrap_or(1);
-        features[base + 7] = 1.0 / min_d.max(1) as f32;
+        features[base + 6 + off] = 1.0 / min_d.max(1) as f32;
     }
 
-    // Dummy node features: [0,0,0, player_feat, moves_feat, 0, 0, 0]
-    // (threat dims 8-11, if present, stay zero for the dummy node)
+    // Dummy node features carry the global scalars, no one-hot. Absolute
+    // layout: [0,0,0, player_feat, moves_feat, 0, 0, 0]; relative layout:
+    // [0,0,0, moves_feat, 0, 0, 0] (to_move doesn't exist in the relative
+    // frame). Threat dims, if present, stay zero in both modes.
     let dummy_base = dummy_idx * fdim;
-    features[dummy_base + 3] = player_feat;
-    features[dummy_base + 4] = moves_feat;
+    if !relative_stones {
+        features[dummy_base + 3] = player_feat;
+    }
+    features[dummy_base + 3 + off] = moves_feat;
 
     // --- Masks ---
 
@@ -318,15 +343,18 @@ fn build_axis_graph(
 
 /// Build axis-window graph arrays from a GameState.
 pub fn game_to_axis_graph_raw(game: &GameState) -> AxisGraphData {
-    game_to_axis_graph_raw_opts(game, false, false)
+    game_to_axis_graph_raw_opts(game, false, false, false)
 }
 
-/// Build axis-window graph arrays with optional empty-edge pruning and
-/// optional 12-dim threat-encoding node features.
+/// Build axis-window graph arrays with optional empty-edge pruning, optional
+/// threat-encoding node features, and optional side-to-move-relative
+/// (own/opp) stone one-hots. Node dim: 8 (absolute), 7 (relative),
+/// 12 (absolute + threat), 11 (relative + threat).
 pub fn game_to_axis_graph_raw_opts(
     game: &GameState,
     prune_empty_edges: bool,
     threat_features: bool,
+    relative_stones: bool,
 ) -> AxisGraphData {
     let mut stones = game.placed_stones();
     stones.sort_by_key(|&(coord, _)| coord);
@@ -347,31 +375,35 @@ pub fn game_to_axis_graph_raw_opts(
         win_length,
         prune_empty_edges,
         threat_features,
+        relative_stones,
     );
     if threat_features {
-        // Real nodes only — the dummy node (last) keeps zeros in dims 8-11.
+        // Real nodes only — the dummy node (last) keeps zeros in the threat dims.
         let n_real = g.num_nodes - 1;
-        crate::graph::fill_threat_features(&mut g.features, &g.coords, n_real, game);
+        let base_dim = if relative_stones { 7 } else { 8 };
+        crate::graph::fill_threat_features(&mut g.features, &g.coords, n_real, game, base_dim);
     }
     g
 }
 
 /// Build axis-window graph arrays for a batch of game states in parallel.
 pub fn game_to_axis_graph_batch(games: &[GameState]) -> Vec<AxisGraphData> {
-    game_to_axis_graph_batch_opts(games, false, false)
+    game_to_axis_graph_batch_opts(games, false, false, false)
 }
 
 /// Build axis-window graph arrays for a batch with optional empty-edge
-/// pruning and optional 12-dim threat-encoding node features.
+/// pruning, optional threat-encoding node features, and optional
+/// side-to-move-relative stone one-hots.
 pub fn game_to_axis_graph_batch_opts(
     games: &[GameState],
     prune_empty_edges: bool,
     threat_features: bool,
+    relative_stones: bool,
 ) -> Vec<AxisGraphData> {
     use rayon::prelude::*;
     games
         .par_iter()
-        .map(|g| game_to_axis_graph_raw_opts(g, prune_empty_edges, threat_features))
+        .map(|g| game_to_axis_graph_raw_opts(g, prune_empty_edges, threat_features, relative_stones))
         .collect()
 }
 
@@ -418,8 +450,9 @@ pub fn augment_axis_graph_opts(game: &GameState, prune_empty_edges: bool) -> Vec
             let t_legal: Vec<Coord> = indexed_legal.iter().map(|&(c, _)| c).collect();
             let permutation: Vec<usize> = indexed_legal.iter().map(|&(_, i)| i).collect();
 
-            // augmentation path does not support threat_features; always 8-dim
-            let graph = build_axis_graph(&t_stones, &t_legal, player_feat, moves_feat, win_length, prune_empty_edges, false);
+            // augmentation path does not support threat_features or
+            // relative_stones; always 8-dim absolute
+            let graph = build_axis_graph(&t_stones, &t_legal, player_feat, moves_feat, win_length, prune_empty_edges, false, false);
             (graph, permutation)
         })
         .collect()
@@ -476,9 +509,9 @@ mod tests {
     #[test]
     fn threat_features_widen_to_12() {
         let game = small_game();
-        let g = game_to_axis_graph_raw_opts(&game, false, true);
+        let g = game_to_axis_graph_raw_opts(&game, false, true, false);
         assert_eq!(g.features.len(), g.num_nodes * 12);
-        let g8 = game_to_axis_graph_raw_opts(&game, false, false);
+        let g8 = game_to_axis_graph_raw_opts(&game, false, false, false);
         assert_eq!(g8.features.len(), g8.num_nodes * 8);
         for node in 0..g8.num_nodes {
             for d in 0..8 {
@@ -497,6 +530,105 @@ mod tests {
             0.25,
             "threat dims must be populated for real nodes"
         );
+    }
+
+    #[test]
+    fn relative_stones_layout_axis() {
+        // mid_game: P1 to move next? Trace: P2,P1,P2,P1,P2 turns → P1 to move.
+        // Use both the initial position (P2 to move) and mid_game (P1 to move)
+        // to verify the own/opp flip.
+        let game = small_game(); // P2 to move; lone P1 stone at origin
+        let g = game_to_axis_graph_raw_opts(&game, false, false, true);
+        assert_eq!(g.features.len(), g.num_nodes * 7);
+        // Node 0 = P1 stone at origin → opp for P2
+        assert_eq!(g.features[0], 0.0);
+        assert_eq!(g.features[1], 1.0);
+        // Shifted base features match the absolute builder for real nodes:
+        // rel [2] == abs [2]; rel [3..7] == abs [4..8].
+        let g8 = game_to_axis_graph_raw_opts(&game, false, false, false);
+        let n_real = g.num_nodes - 1;
+        for node in 0..n_real {
+            assert_eq!(g.features[node * 7 + 2], g8.features[node * 8 + 2]);
+            for d in 0..4 {
+                assert_eq!(
+                    g.features[node * 7 + 3 + d],
+                    g8.features[node * 8 + 4 + d],
+                    "node {node}: shifted base feature {d} mismatch"
+                );
+            }
+        }
+        // Dummy node in the relative layout: moves_feat at [3] (the relative
+        // moves_remaining slot), everything else zero (no to_move channel).
+        let dummy = g.num_nodes - 1;
+        assert_eq!(
+            g.features[dummy * 7 + 3],
+            g8.features[dummy * 8 + 4],
+            "dummy carries moves_feat at the shifted slot"
+        );
+        assert_eq!(g.features[dummy * 7 + 3], 1.0, "moves_remaining 2/2.0 = 1.0");
+        for d in [0, 1, 2, 4, 5, 6] {
+            assert_eq!(g.features[dummy * 7 + d], 0.0, "dummy dim {d} must be zero");
+        }
+
+        // Flip check: with P1 to move (mid_game), a P1 stone is "own".
+        let game2 = mid_game();
+        let g2 = game_to_axis_graph_raw_opts(&game2, false, false, true);
+        let stones: HashMap<Coord, Player> = game2.placed_stones().into_iter().collect();
+        assert_eq!(
+            game2.current_player(),
+            Some(Player::P1),
+            "mid_game fixture should have P1 to move"
+        );
+        let n_real2 = g2.num_nodes - 1;
+        let mut checked = 0;
+        for node in 0..n_real2 {
+            if !g2.stone_mask[node] {
+                continue;
+            }
+            let c = (g2.coords[node * 2], g2.coords[node * 2 + 1]);
+            let expected_own = stones[&c] == Player::P1;
+            assert_eq!(g2.features[node * 7] == 1.0, expected_own, "node {node} own bit");
+            assert_eq!(g2.features[node * 7 + 1] == 1.0, !expected_own, "node {node} opp bit");
+            checked += 1;
+        }
+        assert!(checked >= 5, "should have checked several stones");
+    }
+
+    #[test]
+    fn relative_threat_features_axis_11_dim() {
+        let game = mid_game();
+        let g11 = game_to_axis_graph_raw_opts(&game, false, true, true);
+        assert_eq!(g11.features.len(), g11.num_nodes * 11);
+        let g12 = game_to_axis_graph_raw_opts(&game, false, true, false);
+        let n_real = g11.num_nodes - 1;
+        // Threat values at 7..11 (relative) match 8..12 (absolute).
+        for node in 0..n_real {
+            for d in 0..4 {
+                assert_eq!(
+                    g11.features[node * 11 + 7 + d],
+                    g12.features[node * 12 + 8 + d],
+                    "node {node}: threat dim {d} mismatch between layouts"
+                );
+            }
+        }
+        // Threat dims must actually be populated for some real node.
+        assert!(
+            g11.features[..n_real * 11]
+                .chunks(11)
+                .any(|f| f[7..11].iter().any(|&v| v != 0.0)),
+            "threat dims must be populated"
+        );
+        // Dummy node: moves_feat at [3], everything else zero — including the
+        // threat dims 7..11.
+        let dummy = g11.num_nodes - 1;
+        assert_eq!(
+            g11.features[dummy * 11 + 3],
+            g12.features[dummy * 12 + 4],
+            "dummy carries moves_feat at the shifted slot"
+        );
+        for d in (0..11).filter(|&d| d != 3) {
+            assert_eq!(g11.features[dummy * 11 + d], 0.0, "dummy dim {d} must be zero");
+        }
     }
 
     // AC-1b: All axis edges have |signed_distance| <= win_length

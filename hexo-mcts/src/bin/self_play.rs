@@ -1015,7 +1015,8 @@ impl GameResult {
 ///   of being discarded, since Gumbel-AZ's completed-Q targets are informative
 ///   even at low sims. Trainer applies weights multiplicatively in the loss.
 /// - HX05: added 1B node_dim to the envelope (after move_count). Node features
-///   are 8-dim, or 12-dim with --threat-features; HX04 readers assumed 8.
+///   are 8-dim, or 7-dim with --relative-stones (to_move dropped), +4 with
+///   --threat-features (so 7/8/11/12); HX04 readers assumed 8.
 const RECORD_MAGIC: &[u8; 4] = b"HX05";
 
 /// Write a game as a length-prefixed binary record.
@@ -1029,9 +1030,10 @@ const RECORD_MAGIC: &[u8; 4] = b"HX05";
 ///
 /// `winner`: 1 = P1, -1 = P2, 0 = draw.
 ///
-/// `node_dim` is the per-node feature width (8, or 12 with threat features);
-/// uniform across all examples in a record (all positions of one game are
-/// built with the same flags).
+/// `node_dim` is the per-node feature width (7/8 base depending on
+/// --relative-stones, +4 with threat features → 7, 8, 11, or 12); uniform
+/// across all examples in a record (all positions of one game are built with
+/// the same flags).
 ///
 /// Each example:
 /// ```text
@@ -1169,15 +1171,16 @@ fn build_position_graph(
     graph_type: GraphType,
     prune_empty_edges: bool,
     threat_features: bool,
+    relative_stones: bool,
 ) -> (GraphOutput, GraphTensors) {
     match graph_type {
         GraphType::Axis => {
-            let g = game_to_axis_graph_raw_opts(game, prune_empty_edges, threat_features);
+            let g = game_to_axis_graph_raw_opts(game, prune_empty_edges, threat_features, relative_stones);
             let t = GraphTensors::from_axis(&g);
             (GraphOutput::Axis(g), t)
         }
         GraphType::Hex => {
-            let g = game_to_graph_raw_opts(game, threat_features);
+            let g = game_to_graph_raw_opts(game, threat_features, relative_stones);
             let t = GraphTensors::from_hex(&g);
             (GraphOutput::Hex(g), t)
         }
@@ -1236,6 +1239,7 @@ fn play_one_game(
     graph_type: GraphType,
     prune_empty_edges: bool,
     threat_features: bool,
+    relative_stones: bool,
     rng: &mut ChaCha8Rng,
     playout_cap_fraction: f64,
     playout_cap_divisor: u32,
@@ -1262,7 +1266,7 @@ fn play_one_game(
         // Build graph ONCE for this position — reuse for both output and root eval
         let t = if profile { Some(Instant::now()) } else { None };
         let (graph_output, root_tensors) =
-            build_position_graph(&game, graph_type, prune_empty_edges, threat_features);
+            build_position_graph(&game, graph_type, prune_empty_edges, threat_features, relative_stones);
         let graph_build_ns = t.map(|i| i.elapsed().as_nanos()).unwrap_or(0);
 
         // Choose which inference client services THIS root's MCTS search.
@@ -1288,8 +1292,8 @@ fn play_one_game(
                 // Leaf evals: build graphs on this game thread (CPU work)
                 let gs: Vec<_> = states.iter().map(|s| {
                     match graph_type {
-                        GraphType::Axis => GraphTensors::from(game_to_axis_graph_raw_opts(s, prune_empty_edges, threat_features)),
-                        GraphType::Hex => GraphTensors::from(game_to_graph_raw_opts(s, threat_features)),
+                        GraphType::Axis => GraphTensors::from(game_to_axis_graph_raw_opts(s, prune_empty_edges, threat_features, relative_stones)),
+                        GraphType::Hex => GraphTensors::from(game_to_graph_raw_opts(s, threat_features, relative_stones)),
                     }
                 }).collect();
                 if let Some(i) = gb { eval_graph_build_ns += i.elapsed().as_nanos(); }
@@ -1521,6 +1525,7 @@ fn main() {
     let mut draw_value: f32 = 0.0; // value target for drawn games (0.0=neutral, -0.1=penalty)
     let mut prune_empty_edges = false;
     let mut threat_features = false;
+    let mut relative_stones = false;
 
     // Python subprocess inference flags
     let mut python_inference = false;
@@ -1620,6 +1625,7 @@ fn main() {
             "--padded-inference" => { #[allow(unused)] { padded_inference = true; } i += 1; }
             "--prune-empty-edges" => { prune_empty_edges = true; i += 1; }
             "--threat-features" => { threat_features = true; i += 1; }
+            "--relative-stones" => { relative_stones = true; i += 1; }
             "--shape-hist" => { #[allow(unused)] { shape_hist = true; } i += 1; }
             "--playout-cap-divisor" => {
                 playout_cap_divisor = args[i + 1].parse().unwrap();
@@ -1824,7 +1830,7 @@ fn main() {
                 &graph_type_str, &model_conv_type, device_str,
                 padded_inference,
                 model_use_jk, &model_jk_mode,
-                threat_features,
+                threat_features, relative_stones,
             );
             eprintln!("Spawning Python inference subprocess...");
             let mut model = SubprocessModel::spawn(&python_bin, ckpt, &model_args)
@@ -1843,6 +1849,7 @@ fn main() {
                 let (results, measured) = run_batch_games_with_warmup(
                     s, client, warmup_games, n_games, n_threads, seed, game_config, &mcts_config,
                     &exploration_atomic, graph_type, prune_empty_edges, threat_features,
+                    relative_stones,
                     playout_cap_fraction, playout_cap_divisor,
                     &running,
                 );
@@ -1884,6 +1891,7 @@ fn main() {
                     let (results, measured) = run_batch_games_with_warmup(
                         s, client, warmup_games, n_games, n_threads, seed, game_config, &mcts_config,
                         &exploration_atomic, graph_type, prune_empty_edges, threat_features,
+                        relative_stones,
                         playout_cap_fraction, playout_cap_divisor,
                         &running,
                     );
@@ -1974,7 +1982,7 @@ fn main() {
                 &graph_type_str, &model_conv_type, device_str,
                 padded_inference,
                 model_use_jk, &model_jk_mode,
-                threat_features,
+                threat_features, relative_stones,
             );
             if n_workers > 1 {
                 let dispatch_label = match inference_dispatch {
@@ -2050,7 +2058,7 @@ fn main() {
                 run_continuous_game_threads(
                     s, client, pool_client_opt, n_threads, seed, game_config,
                     &mcts_config, &exploration_atomic, graph_type, prune_empty_edges,
-                    threat_features,
+                    threat_features, relative_stones,
                     playout_cap_fraction, playout_cap_divisor, pool_fraction,
                     &pool_disabled, &pool_ready, &running, &game_counter,
                     &rotating_writer, exploration_fraction, &ema_bits,
@@ -2124,7 +2132,7 @@ fn main() {
                     run_continuous_game_threads(
                         s, client, pool_client_opt, n_threads, seed, game_config,
                         &mcts_config, &exploration_atomic, graph_type, prune_empty_edges,
-                        threat_features,
+                        threat_features, relative_stones,
                         playout_cap_fraction, playout_cap_divisor, pool_fraction,
                         &pool_disabled, &pool_ready, &running, &game_counter,
                         &rotating_writer, exploration_fraction, &ema_bits,
@@ -2140,9 +2148,14 @@ fn main() {
     }
 }
 
-/// Node-feature dim of threat-encoding graphs. Must match `fdim` in
-/// hexo-mcts/src/graph.rs (`build_graph`): 8 base dims + 4 threat dims.
-const THREAT_NODE_DIM: usize = 12;
+/// Node-feature dim for the configured graph flags. Must match `fdim` in
+/// hexo-mcts/src/graph.rs (`build_graph`): 8 base dims, or 7 with
+/// `--relative-stones` (to_move dropped), +4 threat dims with
+/// `--threat-features`.
+fn node_dim(threat_features: bool, relative_stones: bool) -> usize {
+    let base = if relative_stones { 7 } else { 8 };
+    base + if threat_features { 4 } else { 0 }
+}
 
 /// Build the model args vector for `SubprocessModel::spawn`.
 #[allow(clippy::too_many_arguments)]
@@ -2159,6 +2172,7 @@ fn subprocess_model_args(
     use_jk: bool,
     jk_mode: &str,
     threat_features: bool,
+    relative_stones: bool,
 ) -> Vec<String> {
     let mut v = vec![
         "--hidden-dim".into(), hidden_dim.to_string(),
@@ -2180,13 +2194,14 @@ fn subprocess_model_args(
         v.push("--jk-mode".into());
         v.push(jk_mode.to_string());
     }
-    // 12-dim threat-feature graphs need the server to build the model with
-    // node_features=12 and warm up with matching inputs. The server defaults
-    // to 8, so only emit the flag for threat runs (keeps the CLI byte-identical
-    // for plain 8-dim runs).
-    if threat_features {
+    // Non-8-dim graphs (threat features and/or relative stones) need the
+    // server to build the model with a matching node_features and warm up with
+    // matching inputs. The server defaults to 8, so only emit the flag for
+    // non-default dims (keeps the CLI byte-identical for plain 8-dim runs).
+    let dim = node_dim(threat_features, relative_stones);
+    if dim != 8 {
         v.push("--node-dim".into());
-        v.push(THREAT_NODE_DIM.to_string());
+        v.push(dim.to_string());
     }
     v
 }
@@ -2220,6 +2235,7 @@ fn run_batch_games_with_warmup<'scope, 'env: 'scope>(
     graph_type: GraphType,
     prune_empty_edges: bool,
     threat_features: bool,
+    relative_stones: bool,
     playout_cap_fraction: f64,
     playout_cap_divisor: u32,
     running: &'env Arc<AtomicBool>,
@@ -2253,7 +2269,8 @@ fn run_batch_games_with_warmup<'scope, 'env: 'scope>(
                     }
                     let _ = play_one_game(
                         &client, None, None, game_config, mcts_config,
-                        exploration, graph_type, prune_empty_edges, threat_features, &mut rng,
+                        exploration, graph_type, prune_empty_edges, threat_features,
+                        relative_stones, &mut rng,
                         playout_cap_fraction, playout_cap_divisor,
                         &running_thread,
                     );
@@ -2263,7 +2280,8 @@ fn run_batch_games_with_warmup<'scope, 'env: 'scope>(
                 for _ in 0..count {
                     if let Some(game) = play_one_game(
                         &client, None, None, game_config, mcts_config,
-                        exploration, graph_type, prune_empty_edges, threat_features, &mut rng,
+                        exploration, graph_type, prune_empty_edges, threat_features,
+                        relative_stones, &mut rng,
                         playout_cap_fraction, playout_cap_divisor,
                         &running_thread,
                     ) {
@@ -2309,6 +2327,7 @@ fn run_continuous_game_threads<'scope, 'env: 'scope>(
     graph_type: GraphType,
     prune_empty_edges: bool,
     threat_features: bool,
+    relative_stones: bool,
     playout_cap_fraction: f64,
     playout_cap_divisor: u32,
     pool_fraction: f64,
@@ -2359,7 +2378,8 @@ fn run_continuous_game_threads<'scope, 'env: 'scope>(
                 if let Some(result) = play_one_game(
                     &client, pool_client_ref, pool_side,
                     game_config, mcts_config,
-                    exploration_atomic, graph_type, prune_empty_edges, threat_features, &mut rng,
+                    exploration_atomic, graph_type, prune_empty_edges, threat_features,
+                    relative_stones, &mut rng,
                     playout_cap_fraction, playout_cap_divisor,
                     &running,
                 ) {
@@ -2484,7 +2504,7 @@ mod tests {
 
     fn make_result(graph_type: GraphType, winner: &'static str) -> GameResult {
         let game = GameState::with_config(small_game_config());
-        let (graph, _tensors) = build_position_graph(&game, graph_type, false, false);
+        let (graph, _tensors) = build_position_graph(&game, graph_type, false, false, false);
         GameResult {
             positions: vec![
                 PositionData { policy: vec![0.5, 0.5], player: "P1", graph, sample_weight: 1.0 },
@@ -2523,7 +2543,7 @@ mod tests {
         // 12-dim graphs (threat features on) must record node_dim=12 and a
         // size field consistent with the wider feature payload.
         let game = GameState::with_config(small_game_config());
-        let (graph, _) = build_position_graph(&game, GraphType::Hex, false, true);
+        let (graph, _) = build_position_graph(&game, GraphType::Hex, false, true, false);
         let n_nodes = match &graph {
             GraphOutput::Hex(g) => g.num_nodes,
             GraphOutput::Axis(g) => g.num_nodes,
@@ -2545,7 +2565,7 @@ mod tests {
         let record_len = u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize;
         assert_eq!(record_len, buf.len() - 8, "size field must count 12-dim features");
         // Sanity: the record is exactly n*4*4 bytes larger than its 8-dim twin.
-        let (graph8, _) = build_position_graph(&game, GraphType::Hex, false, false);
+        let (graph8, _) = build_position_graph(&game, GraphType::Hex, false, false, false);
         let result8 = GameResult {
             positions: vec![PositionData {
                 policy: vec![0.5, 0.5],
@@ -2559,6 +2579,68 @@ mod tests {
         let mut buf8 = Vec::new();
         write_game_binary(&mut buf8, &result8, 0.0).unwrap();
         assert_eq!(buf.len() - buf8.len(), n_nodes * 4 * 4);
+    }
+
+    /// Build a single-position GameResult with the given graph flags and
+    /// return (record bytes, num_nodes).
+    fn roundtrip_buf(threat_features: bool, relative_stones: bool) -> (Vec<u8>, usize) {
+        let game = GameState::with_config(small_game_config());
+        let (graph, _) =
+            build_position_graph(&game, GraphType::Hex, false, threat_features, relative_stones);
+        let n_nodes = match &graph {
+            GraphOutput::Hex(g) => g.num_nodes,
+            GraphOutput::Axis(g) => g.num_nodes,
+        };
+        let result = GameResult {
+            positions: vec![PositionData {
+                policy: vec![0.5, 0.5],
+                player: "P1",
+                graph,
+                sample_weight: 1.0,
+            }],
+            winner: "P1",
+            move_count: 1,
+        };
+        let mut buf = Vec::new();
+        write_game_binary(&mut buf, &result, 0.0).unwrap();
+        (buf, n_nodes)
+    }
+
+    #[test]
+    fn binary_roundtrip_relative_stones_node_dim_7() {
+        // 7-dim graphs (relative stones, no threat) must record node_dim=7
+        // and a size field consistent with the narrower feature payload.
+        let (buf, n_nodes) = roundtrip_buf(false, true);
+        assert_eq!(&buf[..4], b"HX05");
+        assert_eq!(buf[17], 7, "node_dim must be 7 with relative stones");
+        let record_len = u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize;
+        assert_eq!(record_len, buf.len() - 8, "size field must count 7-dim features");
+        // Sanity: exactly n*1*4 bytes smaller than its 8-dim twin.
+        let (buf8, _) = roundtrip_buf(false, false);
+        assert_eq!(buf8[17], 8);
+        assert_eq!(buf8.len() - buf.len(), n_nodes * 4);
+    }
+
+    #[test]
+    fn binary_roundtrip_relative_stones_threat_node_dim_11() {
+        // 11-dim graphs (relative stones + threat) must record node_dim=11.
+        let (buf, n_nodes) = roundtrip_buf(true, true);
+        assert_eq!(&buf[..4], b"HX05");
+        assert_eq!(buf[17], 11, "node_dim must be 11 with relative stones + threat");
+        let record_len = u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize;
+        assert_eq!(record_len, buf.len() - 8, "size field must count 11-dim features");
+        // Sanity: exactly n*1*4 bytes smaller than its 12-dim twin.
+        let (buf12, _) = roundtrip_buf(true, false);
+        assert_eq!(buf12[17], 12);
+        assert_eq!(buf12.len() - buf.len(), n_nodes * 4);
+    }
+
+    #[test]
+    fn node_dim_all_combos() {
+        assert_eq!(node_dim(false, false), 8);
+        assert_eq!(node_dim(false, true), 7);
+        assert_eq!(node_dim(true, false), 12);
+        assert_eq!(node_dim(true, true), 11);
     }
 
     #[test]
@@ -2579,9 +2661,9 @@ mod tests {
     fn move_count_roundtrip() {
         // Simulate playout cap: 10 actual moves but only 3 recorded examples.
         let game = GameState::with_config(small_game_config());
-        let (g1, _) = build_position_graph(&game, GraphType::Hex, false, false);
-        let (g2, _) = build_position_graph(&game, GraphType::Hex, false, false);
-        let (g3, _) = build_position_graph(&game, GraphType::Hex, false, false);
+        let (g1, _) = build_position_graph(&game, GraphType::Hex, false, false, false);
+        let (g2, _) = build_position_graph(&game, GraphType::Hex, false, false, false);
+        let (g3, _) = build_position_graph(&game, GraphType::Hex, false, false, false);
         let result = GameResult {
             positions: vec![
                 PositionData { policy: vec![0.5, 0.5], player: "P1", graph: g1, sample_weight: 1.0 },
@@ -2634,8 +2716,8 @@ mod tests {
     #[test]
     fn value_targets_win() {
         let game = GameState::with_config(small_game_config());
-        let (g1, _) = build_position_graph(&game, GraphType::Hex, false, false);
-        let (g2, _) = build_position_graph(&game, GraphType::Hex, false, false);
+        let (g1, _) = build_position_graph(&game, GraphType::Hex, false, false, false);
+        let (g2, _) = build_position_graph(&game, GraphType::Hex, false, false, false);
         let result = GameResult {
             positions: vec![
                 PositionData { policy: vec![0.5, 0.5], player: "P1", graph: g1, sample_weight: 1.0 },
