@@ -292,9 +292,12 @@ pub fn augment_graph(
 }
 
 /// Build graph arrays for a batch of game states in parallel using rayon.
-pub fn game_to_graph_batch(games: &[GameState]) -> Vec<GraphData> {
+pub fn game_to_graph_batch_opts(games: &[GameState], threat_features: bool) -> Vec<GraphData> {
     use rayon::prelude::*;
-    games.par_iter().map(game_to_graph_raw).collect()
+    games
+        .par_iter()
+        .map(|g| game_to_graph_raw_opts(g, threat_features))
+        .collect()
 }
 
 #[cfg(test)]

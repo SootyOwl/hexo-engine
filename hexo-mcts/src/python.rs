@@ -614,15 +614,19 @@ fn py_gumbel_mcts_with_diagnostics(
 ///
 /// Returns a dict with keys: features, edge_src, edge_dst, legal_mask, stone_mask,
 /// coords, num_nodes — all as flat Python lists ready for torch.tensor().
-#[pyfunction(name = "game_to_graph_raw")]
-fn py_game_to_graph_raw(py: Python<'_>, game: &PyGameState) -> PyResult<Py<PyAny>> {
+#[pyfunction(name = "game_to_graph_raw", signature = (game, threat_features=false))]
+fn py_game_to_graph_raw(
+    py: Python<'_>,
+    game: &PyGameState,
+    threat_features: bool,
+) -> PyResult<Py<PyAny>> {
     if game.inner.is_terminal() {
         return Err(PyValueError::new_err(
             "Cannot construct graph for a terminal game state.",
         ));
     }
 
-    let g = crate::graph::game_to_graph_raw(&game.inner);
+    let g = crate::graph::game_to_graph_raw_opts(&game.inner, threat_features);
 
     let dict = pyo3::types::PyDict::new(py);
     dict.set_item("features", g.features)?;
@@ -639,8 +643,12 @@ fn py_game_to_graph_raw(py: Python<'_>, game: &PyGameState) -> PyResult<Py<PyAny
 /// Build graph arrays for a batch of game states in parallel.
 ///
 /// Returns a list of dicts, one per state. Uses rayon for parallel construction.
-#[pyfunction(name = "game_to_graph_batch")]
-fn py_game_to_graph_batch(py: Python<'_>, games: Vec<Py<PyGameState>>) -> PyResult<Vec<Py<PyAny>>> {
+#[pyfunction(name = "game_to_graph_batch", signature = (games, threat_features=false))]
+fn py_game_to_graph_batch(
+    py: Python<'_>,
+    games: Vec<Py<PyGameState>>,
+    threat_features: bool,
+) -> PyResult<Vec<Py<PyAny>>> {
     // Extract inner GameStates while we hold the GIL
     let states: Vec<GameState> = games
         .iter()
@@ -648,7 +656,7 @@ fn py_game_to_graph_batch(py: Python<'_>, games: Vec<Py<PyGameState>>) -> PyResu
         .collect();
 
     // Parallel graph construction (no GIL needed — pure Rust)
-    let graphs = crate::graph::game_to_graph_batch(&states);
+    let graphs = crate::graph::game_to_graph_batch_opts(&states, threat_features);
 
     graphs
         .into_iter()
@@ -671,15 +679,24 @@ fn py_game_to_graph_batch(py: Python<'_>, games: Vec<Py<PyGameState>>) -> PyResu
 ///
 /// Returns a dict with keys: features, edge_src, edge_dst, edge_attr, legal_mask,
 /// stone_mask, coords, num_nodes — all as flat Python lists ready for torch.tensor().
-#[pyfunction(name = "game_to_axis_graph_raw", signature = (game, prune_empty_edges=false))]
-fn py_game_to_axis_graph_raw(py: Python<'_>, game: &PyGameState, prune_empty_edges: bool) -> PyResult<Py<PyAny>> {
+#[pyfunction(name = "game_to_axis_graph_raw", signature = (game, prune_empty_edges=false, threat_features=false))]
+fn py_game_to_axis_graph_raw(
+    py: Python<'_>,
+    game: &PyGameState,
+    prune_empty_edges: bool,
+    threat_features: bool,
+) -> PyResult<Py<PyAny>> {
     if game.inner.is_terminal() {
         return Err(PyValueError::new_err(
             "Cannot construct graph for a terminal game state.",
         ));
     }
 
-    let g = crate::axis_graph::game_to_axis_graph_raw_opts(&game.inner, prune_empty_edges, false);
+    let g = crate::axis_graph::game_to_axis_graph_raw_opts(
+        &game.inner,
+        prune_empty_edges,
+        threat_features,
+    );
 
     let dict = pyo3::types::PyDict::new(py);
     dict.set_item("features", g.features)?;
@@ -696,11 +713,12 @@ fn py_game_to_axis_graph_raw(py: Python<'_>, game: &PyGameState, prune_empty_edg
 /// Build axis-window graph arrays for a batch of game states in parallel.
 ///
 /// Returns a list of dicts, one per state. Uses rayon for parallel construction.
-#[pyfunction(name = "game_to_axis_graph_batch", signature = (games, prune_empty_edges=false))]
+#[pyfunction(name = "game_to_axis_graph_batch", signature = (games, prune_empty_edges=false, threat_features=false))]
 fn py_game_to_axis_graph_batch(
     py: Python<'_>,
     games: Vec<Py<PyGameState>>,
     prune_empty_edges: bool,
+    threat_features: bool,
 ) -> PyResult<Vec<Py<PyAny>>> {
     // Extract inner GameStates while we hold the GIL
     let states: Vec<GameState> = games
@@ -718,7 +736,8 @@ fn py_game_to_axis_graph_batch(
         .collect::<PyResult<Vec<_>>>()?;
 
     // Parallel graph construction (no GIL needed — pure Rust)
-    let graphs = crate::axis_graph::game_to_axis_graph_batch_opts(&states, prune_empty_edges, false);
+    let graphs =
+        crate::axis_graph::game_to_axis_graph_batch_opts(&states, prune_empty_edges, threat_features);
 
     graphs
         .into_iter()

@@ -32,7 +32,7 @@ use std::time::{Duration, Instant, SystemTime};
 use hexo_engine::game::{GameConfig, GameState};
 use hexo_engine::types::Coord;
 use hexo_rs::axis_graph::game_to_axis_graph_raw_opts;
-use hexo_rs::graph::game_to_graph_raw;
+use hexo_rs::graph::game_to_graph_raw_opts;
 use hexo_rs::graph_tensors::{GraphTensors, GraphType};
 #[cfg(feature = "torch")]
 use hexo_rs::inference::TorchModel;
@@ -1138,15 +1138,16 @@ fn build_position_graph(
     game: &GameState,
     graph_type: GraphType,
     prune_empty_edges: bool,
+    threat_features: bool,
 ) -> (GraphOutput, GraphTensors) {
     match graph_type {
         GraphType::Axis => {
-            let g = game_to_axis_graph_raw_opts(game, prune_empty_edges, false);
+            let g = game_to_axis_graph_raw_opts(game, prune_empty_edges, threat_features);
             let t = GraphTensors::from_axis(&g);
             (GraphOutput::Axis(g), t)
         }
         GraphType::Hex => {
-            let g = game_to_graph_raw(game);
+            let g = game_to_graph_raw_opts(game, threat_features);
             let t = GraphTensors::from_hex(&g);
             (GraphOutput::Hex(g), t)
         }
@@ -1204,6 +1205,7 @@ fn play_one_game(
     exploration: &AtomicUsize,
     graph_type: GraphType,
     prune_empty_edges: bool,
+    threat_features: bool,
     rng: &mut ChaCha8Rng,
     playout_cap_fraction: f64,
     playout_cap_divisor: u32,
@@ -1229,7 +1231,8 @@ fn play_one_game(
 
         // Build graph ONCE for this position — reuse for both output and root eval
         let t = if profile { Some(Instant::now()) } else { None };
-        let (graph_output, root_tensors) = build_position_graph(&game, graph_type, prune_empty_edges);
+        let (graph_output, root_tensors) =
+            build_position_graph(&game, graph_type, prune_empty_edges, threat_features);
         let graph_build_ns = t.map(|i| i.elapsed().as_nanos()).unwrap_or(0);
 
         // Choose which inference client services THIS root's MCTS search.
@@ -1255,8 +1258,8 @@ fn play_one_game(
                 // Leaf evals: build graphs on this game thread (CPU work)
                 let gs: Vec<_> = states.iter().map(|s| {
                     match graph_type {
-                        GraphType::Axis => GraphTensors::from(game_to_axis_graph_raw_opts(s, prune_empty_edges, false)),
-                        GraphType::Hex => GraphTensors::from(game_to_graph_raw(s)),
+                        GraphType::Axis => GraphTensors::from(game_to_axis_graph_raw_opts(s, prune_empty_edges, threat_features)),
+                        GraphType::Hex => GraphTensors::from(game_to_graph_raw_opts(s, threat_features)),
                     }
                 }).collect();
                 if let Some(i) = gb { eval_graph_build_ns += i.elapsed().as_nanos(); }
@@ -1487,6 +1490,7 @@ fn main() {
     let mut exploration_distribution: String = "improved_policy".to_string(); // or "visit_counts"
     let mut draw_value: f32 = 0.0; // value target for drawn games (0.0=neutral, -0.1=penalty)
     let mut prune_empty_edges = false;
+    let mut threat_features = false;
 
     // Python subprocess inference flags
     let mut python_inference = false;
@@ -1585,6 +1589,7 @@ fn main() {
             }
             "--padded-inference" => { #[allow(unused)] { padded_inference = true; } i += 1; }
             "--prune-empty-edges" => { prune_empty_edges = true; i += 1; }
+            "--threat-features" => { threat_features = true; i += 1; }
             "--shape-hist" => { #[allow(unused)] { shape_hist = true; } i += 1; }
             "--playout-cap-divisor" => {
                 playout_cap_divisor = args[i + 1].parse().unwrap();
@@ -1661,6 +1666,19 @@ fn main() {
 
     if model_path.is_empty() {
         eprintln!("Usage: self_play --model <path.pt> [--continuous] [options]");
+        std::process::exit(1);
+    }
+
+    // The subprocess wire protocol (inference_subprocess.rs + Python
+    // inference_server.py) hardcodes 8-dim node features and carries no
+    // feature-dim field in its header; 12-dim threat graphs would be
+    // silently misparsed. Fail loudly until the protocol learns fdim.
+    if threat_features && python_inference {
+        eprintln!(
+            "--threat-features is not yet supported with --python-inference \
+             (subprocess wire protocol assumes 8-dim node features). \
+             Use in-process torch inference."
+        );
         std::process::exit(1);
     }
 
@@ -1806,7 +1824,8 @@ fn main() {
 
                 let (results, measured) = run_batch_games_with_warmup(
                     s, client, warmup_games, n_games, n_threads, seed, game_config, &mcts_config,
-                    &exploration_atomic, graph_type, prune_empty_edges, playout_cap_fraction, playout_cap_divisor,
+                    &exploration_atomic, graph_type, prune_empty_edges, threat_features,
+                    playout_cap_fraction, playout_cap_divisor,
                     &running,
                 );
 
@@ -1846,7 +1865,8 @@ fn main() {
 
                     let (results, measured) = run_batch_games_with_warmup(
                         s, client, warmup_games, n_games, n_threads, seed, game_config, &mcts_config,
-                        &exploration_atomic, graph_type, prune_empty_edges, playout_cap_fraction, playout_cap_divisor,
+                        &exploration_atomic, graph_type, prune_empty_edges, threat_features,
+                        playout_cap_fraction, playout_cap_divisor,
                         &running,
                     );
 
@@ -2011,6 +2031,7 @@ fn main() {
                 run_continuous_game_threads(
                     s, client, pool_client_opt, n_threads, seed, game_config,
                     &mcts_config, &exploration_atomic, graph_type, prune_empty_edges,
+                    threat_features,
                     playout_cap_fraction, playout_cap_divisor, pool_fraction,
                     &pool_disabled, &pool_ready, &running, &game_counter,
                     &rotating_writer, exploration_fraction, &ema_bits,
@@ -2084,6 +2105,7 @@ fn main() {
                     run_continuous_game_threads(
                         s, client, pool_client_opt, n_threads, seed, game_config,
                         &mcts_config, &exploration_atomic, graph_type, prune_empty_edges,
+                        threat_features,
                         playout_cap_fraction, playout_cap_divisor, pool_fraction,
                         &pool_disabled, &pool_ready, &running, &game_counter,
                         &rotating_writer, exploration_fraction, &ema_bits,
@@ -2165,6 +2187,7 @@ fn run_batch_games_with_warmup<'scope, 'env: 'scope>(
     exploration: &'env AtomicUsize,
     graph_type: GraphType,
     prune_empty_edges: bool,
+    threat_features: bool,
     playout_cap_fraction: f64,
     playout_cap_divisor: u32,
     running: &'env Arc<AtomicBool>,
@@ -2198,7 +2221,7 @@ fn run_batch_games_with_warmup<'scope, 'env: 'scope>(
                     }
                     let _ = play_one_game(
                         &client, None, None, game_config, mcts_config,
-                        exploration, graph_type, prune_empty_edges, &mut rng,
+                        exploration, graph_type, prune_empty_edges, threat_features, &mut rng,
                         playout_cap_fraction, playout_cap_divisor,
                         &running_thread,
                     );
@@ -2208,7 +2231,7 @@ fn run_batch_games_with_warmup<'scope, 'env: 'scope>(
                 for _ in 0..count {
                     if let Some(game) = play_one_game(
                         &client, None, None, game_config, mcts_config,
-                        exploration, graph_type, prune_empty_edges, &mut rng,
+                        exploration, graph_type, prune_empty_edges, threat_features, &mut rng,
                         playout_cap_fraction, playout_cap_divisor,
                         &running_thread,
                     ) {
@@ -2253,6 +2276,7 @@ fn run_continuous_game_threads<'scope, 'env: 'scope>(
     exploration_atomic: &'env AtomicUsize,
     graph_type: GraphType,
     prune_empty_edges: bool,
+    threat_features: bool,
     playout_cap_fraction: f64,
     playout_cap_divisor: u32,
     pool_fraction: f64,
@@ -2303,7 +2327,7 @@ fn run_continuous_game_threads<'scope, 'env: 'scope>(
                 if let Some(result) = play_one_game(
                     &client, pool_client_ref, pool_side,
                     game_config, mcts_config,
-                    exploration_atomic, graph_type, prune_empty_edges, &mut rng,
+                    exploration_atomic, graph_type, prune_empty_edges, threat_features, &mut rng,
                     playout_cap_fraction, playout_cap_divisor,
                     &running,
                 ) {
@@ -2428,7 +2452,7 @@ mod tests {
 
     fn make_result(graph_type: GraphType, winner: &'static str) -> GameResult {
         let game = GameState::with_config(small_game_config());
-        let (graph, _tensors) = build_position_graph(&game, graph_type, false);
+        let (graph, _tensors) = build_position_graph(&game, graph_type, false, false);
         GameResult {
             positions: vec![
                 PositionData { policy: vec![0.5, 0.5], player: "P1", graph, sample_weight: 1.0 },
@@ -2478,9 +2502,9 @@ mod tests {
     fn move_count_roundtrip() {
         // Simulate playout cap: 10 actual moves but only 3 recorded examples.
         let game = GameState::with_config(small_game_config());
-        let (g1, _) = build_position_graph(&game, GraphType::Hex, false);
-        let (g2, _) = build_position_graph(&game, GraphType::Hex, false);
-        let (g3, _) = build_position_graph(&game, GraphType::Hex, false);
+        let (g1, _) = build_position_graph(&game, GraphType::Hex, false, false);
+        let (g2, _) = build_position_graph(&game, GraphType::Hex, false, false);
+        let (g3, _) = build_position_graph(&game, GraphType::Hex, false, false);
         let result = GameResult {
             positions: vec![
                 PositionData { policy: vec![0.5, 0.5], player: "P1", graph: g1, sample_weight: 1.0 },
@@ -2533,8 +2557,8 @@ mod tests {
     #[test]
     fn value_targets_win() {
         let game = GameState::with_config(small_game_config());
-        let (g1, _) = build_position_graph(&game, GraphType::Hex, false);
-        let (g2, _) = build_position_graph(&game, GraphType::Hex, false);
+        let (g1, _) = build_position_graph(&game, GraphType::Hex, false, false);
+        let (g2, _) = build_position_graph(&game, GraphType::Hex, false, false);
         let result = GameResult {
             positions: vec![
                 PositionData { policy: vec![0.5, 0.5], player: "P1", graph: g1, sample_weight: 1.0 },

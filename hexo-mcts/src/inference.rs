@@ -142,8 +142,16 @@ impl TorchModel {
         }
         record_shape(total_nodes, total_edges);
 
-        // Features: (total_nodes, 8)
-        let mut all_features: Vec<f32> = Vec::with_capacity(total_nodes * 8);
+        // Node feature dim: 8 baseline, 12 with threat features. Derive from
+        // the actual graphs so --threat-features batches reshape correctly.
+        let fdim = graphs[0].features.len() / graphs[0].num_nodes.max(1);
+        debug_assert!(
+            graphs.iter().all(|g| g.features.len() / g.num_nodes.max(1) == fdim),
+            "batch contains graphs with mixed feature dims"
+        );
+
+        // Features: (total_nodes, fdim)
+        let mut all_features: Vec<f32> = Vec::with_capacity(total_nodes * fdim);
         let mut all_edge_src: Vec<i64> = Vec::with_capacity(total_edges);
         let mut all_edge_dst: Vec<i64> = Vec::with_capacity(total_edges);
         let mut all_edge_attr: Vec<f32> = Vec::new();
@@ -175,7 +183,7 @@ impl TorchModel {
 
         // Create tensors on device (convert to bf16 if model is bf16)
         let mut x = Tensor::from_slice(&all_features)
-            .reshape([total_nodes as i64, 8])
+            .reshape([total_nodes as i64, fdim as i64])
             .to_device(self.device);
         if self.float_kind != Kind::Float {
             x = x.to_kind(self.float_kind);
@@ -369,7 +377,14 @@ impl TorchModel {
         debug_assert!(ghost_nodes >= 1);
         debug_assert!(ghost_edges >= 1);
 
-        let mut all_features: Vec<f32> = vec![0.0; target_nodes * 8];
+        // Node feature dim: 8 baseline, 12 with threat features (ghost-node
+        // padding features stay all-zero either way).
+        let fdim = graphs[0].features.len() / graphs[0].num_nodes.max(1);
+        debug_assert!(
+            graphs.iter().all(|g| g.features.len() / g.num_nodes.max(1) == fdim),
+            "batch contains graphs with mixed feature dims"
+        );
+        let mut all_features: Vec<f32> = vec![0.0; target_nodes * fdim];
         let mut all_edge_src: Vec<i64> = Vec::with_capacity(target_edges);
         let mut all_edge_dst: Vec<i64> = Vec::with_capacity(target_edges);
         let edge_attr_dim = 5usize;
@@ -385,7 +400,8 @@ impl TorchModel {
         let mut node_offset: usize = 0;
         let mut edge_offset: usize = 0;
         for (gi, g) in graphs.iter().enumerate() {
-            let f_dst = &mut all_features[node_offset * 8..(node_offset + g.num_nodes) * 8];
+            let f_dst =
+                &mut all_features[node_offset * fdim..(node_offset + g.num_nodes) * fdim];
             f_dst.copy_from_slice(&g.features);
             for &s in &g.edge_src {
                 all_edge_src.push(s + node_offset as i64);
@@ -424,7 +440,7 @@ impl TorchModel {
         debug_assert_eq!(all_edge_dst.len(), target_edges);
 
         let mut x = Tensor::from_slice(&all_features)
-            .reshape([target_nodes as i64, 8])
+            .reshape([target_nodes as i64, fdim as i64])
             .to_device(self.device);
         if self.float_kind != Kind::Float {
             x = x.to_kind(self.float_kind);

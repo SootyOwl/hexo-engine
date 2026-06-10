@@ -98,6 +98,11 @@ pub fn build_axis_graph_tensors(game: &GameState) -> GraphTensors {
 }
 
 /// Build axis graph tensors with optional empty-edge pruning.
+///
+/// Only reachable via `TorchModel::build_graphs`/`evaluate` (the legacy
+/// `native_self_play` PyO3 path); the self_play binary builds its graphs on
+/// game threads with the threaded `--threat-features` flag instead, so this
+/// path stays 8-dim (threat_features = false).
 pub fn build_axis_graph_tensors_opts(game: &GameState, prune_empty_edges: bool) -> GraphTensors {
     let axis_data = game_to_axis_graph_raw_opts(game, prune_empty_edges, false);
 
