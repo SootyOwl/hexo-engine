@@ -1014,11 +1014,13 @@ impl GameResult {
 ///   active, fast-cap positions are now written with weight = 1/divisor instead
 ///   of being discarded, since Gumbel-AZ's completed-Q targets are informative
 ///   even at low sims. Trainer applies weights multiplicatively in the loss.
-const RECORD_MAGIC: &[u8; 4] = b"HX04";
+/// - HX05: added 1B node_dim to the envelope (after move_count). Node features
+///   are 8-dim, or 12-dim with --threat-features; HX04 readers assumed 8.
+const RECORD_MAGIC: &[u8; 4] = b"HX05";
 
 /// Write a game as a length-prefixed binary record.
 ///
-/// Format: `[4B magic "HX04"][4B LE record_size][4B LE num_examples][1B winner i8][4B LE move_count u32][example...]`
+/// Format: `[4B magic "HX05"][4B LE record_size][4B LE num_examples][1B winner i8][4B LE move_count u32][1B node_dim u8][example...]`
 ///
 /// `move_count` is the total number of moves played in the game. With
 /// playout-cap randomisation off (or with the HX04+weighted variant)
@@ -1027,24 +1029,44 @@ const RECORD_MAGIC: &[u8; 4] = b"HX04";
 ///
 /// `winner`: 1 = P1, -1 = P2, 0 = draw.
 ///
+/// `node_dim` is the per-node feature width (8, or 12 with threat features);
+/// uniform across all examples in a record (all positions of one game are
+/// built with the same flags).
+///
 /// Each example:
 /// ```text
 /// [2B num_nodes][2B num_edges][2B num_legal][1B has_edge_attr][4B value f32]
 /// [4B sample_weight f32]                                         -- HX04+
-/// [num_nodes*8*4B features f32]
-/// [num_edges*8B edge_src i64][num_edges*8B edge_dst i64]
+/// [num_nodes*node_dim*4B features f32]
+/// [num_edges*2B edge_src u16][num_edges*2B edge_dst u16]
 /// [num_edges*5*4B edge_attr f32]  -- only if has_edge_attr
 /// [num_nodes*1B legal_mask u8][num_nodes*1B stone_mask u8]
-/// [num_nodes*2*4B coords i32]
-/// [num_legal*8B policy f64]
+/// [num_nodes*2*2B coords i16]
+/// [num_legal*4B policy f32]
 /// ```
 fn write_game_binary<W: Write>(writer: &mut W, result: &GameResult, draw_value: f32) -> std::io::Result<()> {
+    // Node-feature width: uniform across the record (all positions of one
+    // game are built with the same threat_features flag).
+    let node_dim = result
+        .positions
+        .first()
+        .map(|pos| {
+            let (n, _, _, _) = example_dims(pos);
+            example_features(pos).len() / n.max(1)
+        })
+        .unwrap_or(8);
+
     // First pass: compute total size
-    let mut size = 4u32 + 1 + 4; // num_examples + winner byte + move_count
+    let mut size = 4u32 + 1 + 4 + 1; // num_examples + winner byte + move_count + node_dim
     for pos in &result.positions {
         let (n, e, nl, has_ea) = example_dims(pos);
+        debug_assert_eq!(
+            example_features(pos).len(),
+            n * node_dim,
+            "record contains examples with mixed node feature dims"
+        );
         size += 2 + 2 + 2 + 1 + 4 + 4; // header (u16×3 + u8 + value f32 + sample_weight f32)
-        size += (n * 8 * 4) as u32; // features (f32)
+        size += (n * node_dim * 4) as u32; // features (f32)
         size += (e * 2 * 2) as u32; // edge_src + edge_dst (u16)
         if has_ea { size += (e * 5 * 4) as u32; } // edge_attr (f32)
         size += (n * 2) as u32; // legal_mask + stone_mask (u8)
@@ -1062,6 +1084,7 @@ fn write_game_binary<W: Write>(writer: &mut W, result: &GameResult, draw_value: 
     };
     writer.write_all(&[winner_byte as u8])?;
     writer.write_all(&result.move_count.to_le_bytes())?;
+    writer.write_all(&[u8::try_from(node_dim).expect("node_dim exceeds u8")])?;
 
     for pos in &result.positions {
         let value: f64 = if result.winner == "draw" {
@@ -1074,6 +1097,13 @@ fn write_game_binary<W: Write>(writer: &mut W, result: &GameResult, draw_value: 
         write_example(writer, pos, value)?;
     }
     writer.flush()
+}
+
+fn example_features(pos: &PositionData) -> &[f32] {
+    match &pos.graph {
+        GraphOutput::Hex(g) => &g.features,
+        GraphOutput::Axis(g) => &g.features,
+    }
 }
 
 fn example_dims(pos: &PositionData) -> (usize, usize, usize, bool) {
@@ -2469,10 +2499,10 @@ mod tests {
         let result = make_result(GraphType::Hex, "P1");
         let mut buf = Vec::new();
         write_game_binary(&mut buf, &result, 0.0).unwrap();
-        assert!(buf.len() > 17);
+        assert!(buf.len() > 18);
         // Check magic
         assert_eq!(&buf[..4], RECORD_MAGIC);
-        assert_eq!(&buf[..4], b"HX04");
+        assert_eq!(&buf[..4], b"HX05");
         // Read length prefix (after magic)
         let record_len = u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize;
         assert_eq!(record_len, buf.len() - 8); // total - magic - length
@@ -2484,6 +2514,51 @@ mod tests {
         // move_count u32 follows winner byte
         let move_count = u32::from_le_bytes(buf[13..17].try_into().unwrap());
         assert_eq!(move_count, 1);
+        // node_dim u8 follows move_count (8 without threat features)
+        assert_eq!(buf[17], 8);
+    }
+
+    #[test]
+    fn binary_roundtrip_threat_features_node_dim_12() {
+        // 12-dim graphs (threat features on) must record node_dim=12 and a
+        // size field consistent with the wider feature payload.
+        let game = GameState::with_config(small_game_config());
+        let (graph, _) = build_position_graph(&game, GraphType::Hex, false, true);
+        let n_nodes = match &graph {
+            GraphOutput::Hex(g) => g.num_nodes,
+            GraphOutput::Axis(g) => g.num_nodes,
+        };
+        let result = GameResult {
+            positions: vec![PositionData {
+                policy: vec![0.5, 0.5],
+                player: "P1",
+                graph,
+                sample_weight: 1.0,
+            }],
+            winner: "P1",
+            move_count: 1,
+        };
+        let mut buf = Vec::new();
+        write_game_binary(&mut buf, &result, 0.0).unwrap();
+        assert_eq!(&buf[..4], b"HX05");
+        assert_eq!(buf[17], 12, "node_dim must be 12 with threat features");
+        let record_len = u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize;
+        assert_eq!(record_len, buf.len() - 8, "size field must count 12-dim features");
+        // Sanity: the record is exactly n*4*4 bytes larger than its 8-dim twin.
+        let (graph8, _) = build_position_graph(&game, GraphType::Hex, false, false);
+        let result8 = GameResult {
+            positions: vec![PositionData {
+                policy: vec![0.5, 0.5],
+                player: "P1",
+                graph: graph8,
+                sample_weight: 1.0,
+            }],
+            winner: "P1",
+            move_count: 1,
+        };
+        let mut buf8 = Vec::new();
+        write_game_binary(&mut buf8, &result8, 0.0).unwrap();
+        assert_eq!(buf.len() - buf8.len(), n_nodes * 4 * 4);
     }
 
     #[test]
@@ -2492,7 +2567,7 @@ mod tests {
             let result = make_result(GraphType::Hex, w);
             let mut buf = Vec::new();
             write_game_binary(&mut buf, &result, 0.0).unwrap();
-            assert_eq!(&buf[..4], b"HX04");
+            assert_eq!(&buf[..4], b"HX05");
             assert_eq!(buf[12] as i8, expected, "winner {w}");
             // Length prefix should match buffer minus magic+size header
             let record_len = u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize;
