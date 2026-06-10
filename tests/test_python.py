@@ -356,3 +356,81 @@ class TestBatchedSelfPlayWinner:
             assert len(game_traj) > 0
             step = game_traj[0]
             assert len(step) == 4
+
+
+# ------------------------------------------------------------------
+# batched_gumbel_mcts — lockstep multi-position search
+# ------------------------------------------------------------------
+
+class TestBatchedGumbelMcts:
+    def _cfgs(self):
+        cfg = hexo_rs.GameConfig(win_length=4, placement_radius=4, max_moves=50)
+        mcts = hexo_rs.MCTSConfig(n_simulations=4, m_actions=4, c_visit=50, c_scale=1.0)
+        return cfg, mcts
+
+    @staticmethod
+    def _dummy_eval(states):
+        logits, values = [], []
+        for s in states:
+            moves = s.legal_moves()
+            logits.append([-0.1 * (q * q + r * r) for (q, r) in moves])
+            values.append(0.0)
+        return (logits, values)
+
+    def test_returns_policy_per_state_in_legal_moves_order(self):
+        cfg, mcts = self._cfgs()
+        g1 = hexo_rs.GameState(cfg)
+        g1.apply_move(1, 0)
+        g2 = hexo_rs.GameState(cfg)
+        g2.apply_move(1, 1)
+        g2.apply_move(2, 2)
+        results = hexo_rs.batched_gumbel_mcts([g1, g2], self._dummy_eval, mcts, seed=7)
+        assert len(results) == 2
+        for (action, policy), g in zip(results, [g1, g2]):
+            moves = g.legal_moves()
+            assert len(policy) == len(moves)
+            assert abs(sum(policy) - 1.0) < 1e-6
+            assert tuple(action) in set(moves)
+            # Pin the ORDER: _dummy_eval biases logits toward the origin
+            # (-0.1*(q²+r²)), and with all dummy values 0.0 the σ(Q) terms
+            # vanish, so the improved policy is ∝ softmax(prior logits).
+            # The argmax must therefore sit on a minimum-(q²+r²) legal
+            # coord — a permuted policy would break this.
+            d2 = [q * q + r * r for (q, r) in moves]
+            argmax = max(range(len(policy)), key=policy.__getitem__)
+            assert d2[argmax] == min(d2)
+
+    def test_deterministic_with_seed(self):
+        cfg, mcts = self._cfgs()
+        g = hexo_rs.GameState(cfg)
+        g.apply_move(1, 0)
+        r1 = hexo_rs.batched_gumbel_mcts([g], self._dummy_eval, mcts, seed=42)
+        r2 = hexo_rs.batched_gumbel_mcts([g], self._dummy_eval, mcts, seed=42)
+        assert r1 == r2
+
+    def test_terminal_state_rejected(self):
+        cfg, mcts = self._cfgs()
+        g = hexo_rs.GameState(cfg)
+        # P2 builds a 4-in-a-row on the q-axis while P1 plays elsewhere.
+        g.apply_move(1, 0)
+        g.apply_move(2, 0)
+        g.apply_move(0, 3)
+        g.apply_move(0, -3)
+        g.apply_move(3, 0)
+        g.apply_move(4, 0)
+        assert g.is_terminal()
+        with pytest.raises(ValueError, match="terminal"):
+            hexo_rs.batched_gumbel_mcts([g], self._dummy_eval, mcts, seed=1)
+
+    def test_eval_exception_propagates(self):
+        cfg, mcts = self._cfgs()
+        g = hexo_rs.GameState(cfg)
+        g.apply_move(1, 0)
+
+        def bad_eval(states):
+            raise RuntimeError("boom")
+
+        # call_python_eval stringifies the Python error into a ValueError
+        # (same convention as batched_self_play); the message is preserved.
+        with pytest.raises(ValueError, match="boom"):
+            hexo_rs.batched_gumbel_mcts([g], bad_eval, mcts, seed=1)

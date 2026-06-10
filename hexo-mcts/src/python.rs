@@ -406,6 +406,79 @@ fn py_gumbel_mcts(
     Ok((result.action, result.improved_policy))
 }
 
+/// Run Gumbel MCTS on many positions in lockstep with fused leaf evaluation.
+///
+/// All searches advance together: each simulation phase gathers the pending
+/// leaves of every game into one eval_fn call, so a single GPU forward pass
+/// serves the whole batch.
+///
+/// Args:
+///     games: list[hexo_rs.GameState] — all must be non-terminal
+///     eval_fn: callable(list[GameState]) -> tuple[list[list[float]], list[float]]
+///     config: hexo_rs.MCTSConfig
+///     seed: optional int for deterministic RNG
+///
+/// Returns:
+///     list[tuple[tuple[int,int], list[float]]] — one (action, improved_policy)
+///     per input state; improved_policy is ordered like state.legal_moves()
+///     (sorted by coord), matching gumbel_mcts and TrainingExample.policy_target.
+#[pyfunction(name = "batched_gumbel_mcts")]
+#[pyo3(signature = (games, eval_fn, config, seed=None))]
+fn py_batched_gumbel_mcts(
+    py: Python<'_>,
+    games: Vec<PyRef<PyGameState>>,
+    eval_fn: Py<PyAny>,
+    config: &PyMCTSConfig,
+    seed: Option<u64>,
+) -> PyResult<Vec<((i32, i32), Vec<f64>)>> {
+    use crate::mcts::batched::batched_gumbel_mcts;
+    use rand::SeedableRng;
+    use rand_chacha::ChaCha8Rng;
+
+    let states: Vec<GameState> = games.iter().map(|g| g.inner.clone()).collect();
+    if let Some(t) = states.iter().position(|s| s.is_terminal()) {
+        return Err(PyValueError::new_err(format!(
+            "batched_gumbel_mcts: state {t} is terminal"
+        )));
+    }
+
+    let mut rng = match seed {
+        Some(s) => ChaCha8Rng::seed_from_u64(s),
+        None => ChaCha8Rng::from_os_rng(),
+    };
+
+    let mut eval_error: Option<String> = None;
+
+    let eval_fn_ref = &eval_fn;
+    let mut eval = |states: &[GameState]| -> (Vec<HashMap<Coord, f64>>, Vec<f64>) {
+        match call_python_eval(py, eval_fn_ref, states) {
+            Ok(result) => result,
+            Err(e) => {
+                eval_error = Some(e);
+                let dummy = states.iter().map(|_| HashMap::default()).collect();
+                (dummy, vec![0.0; states.len()])
+            }
+        }
+    };
+
+    let results = batched_gumbel_mcts(&states, &config.inner, &mut rng, &mut eval)
+        .map_err(PyValueError::new_err)?;
+
+    // Check if the eval callback encountered a Python error
+    if let Some(e) = eval_error {
+        return Err(if e.contains("KeyboardInterrupt") {
+            pyo3::exceptions::PyKeyboardInterrupt::new_err(e)
+        } else {
+            PyValueError::new_err(e)
+        });
+    }
+
+    Ok(results
+        .into_iter()
+        .map(|r| (r.action, r.improved_policy))
+        .collect())
+}
+
 /// Run Gumbel MCTS and return root visit counts alongside the standard outputs.
 ///
 /// Equivalent to `gumbel_mcts` except the returned tuple also contains a
@@ -1342,6 +1415,7 @@ fn hexo_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyGameState>()?;
     m.add_class::<PyMCTSConfig>()?;
     m.add_function(wrap_pyfunction!(py_gumbel_mcts, m)?)?;
+    m.add_function(wrap_pyfunction!(py_batched_gumbel_mcts, m)?)?;
     m.add_function(wrap_pyfunction!(py_gumbel_mcts_with_stats, m)?)?;
     m.add_function(wrap_pyfunction!(py_gumbel_mcts_with_diagnostics, m)?)?;
     m.add_function(wrap_pyfunction!(py_game_to_graph_raw, m)?)?;
