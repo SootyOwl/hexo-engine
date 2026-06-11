@@ -38,6 +38,7 @@ use hexo_rs::graph_tensors::{GraphTensors, GraphType};
 use hexo_rs::inference::TorchModel;
 use hexo_rs::inference_subprocess::SubprocessModel;
 use hexo_rs::mcts::MCTSConfig;
+use hexo_rs::mcts::acting::exploration_weights;
 
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
@@ -58,22 +59,23 @@ static PROFILE_PLAY_ENABLED: AtomicBool = AtomicBool::new(false);
 // Read once per explored move (atomic load only when disabled).
 static EXPLORE_USE_VISIT_COUNTS: AtomicBool = AtomicBool::new(false);
 
-/// Build the sampling weights for an opening-exploration move.
-///
-/// `use_visit_counts == false` returns the improved policy π' (the default,
-/// matching prior HeXO behaviour). `true` returns the root visit counts cast
-/// to f64 (the Gumbel-AZ-paper acting distribution). Both are unnormalised;
-/// the caller normalises by the sum.
-fn exploration_weights(
-    improved_policy: &[f64],
-    visit_counts: &[u32],
-    use_visit_counts: bool,
-) -> Vec<f64> {
-    if use_visit_counts {
-        visit_counts.iter().map(|&n| n as f64).collect()
-    } else {
-        improved_policy.to_vec()
-    }
+// Q-margin gate for exploration acting (bits of f64; 0.0 = off). Set once
+// from --truncate-delta. See docs/research/2026-06-11-q-margin-truncated-exploration.md.
+static TRUNCATE_DELTA_BITS: AtomicU64 = AtomicU64::new(0);
+
+fn truncate_delta() -> Option<f64> {
+    let d = f64::from_bits(TRUNCATE_DELTA_BITS.load(Ordering::Relaxed));
+    (d > 0.0 && d.is_finite()).then_some(d)
+}
+
+/// Per-game exploration-window telemetry (HX06 envelope fields).
+/// Only populated when the Q-margin gate is active.
+#[derive(Default, Clone, Copy)]
+struct WindowStats {
+    in_window_moves: u16,
+    gated_moves: u16,
+    mass_removed_sum: f32,
+    acted_deficit_sum: f32,
 }
 
 #[derive(Default)]
@@ -133,12 +135,57 @@ fn play_perf_flush() {
 // Batched inference server
 // ---------------------------------------------------------------------------
 
+/// Result payload returned to a game thread: per-state (logit maps, values).
+type EvalResult = (Vec<HashMap<Coord, f64>>, Vec<f64>);
+
 /// A request from a game thread to the inference server.
 struct EvalRequest {
     /// Pre-built graph tensors (game threads build these on CPU).
     graphs: Vec<GraphTensors>,
     /// Channel to send results back to the requesting thread.
-    response_tx: mpsc::Sender<(Vec<HashMap<Coord, f64>>, Vec<f64>)>,
+    response_tx: mpsc::Sender<EvalResult>,
+}
+
+/// A batch of graphs flattened from several [`EvalRequest`]s, retaining each
+/// requester's response channel and its `[start, end)` slice of the flattened
+/// results so the compute stage can scatter outputs back to the right thread.
+struct AssembledBatch {
+    graphs: Vec<GraphTensors>,
+    slices: Vec<(mpsc::Sender<EvalResult>, usize, usize)>,
+}
+
+/// Flatten drained `requests` into one graph batch plus per-request response
+/// slices. Consumes each request's graph vector.
+fn assemble_batch(requests: Vec<EvalRequest>) -> AssembledBatch {
+    let total: usize = requests.iter().map(|r| r.graphs.len()).sum();
+    let mut graphs = Vec::with_capacity(total);
+    let mut slices = Vec::with_capacity(requests.len());
+    for mut req in requests {
+        let start = graphs.len();
+        graphs.append(&mut req.graphs);
+        slices.push((req.response_tx, start, graphs.len()));
+    }
+    AssembledBatch { graphs, slices }
+}
+
+/// Scatter forward-pass results back to each requester. `None` (a forward
+/// error) sends empty logits + zero values sized to each request's slice so
+/// game threads unblock instead of hanging.
+fn scatter_results(slices: Vec<(mpsc::Sender<EvalResult>, usize, usize)>, result: Option<EvalResult>) {
+    match result {
+        Some((all_logits, all_values)) => {
+            for (tx, start, end) in slices {
+                let _ = tx.send((all_logits[start..end].to_vec(), all_values[start..end].to_vec()));
+            }
+        }
+        None => {
+            for (tx, start, end) in slices {
+                let n = end - start;
+                let empty_logits: Vec<HashMap<Coord, f64>> = (0..n).map(|_| HashMap::default()).collect();
+                let _ = tx.send((empty_logits, vec![0.0; n]));
+            }
+        }
+    }
 }
 
 /// How eval requests are distributed across the N inference batcher workers.
@@ -230,6 +277,22 @@ fn build_inference_channels(
     }
 }
 
+/// Edge budget for batch accumulation (0 = off → graph-count `max_batch` only).
+/// Set once from `--max-batch-edges`. When >0 the batchers stop gathering once
+/// total edges reach it, so batches target a fixed GPU work size (≈ the wave-
+/// fill knee, ~46k edges; see docs/research/2026-06-16-inference-batch-edge-knee.md)
+/// instead of a fixed graph count — keeps small-graph (early-game) batches from
+/// running under-filled and large-graph batches from overshooting. Pair with a
+/// high `--max-batch` so the graph count doesn't bind before the edge budget.
+static MAX_BATCH_EDGES: AtomicUsize = AtomicUsize::new(0);
+
+/// Whether the batcher should keep accumulating: below the graph cap AND — when
+/// an edge budget is set — below it too. `total_edges` is summed by each loop.
+fn batch_wants_more(total_graphs: usize, total_edges: usize, max_batch: usize) -> bool {
+    let edge_cap = MAX_BATCH_EDGES.load(Ordering::Relaxed);
+    total_graphs < max_batch && (edge_cap == 0 || total_edges < edge_cap)
+}
+
 /// Run the inference server loop. Collects requests into batches and
 /// runs forward passes. Returns when all senders are dropped or `running`
 /// is set to false.
@@ -277,9 +340,10 @@ fn inference_server(
         // Collect more requests up to max_batch or timeout
         let mut requests = vec![first];
         let mut total_graphs: usize = requests[0].graphs.len();
+        let mut total_edges: usize = requests[0].graphs.iter().map(|g| g.num_edges).sum();
         let deadline = Instant::now() + batch_timeout;
 
-        while total_graphs < max_batch {
+        while batch_wants_more(total_graphs, total_edges, max_batch) {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 break;
@@ -287,6 +351,7 @@ fn inference_server(
             match request_rx.recv_timeout(remaining) {
                 Ok(req) => {
                     total_graphs += req.graphs.len();
+                    total_edges += req.graphs.iter().map(|g| g.num_edges).sum::<usize>();
                     requests.push(req);
                 }
                 Err(_) => break,
@@ -381,9 +446,10 @@ fn inference_server_subprocess(
         // Collect more requests up to max_batch or timeout
         let mut requests = vec![first];
         let mut total_graphs: usize = requests[0].graphs.len();
+        let mut total_edges: usize = requests[0].graphs.iter().map(|g| g.num_edges).sum();
         let deadline = Instant::now() + batch_timeout;
 
-        while total_graphs < max_batch {
+        while batch_wants_more(total_graphs, total_edges, max_batch) {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 break;
@@ -391,50 +457,138 @@ fn inference_server_subprocess(
             match request_rx.recv_timeout(remaining) {
                 Ok(req) => {
                     total_graphs += req.graphs.len();
+                    total_edges += req.graphs.iter().map(|g| g.num_edges).sum::<usize>();
                     requests.push(req);
                 }
                 Err(_) => break,
             }
         }
 
-        // Flatten all graphs into one batch
-        let mut all_graphs = Vec::with_capacity(total_graphs);
-        let mut slice_ranges: Vec<(usize, usize)> = Vec::with_capacity(requests.len());
-        for req in &mut requests {
-            let start = all_graphs.len();
-            all_graphs.extend(req.graphs.drain(..));
-            slice_ranges.push((start, all_graphs.len()));
-        }
-
-        // Single forward pass via subprocess
-        match model.forward_graphs(all_graphs) {
-            Ok((all_logits, all_values)) => {
-                // Scatter results back
-                for (i, req) in requests.into_iter().enumerate() {
-                    let (start, end) = slice_ranges[i];
-                    let logits = all_logits[start..end].to_vec();
-                    let values = all_values[start..end].to_vec();
-                    let _ = req.response_tx.send((logits, values));
-                }
-            }
+        // Flatten, run a single forward pass via subprocess, scatter results.
+        let batch = assemble_batch(requests);
+        let result = match model.forward_graphs(batch.graphs) {
+            Ok(r) => Some(r),
             Err(e) => {
                 eprintln!("Subprocess forward error: {e}");
-                // Send empty results so game threads don't hang
-                for req in requests {
-                    let n = req.graphs.len().max(1); // graphs already drained
-                    let empty_logits: Vec<HashMap<Coord, f64>> =
-                        (0..n).map(|_| HashMap::default()).collect();
-                    let empty_values: Vec<f64> = vec![0.0; n];
-                    let _ = req.response_tx.send((empty_logits, empty_values));
-                }
+                None
             }
-        }
+        };
+        scatter_results(batch.slices, result);
 
         // Check for model reload after processing a batch
         if let Some(path) = model_path {
             model.try_reload(path);
         }
     }
+}
+
+/// Gather stage of the double-buffered server: block for the first request,
+/// accumulate up to `max_batch` graphs or `batch_timeout`, then hand the
+/// assembled batch to the compute stage. Runs concurrently with the forward
+/// pass so batch accumulation overlaps GPU compute instead of stalling it.
+/// Exits when the request channel disconnects or `running` clears.
+fn gather_stage(
+    request_rx: &ReqReceiver<EvalRequest>,
+    max_batch: usize,
+    batch_timeout: Duration,
+    running: &AtomicBool,
+    assembled_tx: mpsc::SyncSender<AssembledBatch>,
+) {
+    loop {
+        let first = match request_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(req) => req,
+            Err(ReqRecvTimeoutError::Timeout) => {
+                if !running.load(Ordering::Relaxed) {
+                    break;
+                }
+                continue;
+            }
+            Err(ReqRecvTimeoutError::Disconnected) => break,
+        };
+
+        let mut requests = vec![first];
+        let mut total_graphs: usize = requests[0].graphs.len();
+        let mut total_edges: usize = requests[0].graphs.iter().map(|g| g.num_edges).sum();
+        let deadline = Instant::now() + batch_timeout;
+        while batch_wants_more(total_graphs, total_edges, max_batch) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match request_rx.recv_timeout(remaining) {
+                Ok(req) => {
+                    total_graphs += req.graphs.len();
+                    total_edges += req.graphs.iter().map(|g| g.num_edges).sum::<usize>();
+                    requests.push(req);
+                }
+                Err(_) => break,
+            }
+        }
+
+        // Hand the assembled batch to the compute stage. A full channel
+        // (capacity 1) applies natural backpressure: the gather thread blocks
+        // here only while a batch is already staged AND compute is mid-forward,
+        // which is exactly the steady-state double-buffered regime. If the
+        // compute stage has gone, stop gathering.
+        if assembled_tx.send(assemble_batch(requests)).is_err() {
+            break;
+        }
+    }
+}
+
+/// Double-buffered subprocess inference server. A gather thread assembles the
+/// next batch from the request queue while this thread runs the current
+/// forward pass, so the `batch_timeout` accumulation window overlaps GPU
+/// compute instead of idling it between passes. Outputs are identical to
+/// [`inference_server_subprocess`]; only the pipelining differs.
+fn inference_server_subprocess_double_buffered(
+    request_rx: ReqReceiver<EvalRequest>,
+    model: &mut SubprocessModel,
+    max_batch: usize,
+    batch_timeout: Duration,
+    running: &AtomicBool,
+    model_path: Option<&str>,
+) {
+    // One-deep handoff: the gather thread can stage exactly one batch ahead.
+    let (assembled_tx, assembled_rx) = mpsc::sync_channel::<AssembledBatch>(1);
+
+    std::thread::scope(|s| {
+        // Gather stage (separate thread): drain requests, hand off batches.
+        s.spawn(move || {
+            gather_stage(&request_rx, max_batch, batch_timeout, running, assembled_tx);
+        });
+
+        // Compute stage (this thread owns the model): forward + scatter.
+        loop {
+            let batch = match assembled_rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(b) => b,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if !running.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    // Reload model during idle, mirroring the serial loop.
+                    if let Some(path) = model_path {
+                        model.try_reload(path);
+                    }
+                    continue;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            };
+
+            let result = match model.forward_graphs(batch.graphs) {
+                Ok(r) => Some(r),
+                Err(e) => {
+                    eprintln!("Subprocess forward error: {e}");
+                    None
+                }
+            };
+            scatter_results(batch.slices, result);
+
+            if let Some(path) = model_path {
+                model.try_reload(path);
+            }
+        }
+    });
 }
 
 /// Pool inference server for subprocess mode. Spawns its own SubprocessModel
@@ -482,14 +636,16 @@ fn pool_inference_server_subprocess(
 
         let mut requests = vec![first];
         let mut total_graphs: usize = requests[0].graphs.len();
+        let mut total_edges: usize = requests[0].graphs.iter().map(|g| g.num_edges).sum();
         let deadline = Instant::now() + batch_timeout;
 
-        while total_graphs < max_batch {
+        while batch_wants_more(total_graphs, total_edges, max_batch) {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() { break; }
             match request_rx.recv_timeout(remaining) {
                 Ok(req) => {
                     total_graphs += req.graphs.len();
+                    total_edges += req.graphs.iter().map(|g| g.num_edges).sum::<usize>();
                     requests.push(req);
                 }
                 Err(_) => break,
@@ -718,14 +874,16 @@ fn pool_inference_server(
 
         let mut requests = vec![first];
         let mut total_graphs: usize = requests[0].graphs.len();
+        let mut total_edges: usize = requests[0].graphs.iter().map(|g| g.num_edges).sum();
         let deadline = Instant::now() + batch_timeout;
 
-        while total_graphs < max_batch {
+        while batch_wants_more(total_graphs, total_edges, max_batch) {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() { break; }
             match request_rx.recv_timeout(remaining) {
                 Ok(req) => {
                     total_graphs += req.graphs.len();
+                    total_edges += req.graphs.iter().map(|g| g.num_edges).sum::<usize>();
                     requests.push(req);
                 }
                 Err(_) => break,
@@ -954,6 +1112,9 @@ struct GameResult {
     /// `positions.len()` when playout cap randomization is active —
     /// fast-search positions advance `move_count` but are not recorded.
     move_count: u32,
+    /// Per-game exploration-window telemetry. Some(...) when the Q-margin
+    /// gate is active (--truncate-delta), None otherwise (HX05 written).
+    window_stats: Option<WindowStats>,
 }
 
 impl GameResult {
@@ -1017,11 +1178,24 @@ impl GameResult {
 /// - HX05: added 1B node_dim to the envelope (after move_count). Node features
 ///   are 8-dim, or 7-dim with --relative-stones (to_move dropped), +4 with
 ///   --threat-features (so 7/8/11/12); HX04 readers assumed 8.
-const RECORD_MAGIC: &[u8; 4] = b"HX05";
+/// - HX06: added 12B window telemetry after node_dim: [2B in_window_moves u16]
+///   [2B gated_moves u16][4B mass_removed_sum f32][4B acted_deficit_sum f32].
+///   Written IFF --truncate-delta is set; gate off → HX05 (byte-identical).
+const RECORD_MAGIC_HX05: &[u8; 4] = b"HX05";
+const RECORD_MAGIC_HX06: &[u8; 4] = b"HX06";
 
 /// Write a game as a length-prefixed binary record.
 ///
-/// Format: `[4B magic "HX05"][4B LE record_size][4B LE num_examples][1B winner i8][4B LE move_count u32][1B node_dim u8][example...]`
+/// When `result.window_stats` is `Some`, writes an HX06 envelope; otherwise
+/// writes HX05 (byte-identical to before, gate-off path unchanged).
+///
+/// HX05 format: `[4B magic "HX05"][4B LE record_size][4B LE num_examples]
+/// [1B winner i8][4B LE move_count u32][1B node_dim u8][examples...]`
+///
+/// HX06 format: same as HX05 but magic = "HX06" and 12B window telemetry
+/// appended after node_dim: `[2B in_window_moves u16][2B gated_moves u16]
+/// [4B mass_removed_sum f32][4B acted_deficit_sum f32][examples...]`
+/// record_size counts everything after the size field (so +12 vs HX05).
 ///
 /// `move_count` is the total number of moves played in the game. With
 /// playout-cap randomisation off (or with the HX04+weighted variant)
@@ -1058,8 +1232,13 @@ fn write_game_binary<W: Write>(writer: &mut W, result: &GameResult, draw_value: 
         })
         .unwrap_or(8);
 
-    // First pass: compute total size
-    let mut size = 4u32 + 1 + 4 + 1; // num_examples + winner byte + move_count + node_dim
+    let has_window_stats = result.window_stats.is_some();
+
+    // First pass: compute total size (everything after the 4B size field)
+    // HX05 envelope: num_examples(4) + winner(1) + move_count(4) + node_dim(1) = 10
+    // HX06 envelope: +12 for window stats (2+2+4+4)
+    let envelope_extra: u32 = if has_window_stats { 12 } else { 0 };
+    let mut size = 4u32 + 1 + 4 + 1 + envelope_extra; // num_examples + winner byte + move_count + node_dim [+ window]
     for pos in &result.positions {
         let (n, e, nl, has_ea) = example_dims(pos);
         debug_assert_eq!(
@@ -1076,7 +1255,8 @@ fn write_game_binary<W: Write>(writer: &mut W, result: &GameResult, draw_value: 
         size += (nl * 4) as u32; // policy (f32)
     }
 
-    writer.write_all(RECORD_MAGIC)?;
+    let magic = if has_window_stats { RECORD_MAGIC_HX06 } else { RECORD_MAGIC_HX05 };
+    writer.write_all(magic)?;
     writer.write_all(&size.to_le_bytes())?;
     writer.write_all(&(result.positions.len() as u32).to_le_bytes())?;
     let winner_byte: i8 = match result.winner {
@@ -1087,6 +1267,13 @@ fn write_game_binary<W: Write>(writer: &mut W, result: &GameResult, draw_value: 
     writer.write_all(&[winner_byte as u8])?;
     writer.write_all(&result.move_count.to_le_bytes())?;
     writer.write_all(&[u8::try_from(node_dim).expect("node_dim exceeds u8")])?;
+
+    if let Some(ws) = result.window_stats {
+        writer.write_all(&ws.in_window_moves.to_le_bytes())?;
+        writer.write_all(&ws.gated_moves.to_le_bytes())?;
+        writer.write_all(&ws.mass_removed_sum.to_le_bytes())?;
+        writer.write_all(&ws.acted_deficit_sum.to_le_bytes())?;
+    }
 
     for pos in &result.positions {
         let value: f64 = if result.winner == "draw" {
@@ -1250,6 +1437,11 @@ fn play_one_game(
     let mut game = GameState::with_config(game_config);
     let mut positions = Vec::new();
     let mut move_count = 0;
+    let mut window_stats = WindowStats::default();
+    // One load for the whole game: the gate setting drives the acting
+    // weights, the stats accumulation, and the HX06-vs-HX05 envelope choice,
+    // which must all agree.
+    let delta = truncate_delta();
     let profile = PROFILE_PLAY_ENABLED.load(Ordering::Relaxed);
 
     while !game.is_terminal() {
@@ -1340,21 +1532,71 @@ fn play_one_game(
         let mcts_total_ns = t.map(|i| i.elapsed().as_nanos()).unwrap_or(0);
 
         let action = if move_count < exploration.load(Ordering::Relaxed) {
-            let weights = exploration_weights(
+            let aw = exploration_weights(
                 &result.improved_policy,
                 &result.visit_counts,
+                &result.per_child_q,
+                &result.candidate_indices,
                 EXPLORE_USE_VISIT_COUNTS.load(Ordering::Relaxed),
+                delta,
             );
-            let total: f64 = weights.iter().sum();
-            if total > 0.0 {
+            let total: f64 = aw.weights.iter().sum();
+            let chosen_coord = if total > 0.0 {
+                // Select proportionally; skip zero-weight entries so that a
+                // rng.random() == 0.0 cannot land on a gate-zeroed move. If
+                // floating-point drift keeps cumsum from ever crossing r, the
+                // post-loop rescue falls back to the last positive-weight
+                // index so chosen always carries a real move.
                 let r: f64 = rng.random::<f64>() * total;
                 let mut cumsum = 0.0;
                 let mut chosen = 0;
-                for (i, &p) in weights.iter().enumerate() {
-                    cumsum += p;
-                    if cumsum >= r { chosen = i; break; }
+                let mut last_positive = 0;
+                for (i, &p) in aw.weights.iter().enumerate() {
+                    if p > 0.0 {
+                        last_positive = i;
+                        cumsum += p;
+                        if cumsum >= r { chosen = i; break; }
+                    }
                 }
-                result.coords[chosen]
+                // If no break fired (rounding drift), fall back to last
+                // positive-weight entry so chosen always carries a real move.
+                if cumsum < r { chosen = last_positive; }
+                Some(chosen)
+            } else {
+                None
+            };
+            // Record telemetry for every in-window move when the gate is
+            // active, regardless of whether total > 0 (all-gated fallback).
+            // This prevents the mass_removed=1.0 events from being silently
+            // censored from window stats.
+            if delta.is_some() {
+                window_stats.in_window_moves = window_stats.in_window_moves.saturating_add(1);
+                if aw.mass_removed > 0.0 {
+                    window_stats.gated_moves = window_stats.gated_moves.saturating_add(1);
+                }
+                window_stats.mass_removed_sum += aw.mass_removed as f32;
+                // Determine the index of the move ACTUALLY played so that
+                // acted_deficit reflects the real exploration choice.
+                let played_idx_opt = if let Some(c) = chosen_coord {
+                    Some(c)
+                } else {
+                    // All-gated fallback: find result.action in result.coords.
+                    // If invariant breaks and action is absent, skip deficit
+                    // accumulation entirely rather than misattributing to index 0.
+                    result.coords.iter().position(|&c| c == result.action)
+                };
+                if aw.q_max.is_finite() {
+                    if let Some(played_idx) = played_idx_opt {
+                        // .max(0.0) also absorbs a NaN chosen-Q (NaN.max(0.0)
+                        // = 0.0), matching acting.rs's NaN fail-safe; don't
+                        // refactor to clamp or an `if deficit > 0.0` guard.
+                        window_stats.acted_deficit_sum +=
+                            (aw.q_max - result.per_child_q[played_idx]).max(0.0) as f32;
+                    }
+                }
+            }
+            if let Some(c) = chosen_coord {
+                result.coords[c]
             } else {
                 result.action
             }
@@ -1405,7 +1647,8 @@ fn play_one_game(
         None => "draw",
     };
 
-    Some(GameResult { positions, winner, move_count: move_count as u32 })
+    let game_window_stats = delta.is_some().then_some(window_stats);
+    Some(GameResult { positions, winner, move_count: move_count as u32, window_stats: game_window_stats })
 }
 
 // ---------------------------------------------------------------------------
@@ -1498,6 +1741,7 @@ fn main() {
     let mut c_visit: u32 = 50;
     let mut c_scale: f64 = 1.0;
     let mut exploration: usize = 16;
+    let mut truncate_delta_arg: Option<f64> = None;
     let mut exploration_fraction: Option<f64> = None;
     let mut output_path = "trajectories.json".to_string();
     let mut output_dir: Option<String> = None;
@@ -1508,6 +1752,7 @@ fn main() {
     let mut graph_type_str = "hex".to_string();
     let mut output_filename = "games.bin".to_string();
     let mut max_batch: usize = 0; // 0 = auto
+    let mut max_batch_edges: usize = 0; // 0 = off (graph-count batching only)
     let mut batch_timeout_ms: u64 = 0; // 0 = auto
     let mut max_file_mb: u64 = 2048;
     let mut pool_dir: Option<String> = None;
@@ -1544,6 +1789,11 @@ fn main() {
     // ~67 graphs); strictly more general for future multi-GPU. Pass
     // `--inference-dispatch round-robin` for the legacy push behaviour.
     let mut inference_dispatch = DispatchMode::Shared;
+    // Double-buffer the subprocess inference server: a gather thread assembles
+    // the next batch while the compute thread runs the current forward pass,
+    // overlapping the batch_timeout accumulation window with GPU compute.
+    // Off by default (prototype); only applies to --python-inference.
+    let mut inference_double_buffer = false;
     let mut checkpoint_path: Option<String> = None;
     let mut model_hidden_dim: usize = 256;
     let mut model_num_layers: usize = 3;
@@ -1588,6 +1838,7 @@ fn main() {
             "--c-visit" => { c_visit = args[i + 1].parse().unwrap(); i += 2; }
             "--c-scale" => { c_scale = args[i + 1].parse().unwrap(); i += 2; }
             "--exploration" => { exploration = args[i + 1].parse().unwrap(); i += 2; }
+            "--truncate-delta" => { truncate_delta_arg = Some(args[i + 1].parse().unwrap()); i += 2; }
             "--exploration-fraction" => { exploration_fraction = Some(args[i + 1].parse().unwrap()); i += 2; }
             "--exploration-max" => { exploration_max = Some(args[i + 1].parse().unwrap()); i += 2; }
             "--exploration-window" => { exploration_window = args[i + 1].parse().unwrap(); i += 2; }
@@ -1603,6 +1854,7 @@ fn main() {
             "--graph-type" => { graph_type_str = args[i + 1].clone(); i += 2; }
             "--jsonl-filename" | "--output-filename" => { output_filename = args[i + 1].clone(); i += 2; }
             "--max-batch" => { max_batch = args[i + 1].parse().unwrap(); i += 2; }
+            "--max-batch-edges" => { max_batch_edges = args[i + 1].parse().unwrap(); i += 2; }
             "--batch-timeout-ms" => { batch_timeout_ms = args[i + 1].parse().unwrap(); i += 2; }
             "--max-file-mb" => { max_file_mb = args[i + 1].parse().unwrap(); i += 2; }
             "--pool-dir" => { pool_dir = Some(args[i + 1].clone()); i += 2; }
@@ -1657,6 +1909,7 @@ fn main() {
                 };
                 i += 2;
             }
+            "--inference-double-buffer" => { inference_double_buffer = true; i += 1; }
             "--python-bin" => { python_bin = args[i + 1].clone(); i += 2; }
             "--checkpoint" => { checkpoint_path = Some(args[i + 1].clone()); i += 2; }
             "--model-hidden-dim" => { model_hidden_dim = args[i + 1].parse().unwrap(); i += 2; }
@@ -1717,6 +1970,15 @@ fn main() {
         python_inference_workers = 1;
     }
 
+    // Double-buffering is wired only into the subprocess inference path.
+    if inference_double_buffer && !python_inference {
+        eprintln!(
+            "Warning: --inference-double-buffer currently applies only to \
+             --python-inference; ignoring."
+        );
+        inference_double_buffer = false;
+    }
+
     // Auto-detect thread counts
     let num_cpus = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -1729,6 +1991,17 @@ fn main() {
     }
     if max_batch == 0 {
         max_batch = n_threads * 2; // reasonable default
+    }
+    // Edge-targeted batching (≈ the ~44-46k-edge GPU wave-fill knee). When set,
+    // the batchers accumulate to this edge budget instead of a fixed graph
+    // count; pair with a high `--max-batch` so the graph cap stays a safety
+    // ceiling rather than binding first.
+    MAX_BATCH_EDGES.store(max_batch_edges, Ordering::Relaxed);
+    if max_batch_edges > 0 {
+        eprintln!(
+            "Edge-targeted batching: max_batch_edges={max_batch_edges} \
+             (graph cap max_batch={max_batch} = safety ceiling)"
+        );
     }
 
     // SAFETY: called before spawning threads.
@@ -1772,6 +2045,21 @@ fn main() {
     };
     EXPLORE_USE_VISIT_COUNTS.store(explore_use_visit_counts, Ordering::Relaxed);
 
+    // Values ≤ 0.0 or non-finite are treated as gate-off (None); callers must
+    // pass a finite δ > 0 to activate. Storing 0 for non-finite is safe.
+    let effective_truncate_delta = truncate_delta_arg.filter(|&d| d > 0.0 && d.is_finite());
+    if truncate_delta_arg.is_some() && effective_truncate_delta.is_none() {
+        eprintln!(
+            "warning: --truncate-delta value {:?} was discarded (must be finite and > 0); \
+             Q-margin gate is OFF",
+            truncate_delta_arg
+        );
+    }
+    TRUNCATE_DELTA_BITS.store(
+        effective_truncate_delta.unwrap_or(0.0).to_bits(),
+        Ordering::Relaxed,
+    );
+
     let game_config = GameConfig { win_length, placement_radius: radius, max_moves };
     let mcts_config = Arc::new(MCTSConfig {
         n_simulations: n_sims,
@@ -1811,6 +2099,9 @@ fn main() {
             "Playing {} games (sims={}, m={}, c_visit={}, c_scale={}, explore={}, threads={}, omp={}, max_batch={}, warmup={})...",
             n_games, n_sims, m_actions, c_visit, c_scale, exploration, n_threads, omp_threads, max_batch, warmup_games,
         );
+        if let Some(delta) = effective_truncate_delta {
+            eprintln!("Q-margin gate: truncate_delta={delta}");
+        }
 
         // Create inference channel (batch mode is always single-worker, so
         // dispatch mode is irrelevant — one channel either way).
@@ -1833,17 +2124,28 @@ fn main() {
                 threat_features, relative_stones,
             );
             eprintln!("Spawning Python inference subprocess...");
+            if inference_double_buffer {
+                eprintln!("Double-buffered inference enabled (gather/compute split).");
+            }
             let mut model = SubprocessModel::spawn(&python_bin, ckpt, &model_args)
                 .unwrap_or_else(|e| { eprintln!("Failed to spawn Python: {e}"); std::process::exit(1); });
 
             std::thread::scope(|s| {
                 let running_ref = &running;
                 let model_ref = &mut model;
+                let double_buffer = inference_double_buffer;
                 let server_handle = s.spawn(move || {
-                    inference_server_subprocess(
-                        request_rx, model_ref, max_batch, batch_timeout,
-                        running_ref, None,
-                    );
+                    if double_buffer {
+                        inference_server_subprocess_double_buffered(
+                            request_rx, model_ref, max_batch, batch_timeout,
+                            running_ref, None,
+                        );
+                    } else {
+                        inference_server_subprocess(
+                            request_rx, model_ref, max_batch, batch_timeout,
+                            running_ref, None,
+                        );
+                    }
                 });
 
                 let (results, measured) = run_batch_games_with_warmup(
@@ -1941,6 +2243,9 @@ fn main() {
                 n_threads, omp_threads, max_batch, dir, output_filename, exploration,
             );
         }
+        if let Some(delta) = effective_truncate_delta {
+            eprintln!("Q-margin gate: truncate_delta={delta} (HX06 envelope, window telemetry enabled)");
+        }
 
         let game_counter = Arc::new(AtomicU64::new(0));
 
@@ -2014,17 +2319,29 @@ fn main() {
                 }
             }
 
+            if inference_double_buffer {
+                eprintln!("Double-buffered inference enabled (gather/compute split).");
+            }
+
             std::thread::scope(|s| {
                 let running_ref = &running;
                 let model_path_ref = model_path.as_str();
                 // Each batcher thread gets one (rx, &mut model) pair.
                 for (rx_opt, model) in main_request_rxs.iter_mut().zip(models.iter_mut()) {
                     let rx = rx_opt.take().expect("each receiver consumed exactly once");
+                    let double_buffer = inference_double_buffer;
                     s.spawn(move || {
-                        inference_server_subprocess(
-                            rx, model, max_batch, batch_timeout,
-                            running_ref, Some(model_path_ref),
-                        );
+                        if double_buffer {
+                            inference_server_subprocess_double_buffered(
+                                rx, model, max_batch, batch_timeout,
+                                running_ref, Some(model_path_ref),
+                            );
+                        } else {
+                            inference_server_subprocess(
+                                rx, model, max_batch, batch_timeout,
+                                running_ref, Some(model_path_ref),
+                            );
+                        }
                     });
                 }
 
@@ -2502,6 +2819,91 @@ mod tests {
         GameConfig { win_length: 4, placement_radius: 4, max_moves: 50 }
     }
 
+    /// Minimal GraphTensors tagged via `num_nodes` so order/identity is checkable.
+    fn dummy_graph(tag: usize) -> GraphTensors {
+        GraphTensors {
+            features: Vec::new(),
+            edge_src: Vec::new(),
+            edge_dst: Vec::new(),
+            edge_attr: None,
+            legal_mask: Vec::new(),
+            stone_mask: Vec::new(),
+            legal_coords: Vec::new(),
+            num_nodes: tag,
+            num_edges: 0,
+        }
+    }
+
+    fn req_with_graphs(tags: &[usize]) -> (EvalRequest, mpsc::Receiver<EvalResult>) {
+        let (tx, rx) = mpsc::channel();
+        let graphs = tags.iter().map(|&t| dummy_graph(t)).collect();
+        (EvalRequest { graphs, response_tx: tx }, rx)
+    }
+
+    /// One logit map per state, carrying a single sentinel entry so each
+    /// state's result is distinguishable after scatter.
+    fn fake_results(n: usize) -> EvalResult {
+        let logits = (0..n)
+            .map(|i| {
+                let mut m: HashMap<Coord, f64> = HashMap::default();
+                m.insert((0i32, 0i32), i as f64);
+                m
+            })
+            .collect();
+        let values = (0..n).map(|i| i as f64).collect();
+        (logits, values)
+    }
+
+    #[test]
+    fn assemble_batch_flattens_and_slices_in_order() {
+        let (r0, _rx0) = req_with_graphs(&[10, 11]);
+        let (r1, _rx1) = req_with_graphs(&[20]);
+        let (r2, _rx2) = req_with_graphs(&[30, 31, 32]);
+
+        let batch = assemble_batch(vec![r0, r1, r2]);
+
+        // Graphs flattened in request order, identities preserved via tags.
+        let tags: Vec<usize> = batch.graphs.iter().map(|g| g.num_nodes).collect();
+        assert_eq!(tags, vec![10, 11, 20, 30, 31, 32]);
+        // Slice ranges are contiguous and sized to each request's graph count.
+        let ranges: Vec<(usize, usize)> =
+            batch.slices.iter().map(|(_, s, e)| (*s, *e)).collect();
+        assert_eq!(ranges, vec![(0, 2), (2, 3), (3, 6)]);
+    }
+
+    #[test]
+    fn scatter_results_routes_each_slice_to_its_requester() {
+        let (r0, rx0) = req_with_graphs(&[1, 1]);
+        let (r1, rx1) = req_with_graphs(&[1]);
+        let batch = assemble_batch(vec![r0, r1]);
+
+        scatter_results(batch.slices, Some(fake_results(3)));
+
+        let (logits0, values0) = rx0.recv().unwrap();
+        assert_eq!(values0, vec![0.0, 1.0]); // first two states
+        assert_eq!(logits0[0][&(0i32, 0i32)], 0.0);
+        let (logits1, values1) = rx1.recv().unwrap();
+        assert_eq!(values1, vec![2.0]); // third state
+        assert_eq!(logits1[0][&(0i32, 0i32)], 2.0);
+    }
+
+    #[test]
+    fn scatter_results_none_sends_correctly_sized_empties() {
+        let (r0, rx0) = req_with_graphs(&[1, 1, 1]);
+        let (r1, rx1) = req_with_graphs(&[1]);
+        let batch = assemble_batch(vec![r0, r1]);
+
+        scatter_results(batch.slices, None);
+
+        let (logits0, values0) = rx0.recv().unwrap();
+        assert_eq!(values0, vec![0.0; 3]);
+        assert_eq!(logits0.len(), 3);
+        assert!(logits0.iter().all(|m| m.is_empty()));
+        let (logits1, values1) = rx1.recv().unwrap();
+        assert_eq!(values1, vec![0.0]);
+        assert_eq!(logits1.len(), 1);
+    }
+
     fn make_result(graph_type: GraphType, winner: &'static str) -> GameResult {
         let game = GameState::with_config(small_game_config());
         let (graph, _tensors) = build_position_graph(&game, graph_type, false, false, false);
@@ -2511,6 +2913,7 @@ mod tests {
             ],
             winner,
             move_count: 1,
+            window_stats: None,
         }
     }
 
@@ -2521,7 +2924,7 @@ mod tests {
         write_game_binary(&mut buf, &result, 0.0).unwrap();
         assert!(buf.len() > 18);
         // Check magic
-        assert_eq!(&buf[..4], RECORD_MAGIC);
+        assert_eq!(&buf[..4], RECORD_MAGIC_HX05);
         assert_eq!(&buf[..4], b"HX05");
         // Read length prefix (after magic)
         let record_len = u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize;
@@ -2557,6 +2960,7 @@ mod tests {
             }],
             winner: "P1",
             move_count: 1,
+            window_stats: None,
         };
         let mut buf = Vec::new();
         write_game_binary(&mut buf, &result, 0.0).unwrap();
@@ -2575,6 +2979,7 @@ mod tests {
             }],
             winner: "P1",
             move_count: 1,
+            window_stats: None,
         };
         let mut buf8 = Vec::new();
         write_game_binary(&mut buf8, &result8, 0.0).unwrap();
@@ -2600,6 +3005,7 @@ mod tests {
             }],
             winner: "P1",
             move_count: 1,
+            window_stats: None,
         };
         let mut buf = Vec::new();
         write_game_binary(&mut buf, &result, 0.0).unwrap();
@@ -2672,6 +3078,7 @@ mod tests {
             ],
             winner: "P1",
             move_count: 10,
+            window_stats: None,
         };
         let mut buf = Vec::new();
         write_game_binary(&mut buf, &result, 0.0).unwrap();
@@ -2679,6 +3086,74 @@ mod tests {
         assert_eq!(num_examples, 3, "examples == positions.len()");
         let move_count = u32::from_le_bytes(buf[13..17].try_into().unwrap());
         assert_eq!(move_count, 10, "move_count distinct from examples");
+    }
+
+    #[test]
+    fn hx06_window_stats_roundtrip() {
+        // Gate on (window_stats: Some): magic flips to HX06 and the 12B
+        // window telemetry sits between node_dim and the first example, in
+        // contract order/offsets. Dyadic floats make equality exact.
+        let game = GameState::with_config(small_game_config());
+        let (graph, _) = build_position_graph(&game, GraphType::Hex, false, false, false);
+        let result = GameResult {
+            positions: vec![PositionData {
+                policy: vec![0.5, 0.5],
+                player: "P1",
+                graph,
+                sample_weight: 1.0,
+            }],
+            winner: "P1",
+            move_count: 1,
+            window_stats: Some(WindowStats {
+                in_window_moves: 7,
+                gated_moves: 3,
+                mass_removed_sum: 0.8125,
+                acted_deficit_sum: 0.4375,
+            }),
+        };
+        let mut buf = Vec::new();
+        write_game_binary(&mut buf, &result, 0.0).unwrap();
+        assert_eq!(&buf[..4], RECORD_MAGIC_HX06);
+        assert_eq!(&buf[..4], b"HX06");
+        // record_size counts everything after the size field, incl. the +12.
+        let record_len = u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize;
+        assert_eq!(record_len, buf.len() - 8);
+        // Envelope prefix unchanged vs HX05: num_examples / winner /
+        // move_count / node_dim at the same offsets.
+        assert_eq!(u32::from_le_bytes(buf[8..12].try_into().unwrap()), 1);
+        assert_eq!(buf[12] as i8, 1);
+        assert_eq!(u32::from_le_bytes(buf[13..17].try_into().unwrap()), 1);
+        assert_eq!(buf[17], 8);
+        // Window telemetry at payload offsets 10/12/14/18 (buffer 18/20/22/26).
+        assert_eq!(u16::from_le_bytes(buf[18..20].try_into().unwrap()), 7);
+        assert_eq!(u16::from_le_bytes(buf[20..22].try_into().unwrap()), 3);
+        assert_eq!(f32::from_le_bytes(buf[22..26].try_into().unwrap()), 0.8125);
+        assert_eq!(f32::from_le_bytes(buf[26..30].try_into().unwrap()), 0.4375);
+        // Gate-off twin: identical game, window_stats: None → HX05 magic,
+        // exactly 12 bytes shorter, size field smaller by exactly 12.
+        let buf5 = {
+            let (graph, _) = build_position_graph(&game, GraphType::Hex, false, false, false);
+            let result5 = GameResult {
+                positions: vec![PositionData {
+                    policy: vec![0.5, 0.5],
+                    player: "P1",
+                    graph,
+                    sample_weight: 1.0,
+                }],
+                winner: "P1",
+                move_count: 1,
+                window_stats: None,
+            };
+            let mut b = Vec::new();
+            write_game_binary(&mut b, &result5, 0.0).unwrap();
+            b
+        };
+        assert_eq!(&buf5[..4], b"HX05");
+        assert_eq!(buf.len() - buf5.len(), 12);
+        let record_len5 = u32::from_le_bytes(buf5[4..8].try_into().unwrap()) as usize;
+        assert_eq!(record_len - record_len5, 12);
+        // Example payloads are byte-identical after the envelopes.
+        assert_eq!(&buf[30..], &buf5[18..]);
     }
 
     #[test]
@@ -2690,25 +3165,30 @@ mod tests {
 
     #[test]
     fn exploration_weights_improved_policy_default() {
-        // Default (use_visit_counts=false): returns π' verbatim.
+        // Default (use_visit_counts=false, gate off): returns π' verbatim.
         let pi = vec![0.7, 0.2, 0.1];
         let visits = vec![30u32, 14, 6];
-        let w = exploration_weights(&pi, &visits, false);
-        assert_eq!(w, pi);
+        let q = vec![0.4, 0.3, 0.2];
+        let cands = vec![0, 1, 2];
+        let aw = exploration_weights(&pi, &visits, &q, &cands, false, None);
+        assert_eq!(aw.weights, pi);
+        assert_eq!(aw.mass_removed, 0.0);
     }
 
     #[test]
     fn exploration_weights_visit_counts() {
-        // use_visit_counts=true: returns visit counts cast to f64, NOT π'.
+        // use_visit_counts=true, gate off: returns visit counts cast to f64, NOT π'.
         // This is the broad Sequential-Halving staircase the paper samples.
         let pi = vec![0.99, 0.005, 0.005];
         let visits = vec![30u32, 14, 6];
-        let w = exploration_weights(&pi, &visits, true);
-        assert_eq!(w, vec![30.0, 14.0, 6.0]);
+        let q = vec![0.4, 0.3, 0.2];
+        let cands = vec![0, 1, 2];
+        let aw = exploration_weights(&pi, &visits, &q, &cands, true, None);
+        assert_eq!(aw.weights, vec![30.0, 14.0, 6.0]);
         // The two distributions are genuinely different: π' is near one-hot
         // while the visit-count weights spread mass across the survivors.
         let pi_top = pi[0] / pi.iter().sum::<f64>();
-        let vc_top = w[0] / w.iter().sum::<f64>();
+        let vc_top = aw.weights[0] / aw.weights.iter().sum::<f64>();
         assert!(pi_top > 0.9, "π' should be peaky, got {pi_top}");
         assert!(vc_top < 0.7, "visit counts should be broad, got {vc_top}");
     }
@@ -2725,6 +3205,7 @@ mod tests {
             ],
             winner: "P1",
             move_count: 2,
+            window_stats: None,
         };
         let record = result.to_record(0.0);
         assert_eq!(record.examples[0].value, 1.0);  // P1 wins, P1's turn

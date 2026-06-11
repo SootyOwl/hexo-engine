@@ -1,3 +1,4 @@
+pub mod acting;
 pub mod batcher;
 pub mod backup;
 pub mod batched;
