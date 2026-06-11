@@ -69,12 +69,15 @@ use super::MCTSConfig;
 /// Allocate simulations across candidates using Sequential Halving.
 ///
 /// Each phase distributes simulations to surviving candidates. After each phase,
-/// the bottom half (by Gumbel score) is eliminated.
+/// the bottom half (by Gumbel score) is eliminated, down to a final pair. Any
+/// budget left over from floor rounding is spent in extra rounds over that pair
+/// (mctx parity), so exactly `n_simulations` are used whenever possible.
 ///
 /// The evaluation callback `eval_fn` receives a list of game states that need
 /// network evaluation and returns `(priors_per_state, values)`.
 ///
-/// Returns the list of surviving candidate indices.
+/// Returns the surviving candidate indices (the final pair, best-first); the
+/// caller picks the winner by argmax of gumbel + logit + σ(Q).
 pub fn sequential_halving<F>(
     root: &mut MCTSNode,
     candidate_indices: &[usize],
@@ -102,11 +105,12 @@ where
     let mut remaining: Vec<usize> = candidate_indices.to_vec();
     let mut total_sims_used: u32 = 0;
 
-    for _ in 0..num_phases {
-        if total_sims_used >= n_simulations || remaining.len() <= 1 {
-            break;
-        }
-
+    // mctx parity (seq_halving.get_sequence_of_considered_visits): loop until
+    // the budget is exactly spent, never shrinking the candidate set below the
+    // final pair. Leftover sims from the floor in `sims_per_action` therefore
+    // top up the last head-to-head instead of being dropped. The final winner
+    // is picked by the caller's argmax over the returned survivors.
+    while total_sims_used < n_simulations && remaining.len() > 1 {
         let sims_per_action =
             (n_simulations / (num_phases * remaining.len() as u32)).max(1);
 
@@ -185,7 +189,7 @@ where
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        let keep = (remaining.len() + 1) / 2; // ceil(len/2)
+        let keep = ((remaining.len() + 1) / 2).max(2); // ceil(len/2), floor at the final pair
         remaining.truncate(keep);
     }
 
@@ -399,6 +403,90 @@ mod tests {
             },
         );
         assert!(total_eval_calls <= 4);
+    }
+
+    #[test]
+    fn sequential_halving_spends_full_budget_and_tops_up_final_pair() {
+        // mctx parity: when n is not divisible by the phase arithmetic, the
+        // leftover budget goes to extra rounds over the final pair instead of
+        // being dropped. n=200/m=16: phases spend 3/6/12/25 per survivor
+        // (194 sims); the remaining 6 add 3 more visits to each finalist.
+        let mut root = MCTSNode::new(1.0, None, Player::P1);
+        let coords: Vec<Coord> = (0..16).map(|i| (i, 0)).collect();
+        let priors: HashMap<Coord, f64> =
+            coords.iter().map(|&c| (c, 1.0 / 16.0)).collect();
+        root.expand(priors, 0.0);
+
+        let config = MCTSConfig {
+            n_simulations: 200,
+            m_actions: 16,
+            c_visit: 50,
+            c_scale: 1.0,
+            virtual_loss: 0.0,
+            ..Default::default()
+        };
+        let candidates: Vec<usize> = (0..16).collect();
+        // Descending gumbels: with a no-op eval_fn there are no Q updates,
+        // so elimination preserves this order and candidates 0/1 are the pair.
+        let gumbels: Vec<f64> = (0..16).map(|i| (16 - i) as f64).collect();
+        let logits = vec![0.0; 16];
+
+        let mut total = 0u32;
+        let mut per_action: HashMap<Coord, u32> = HashMap::default();
+        sequential_halving(
+            &mut root,
+            &candidates,
+            &gumbels,
+            &coords,
+            &logits,
+            &config,
+            &mut |_, actions, _, _| {
+                total += actions.len() as u32;
+                for &a in actions {
+                    *per_action.entry(a).or_insert(0) += 1;
+                }
+            },
+        );
+
+        assert_eq!(total, 200, "full simulation budget must be spent");
+        assert_eq!(per_action[&coords[0]], 49, "finalist gets 46 + 3 top-up");
+        assert_eq!(per_action[&coords[1]], 49, "finalist gets 46 + 3 top-up");
+    }
+
+    #[test]
+    fn sequential_halving_top_up_fused_path_matches_serial_budget() {
+        // The virtual-loss fused path must spend the identical budget.
+        let mut root = MCTSNode::new(1.0, None, Player::P1);
+        let coords: Vec<Coord> = (0..16).map(|i| (i, 0)).collect();
+        let priors: HashMap<Coord, f64> =
+            coords.iter().map(|&c| (c, 1.0 / 16.0)).collect();
+        root.expand(priors, 0.0);
+
+        let config = MCTSConfig {
+            n_simulations: 200,
+            m_actions: 16,
+            c_visit: 50,
+            c_scale: 1.0,
+            virtual_loss: 0.5,
+            ..Default::default()
+        };
+        let candidates: Vec<usize> = (0..16).collect();
+        let gumbels: Vec<f64> = (0..16).map(|i| (16 - i) as f64).collect();
+        let logits = vec![0.0; 16];
+
+        let mut total = 0u32;
+        sequential_halving(
+            &mut root,
+            &candidates,
+            &gumbels,
+            &coords,
+            &logits,
+            &config,
+            &mut |_, actions, _, _| {
+                total += actions.len() as u32;
+            },
+        );
+        assert_eq!(total, 200, "fused path must spend the full budget too");
     }
 
     #[test]

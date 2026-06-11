@@ -114,22 +114,17 @@ where
     let c_scale = config.c_scale;
 
     if n_simulations > 0 {
-        // Compute max phases across all searches
-        let max_phases = searches
-            .iter()
-            .map(|s| {
-                if s.candidate_indices.len() <= 1 {
-                    0
-                } else {
-                    (s.candidate_indices.len() as f64).log2().ceil() as u32
-                }
-            })
-            .max()
-            .unwrap_or(0);
-
         let mut sims_used: Vec<u32> = vec![0; searches.len()];
 
-        for _phase in 0..max_phases {
+        // mctx parity: iterate until every search has spent its full budget,
+        // never shrinking a candidate set below the final pair. Leftover sims
+        // from the floor in `sims_per_action` top up the last head-to-head
+        // instead of being dropped (mirrors halving.rs::sequential_halving).
+        while searches
+            .iter()
+            .enumerate()
+            .any(|(i, s)| sims_used[i] < n_simulations && s.remaining.len() > 1)
+        {
             // Compute sims_per_action for each search
             let num_phases_per_search: Vec<u32> = searches
                 .iter()
@@ -244,7 +239,7 @@ where
                         + sigma(qctx.norm_q[&search.coords[b]], qctx.max_child_visits, c_visit, c_scale);
                     score_b.partial_cmp(&score_a).unwrap_or(std::cmp::Ordering::Equal)
                 });
-                let keep = (search.remaining.len() + 1) / 2;
+                let keep = ((search.remaining.len() + 1) / 2).max(2); // floor at the final pair
                 search.remaining.truncate(keep);
             }
         }
@@ -286,4 +281,53 @@ where
     }
 
     Ok(results)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hexo_engine::GameConfig;
+    use rand::SeedableRng;
+    use rand_chacha::ChaCha8Rng;
+
+    fn uniform_eval(states: &[GameState]) -> (Vec<HashMap<Coord, f64>>, Vec<f64>) {
+        let logits = states
+            .iter()
+            .map(|s| s.legal_moves().iter().map(|&c| (c, 0.0)).collect())
+            .collect();
+        (logits, vec![0.0; states.len()])
+    }
+
+    #[test]
+    fn batched_lockstep_spends_full_budget_via_top_up() {
+        // mctx parity for the lockstep copy of SH: n=200/m=16 must spend all
+        // 200 sims (the nominal phases only cover 194). win_length=7 keeps
+        // every leaf non-terminal at the depths this search reaches, so the
+        // eval_fn sees exactly 1 root state + 1 state per simulation.
+        let game = GameState::with_config(GameConfig {
+            win_length: 7,
+            placement_radius: 2,
+            max_moves: 200,
+        });
+        assert!(game.legal_moves().len() >= 16);
+
+        let config = MCTSConfig {
+            n_simulations: 200,
+            m_actions: 16,
+            c_visit: 50,
+            c_scale: 1.0,
+            virtual_loss: 0.0,
+            ..Default::default()
+        };
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+
+        let mut states_seen = 0usize;
+        let mut eval = |states: &[GameState]| {
+            states_seen += states.len();
+            uniform_eval(states)
+        };
+        batched_gumbel_mcts(&[game], &config, &mut rng, &mut eval).unwrap();
+
+        assert_eq!(states_seen, 1 + 200, "1 root eval + full sim budget");
+    }
 }

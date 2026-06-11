@@ -1310,17 +1310,21 @@ mod tests {
 
     #[test]
     fn gumbel_mcts_fused_sh_calls_eval_at_most_once_per_phase() {
-        // Fusion is gated on `virtual_loss > 0`. With VL > 0, each SH phase
-        // emits exactly one `eval_fn` call (1 root + ≤ num_phases calls).
+        // Fusion is gated on `virtual_loss > 0`. With VL > 0, each SH
+        // while-iteration emits exactly one `eval_fn` call: 1 root +
+        // num_phases halving iterations + budget top-up iterations on the
+        // final pair (mctx parity). For n=32/m=8 the halving phases spend
+        // 8+8+10=26 sims; the leftover 6 fit in one top-up iteration
+        // (spa=5 → up to 10 sims), so the bound is 1 + num_phases + 1.
         // With VL = 0, the original serial loop runs (sims_per_action calls
-        // per phase), so call count is strictly higher.
+        // per iteration), so call count is strictly higher.
         let game = GameState::with_config(small_config());
         let n_legal = game.legal_moves().len();
         let num_candidates = n_legal.min(8);
         let num_phases = (num_candidates as f64).log2().ceil() as u32;
-        let fused_expected_max = 1 + num_phases;
+        let fused_expected_max = 1 + num_phases + 1;
 
-        // VL > 0 → fused, bounded by 1 + num_phases.
+        // VL > 0 → fused, bounded by 1 + num_phases + 1 top-up.
         let config_fused = MCTSConfig {
             n_simulations: 32, m_actions: 8, c_visit: 50, c_scale: 1.0,
             virtual_loss: 0.5,
