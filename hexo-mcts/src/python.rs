@@ -1377,6 +1377,77 @@ fn py_game_states_to_batch(
     ))
 }
 
+/// Reinterpret a slice as native-endian raw bytes (single memcpy on the Python side).
+fn as_bytes<T: Copy>(v: &[T]) -> &[u8] {
+    // SAFETY: T is a plain-old-data numeric/bool type with no padding between
+    // elements of a slice; lifetime is tied to the borrow.
+    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
+}
+
+/// Collate AXIS graphs for a batch of states into flat native-endian byte
+/// buffers, ready for zero-copy `torch.frombuffer` — avoids the per-element
+/// Python list -> tensor conversion cost of the dict-based builders.
+///
+/// Returns a dict: x (f32), edge_src/edge_dst (i64), edge_attr (f32, E*5),
+/// legal_mask (bool), batch (i64), coords (i32, N*2), legal_counts (i64),
+/// legal_idx/stone_idx/stone_batch (i64) as bytes; num_graphs and n_feat as ints.
+#[pyfunction(
+    name = "game_states_to_axis_batch_bytes",
+    signature = (states, prune_empty_edges=false, threat_features=false, relative_stones=false)
+)]
+fn py_game_states_to_axis_batch_bytes(
+    py: Python<'_>,
+    states: Vec<Py<PyGameState>>,
+    prune_empty_edges: bool,
+    threat_features: bool,
+    relative_stones: bool,
+) -> PyResult<Py<PyDict>> {
+    use crate::batch_tensors::collate_axis_graphs;
+
+    let inner_states: Vec<GameState> = states
+        .iter()
+        .enumerate()
+        .map(|(i, g)| {
+            let gs = g.borrow(py);
+            if gs.inner.is_terminal() {
+                return Err(PyValueError::new_err(format!(
+                    "Cannot construct graph for a terminal game state (game index {i})."
+                )));
+            }
+            Ok(gs.inner.clone())
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+
+    let bt = py.detach(|| {
+        let graphs = crate::axis_graph::game_to_axis_graph_batch_opts(
+            &inner_states,
+            prune_empty_edges,
+            threat_features,
+            relative_stones,
+        );
+        collate_axis_graphs(&graphs)
+    });
+
+    let total_nodes = bt.batch.len();
+    let n_feat = if total_nodes > 0 { bt.features.len() / total_nodes } else { 0 };
+
+    let dict = PyDict::new(py);
+    dict.set_item("x", pyo3::types::PyBytes::new(py, as_bytes(&bt.features)))?;
+    dict.set_item("edge_src", pyo3::types::PyBytes::new(py, as_bytes(&bt.edge_index_src)))?;
+    dict.set_item("edge_dst", pyo3::types::PyBytes::new(py, as_bytes(&bt.edge_index_dst)))?;
+    dict.set_item("edge_attr", pyo3::types::PyBytes::new(py, as_bytes(&bt.edge_attr)))?;
+    dict.set_item("legal_mask", pyo3::types::PyBytes::new(py, as_bytes(&bt.legal_mask)))?;
+    dict.set_item("batch", pyo3::types::PyBytes::new(py, as_bytes(&bt.batch)))?;
+    dict.set_item("coords", pyo3::types::PyBytes::new(py, as_bytes(&bt.coords)))?;
+    dict.set_item("legal_counts", pyo3::types::PyBytes::new(py, as_bytes(&bt.legal_counts)))?;
+    dict.set_item("legal_idx", pyo3::types::PyBytes::new(py, as_bytes(&bt.legal_idx)))?;
+    dict.set_item("stone_idx", pyo3::types::PyBytes::new(py, as_bytes(&bt.stone_idx)))?;
+    dict.set_item("stone_batch", pyo3::types::PyBytes::new(py, as_bytes(&bt.stone_batch)))?;
+    dict.set_item("num_graphs", bt.num_graphs)?;
+    dict.set_item("n_feat", n_feat)?;
+    Ok(dict.into())
+}
+
 // ---------------------------------------------------------------------------
 // Phase 0 DAG-MCTS spike: thread-local instrumentation bindings.
 // Feature-gated; only present when built with `--features dedup_count`.
@@ -1435,6 +1506,7 @@ fn hexo_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_game_to_graph_raw, m)?)?;
     m.add_function(wrap_pyfunction!(py_game_to_graph_batch, m)?)?;
     m.add_function(wrap_pyfunction!(py_game_states_to_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(py_game_states_to_axis_batch_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(py_game_to_axis_graph_raw, m)?)?;
     m.add_function(wrap_pyfunction!(py_game_to_axis_graph_batch, m)?)?;
     m.add_function(wrap_pyfunction!(py_augment_graph, m)?)?;
