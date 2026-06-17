@@ -414,10 +414,54 @@ pub fn augment_axis_graph(game: &GameState) -> Vec<(AxisGraphData, Vec<usize>)> 
     augment_axis_graph_opts(game, false)
 }
 
-/// Augment with optional empty-edge pruning.
+/// Augment with optional empty-edge pruning (8-dim absolute features).
 pub fn augment_axis_graph_opts(game: &GameState, prune_empty_edges: bool) -> Vec<(AxisGraphData, Vec<usize>)> {
+    augment_axis_graph_all_opts(game, prune_empty_edges, false, false)
+}
+
+/// Augment with optional empty-edge pruning and optional threat / relative
+/// node-feature encodings. Loops the 11 non-identity D6 transforms, calling
+/// [`augment_axis_graph_single`] for each.
+pub fn augment_axis_graph_all_opts(
+    game: &GameState,
+    prune_empty_edges: bool,
+    threat_features: bool,
+    relative_stones: bool,
+) -> Vec<(AxisGraphData, Vec<usize>)> {
     use hexo_engine::symmetry::D6_TRANSFORMS;
 
+    D6_TRANSFORMS[1..]
+        .iter()
+        .map(|&transform| {
+            augment_axis_graph_single(
+                game,
+                transform,
+                prune_empty_edges,
+                threat_features,
+                relative_stones,
+            )
+        })
+        .collect()
+}
+
+/// Apply a single D6 `transform` to `game`'s board and build the axis-window
+/// graph for the transformed position, honouring the threat / relative
+/// node-feature flags. Returns `(graph, permutation)` where
+/// `permutation[new_legal_idx] = old_legal_idx`.
+///
+/// The transform is applied directly to the stone and legal-move coordinates
+/// (then re-sorted), which is equivalent to — and avoids the cost of — replaying
+/// moves on a freshly reconstructed `GameState`. When `threat_features` is set
+/// the threat dims must be computed against the transformed board, so a
+/// transformed `GameState` is materialised via [`GameState::from_state`] purely
+/// to drive `fill_threat_features` (mirroring `game_to_axis_graph_raw_opts`).
+pub fn augment_axis_graph_single(
+    game: &GameState,
+    transform: fn(Coord) -> Coord,
+    prune_empty_edges: bool,
+    threat_features: bool,
+    relative_stones: bool,
+) -> (AxisGraphData, Vec<usize>) {
     let mut stones = game.placed_stones();
     stones.sort_by_key(|&(c, _)| c);
     let legal = game.legal_moves(); // already sorted
@@ -429,33 +473,51 @@ pub fn augment_axis_graph_opts(game: &GameState, prune_empty_edges: bool) -> Vec
     let moves_feat: f32 = game.moves_remaining_this_turn() as f32 / 2.0;
     let win_length = game.config().win_length;
 
-    D6_TRANSFORMS[1..]
+    // Transform and sort stones.
+    let mut t_stones: Vec<(Coord, Player)> = stones
         .iter()
-        .map(|transform| {
-            // Transform and sort stones
-            let mut t_stones: Vec<(Coord, Player)> = stones
-                .iter()
-                .map(|&(c, p)| (transform(c), p))
-                .collect();
-            t_stones.sort_by_key(|&(c, _)| c);
+        .map(|&(c, p)| (transform(c), p))
+        .collect();
+    t_stones.sort_by_key(|&(c, _)| c);
 
-            // Transform legal moves, tracking original indices for permutation
-            let mut indexed_legal: Vec<(Coord, usize)> = legal
-                .iter()
-                .enumerate()
-                .map(|(i, &c)| (transform(c), i))
-                .collect();
-            indexed_legal.sort_by_key(|&(c, _)| c);
+    // Transform legal moves, tracking original indices for the permutation.
+    let mut indexed_legal: Vec<(Coord, usize)> = legal
+        .iter()
+        .enumerate()
+        .map(|(i, &c)| (transform(c), i))
+        .collect();
+    indexed_legal.sort_by_key(|&(c, _)| c);
 
-            let t_legal: Vec<Coord> = indexed_legal.iter().map(|&(c, _)| c).collect();
-            let permutation: Vec<usize> = indexed_legal.iter().map(|&(_, i)| i).collect();
+    let t_legal: Vec<Coord> = indexed_legal.iter().map(|&(c, _)| c).collect();
+    let permutation: Vec<usize> = indexed_legal.iter().map(|&(_, i)| i).collect();
 
-            // augmentation path does not support threat_features or
-            // relative_stones; always 8-dim absolute
-            let graph = build_axis_graph(&t_stones, &t_legal, player_feat, moves_feat, win_length, prune_empty_edges, false, false);
-            (graph, permutation)
-        })
-        .collect()
+    let mut graph = build_axis_graph(
+        &t_stones,
+        &t_legal,
+        player_feat,
+        moves_feat,
+        win_length,
+        prune_empty_edges,
+        threat_features,
+        relative_stones,
+    );
+
+    if threat_features {
+        // `build_axis_graph` zeroes the threat dims; fill them from the
+        // transformed board, exactly as `game_to_axis_graph_raw_opts` does.
+        let t_game = GameState::from_state(
+            &t_stones,
+            game.current_player()
+                .expect("augment_axis_graph_single called on terminal GameState"),
+            game.moves_remaining_this_turn(),
+            *game.config(),
+        );
+        let n_real = graph.num_nodes - 1;
+        let base_dim = if relative_stones { 7 } else { 8 };
+        crate::graph::fill_threat_features(&mut graph.features, &graph.coords, n_real, &t_game, base_dim);
+    }
+
+    (graph, permutation)
 }
 
 #[cfg(test)]
@@ -1439,6 +1501,88 @@ mod tests {
             let n_legal: usize = g.legal_mask.iter().filter(|&&b| b).count();
             assert_eq!(n_stones, orig_stones);
             assert_eq!(n_legal, orig_legal);
+        }
+    }
+
+    /// D6-equivariance of the augment helper across ALL 4 node-feature
+    /// encodings: building the axis graph from transformed stones/legal (the
+    /// augment path) must match building it from a `GameState` reconstructed on
+    /// the transformed board (the honest path), for the same flags.
+    #[test]
+    fn augment_axis_graph_single_equivariant_all_encodings() {
+        use hexo_engine::symmetry::D6_TRANSFORMS;
+
+        let game = mid_game();
+        let cfg = *game.config();
+        let stones = game.placed_stones();
+        let current_player = game.current_player().unwrap();
+        let moves_remaining = game.moves_remaining_this_turn();
+
+        let prune = false;
+        for (threat, relative) in [(false, false), (false, true), (true, false), (true, true)] {
+            // Every non-identity D6 transform must be equivariant.
+            for k in 1..D6_TRANSFORMS.len() {
+                let transform = D6_TRANSFORMS[k];
+                let (aug_graph, perm) =
+                    augment_axis_graph_single(&game, transform, prune, threat, relative);
+
+                // Honest path: reconstruct the transformed board and build from it.
+                let t_stones: Vec<(Coord, Player)> =
+                    stones.iter().map(|&(c, p)| (transform(c), p)).collect();
+                let t_game =
+                    GameState::from_state(&t_stones, current_player, moves_remaining, cfg);
+                let honest = game_to_axis_graph_raw_opts(&t_game, prune, threat, relative);
+
+                let ctx = format!("threat={threat} relative={relative} transform={k}");
+                assert_eq!(aug_graph.features, honest.features, "features mismatch ({ctx})");
+                assert_eq!(aug_graph.edge_src, honest.edge_src, "edge_src mismatch ({ctx})");
+                assert_eq!(aug_graph.edge_dst, honest.edge_dst, "edge_dst mismatch ({ctx})");
+                assert_eq!(aug_graph.edge_attr, honest.edge_attr, "edge_attr mismatch ({ctx})");
+                assert_eq!(aug_graph.legal_mask, honest.legal_mask, "legal_mask mismatch ({ctx})");
+                assert_eq!(aug_graph.stone_mask, honest.stone_mask, "stone_mask mismatch ({ctx})");
+                assert_eq!(aug_graph.coords, honest.coords, "coords mismatch ({ctx})");
+                assert_eq!(aug_graph.num_nodes, honest.num_nodes, "num_nodes mismatch ({ctx})");
+
+                // Expected feature dim per encoding.
+                let base = if relative { 7 } else { 8 };
+                let fdim = base + if threat { 4 } else { 0 };
+                assert_eq!(
+                    aug_graph.features.len(),
+                    aug_graph.num_nodes * fdim,
+                    "feature dim mismatch ({ctx})"
+                );
+
+                // Permutation maps augmented legal index -> original legal index,
+                // and must be a permutation of 0..n_legal.
+                let n_legal = perm.len();
+                let mut seen = vec![false; n_legal];
+                for &orig in &perm {
+                    assert!(orig < n_legal, "perm out of range ({ctx})");
+                    assert!(!seen[orig], "perm not injective ({ctx})");
+                    seen[orig] = true;
+                }
+            }
+        }
+    }
+
+    /// The batched-binding path collates `augment_axis_graph_single` outputs via
+    /// `collate_axis_graphs`. For a single state, the collated `x`/`legal_mask`
+    /// must equal the augment helper's graph bytes (no reordering / loss). This
+    /// mirrors what `py_augment_axis_states_to_batch_bytes` emits for one state.
+    #[test]
+    fn augment_axis_single_state_collate_matches_helper() {
+        use crate::batch_tensors::collate_axis_graphs;
+        use hexo_engine::symmetry::D6_TRANSFORMS;
+
+        let game = mid_game();
+        let k = 5;
+        for (threat, relative) in [(false, false), (false, true), (true, false), (true, true)] {
+            let (graph, _perm) =
+                augment_axis_graph_single(&game, D6_TRANSFORMS[k], false, threat, relative);
+            let bt = collate_axis_graphs(std::slice::from_ref(&graph));
+            assert_eq!(bt.features, graph.features, "x mismatch (threat={threat} relative={relative})");
+            assert_eq!(bt.legal_mask, graph.legal_mask, "legal_mask mismatch (threat={threat} relative={relative})");
+            assert_eq!(bt.num_graphs, 1);
         }
     }
 }
