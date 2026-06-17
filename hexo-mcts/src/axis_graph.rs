@@ -341,6 +341,25 @@ fn build_axis_graph(
     }
 }
 
+/// Fill the threat-encoding node dims of `graph` from `game`'s board, when
+/// `threat_features` is set. Real nodes only — the dummy node (last) keeps its
+/// zeros, so `n_real = num_nodes - 1`. `base_dim` is the stone-feature width
+/// (7 relative, 8 absolute) that the threat dims are appended after. The caller
+/// must pass the game whose board the threats should be read from (the original
+/// game for `game_to_axis_graph_raw_opts`, the transformed game for augment).
+fn fill_axis_threat(
+    graph: &mut AxisGraphData,
+    game: &GameState,
+    threat_features: bool,
+    relative_stones: bool,
+) {
+    if threat_features {
+        let n_real = graph.num_nodes - 1;
+        let base_dim = if relative_stones { 7 } else { 8 };
+        crate::graph::fill_threat_features(&mut graph.features, &graph.coords, n_real, game, base_dim);
+    }
+}
+
 /// Build axis-window graph arrays from a GameState.
 pub fn game_to_axis_graph_raw(game: &GameState) -> AxisGraphData {
     game_to_axis_graph_raw_opts(game, false, false, false)
@@ -377,12 +396,8 @@ pub fn game_to_axis_graph_raw_opts(
         threat_features,
         relative_stones,
     );
-    if threat_features {
-        // Real nodes only — the dummy node (last) keeps zeros in the threat dims.
-        let n_real = g.num_nodes - 1;
-        let base_dim = if relative_stones { 7 } else { 8 };
-        crate::graph::fill_threat_features(&mut g.features, &g.coords, n_real, game, base_dim);
-    }
+    // Real nodes only — threats read from the original game's board.
+    fill_axis_threat(&mut g, game, threat_features, relative_stones);
     g
 }
 
@@ -512,9 +527,7 @@ pub fn augment_axis_graph_single(
             game.moves_remaining_this_turn(),
             *game.config(),
         );
-        let n_real = graph.num_nodes - 1;
-        let base_dim = if relative_stones { 7 } else { 8 };
-        crate::graph::fill_threat_features(&mut graph.features, &graph.coords, n_real, &t_game, base_dim);
+        fill_axis_threat(&mut graph, &t_game, threat_features, relative_stones);
     }
 
     (graph, permutation)

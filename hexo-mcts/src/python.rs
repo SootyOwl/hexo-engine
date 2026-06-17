@@ -1387,6 +1387,53 @@ fn as_bytes<T: Copy>(v: &[T]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
 }
 
+/// Clone the inner `GameState`s out of a batch of `PyGameState`s, rejecting any
+/// terminal state (graphs cannot be built for terminal positions). The error
+/// message carries the offending game index.
+fn collect_inner_states(py: Python<'_>, states: &[Py<PyGameState>]) -> PyResult<Vec<GameState>> {
+    states
+        .iter()
+        .enumerate()
+        .map(|(i, g)| {
+            let gs = g.borrow(py);
+            if gs.inner.is_terminal() {
+                return Err(PyValueError::new_err(format!(
+                    "Cannot construct graph for a terminal game state (game index {i})."
+                )));
+            }
+            Ok(gs.inner.clone())
+        })
+        .collect::<PyResult<Vec<_>>>()
+}
+
+/// Build the shared zero-copy byte-buffer dict for a collated AXIS batch. Fills
+/// the keys common to both batch builders (x, edge_src/dst, edge_attr,
+/// legal_mask, batch, coords, legal_counts, legal_idx, stone_idx, stone_batch,
+/// num_graphs, n_feat); callers may add extra keys (e.g. `permutations`).
+fn axis_batch_to_pydict<'py>(
+    py: Python<'py>,
+    bt: &crate::batch_tensors::AxisBatchTensors,
+) -> PyResult<Bound<'py, PyDict>> {
+    let total_nodes = bt.batch.len();
+    let n_feat = if total_nodes > 0 { bt.features.len() / total_nodes } else { 0 };
+
+    let dict = PyDict::new(py);
+    dict.set_item("x", pyo3::types::PyBytes::new(py, as_bytes(&bt.features)))?;
+    dict.set_item("edge_src", pyo3::types::PyBytes::new(py, as_bytes(&bt.edge_index_src)))?;
+    dict.set_item("edge_dst", pyo3::types::PyBytes::new(py, as_bytes(&bt.edge_index_dst)))?;
+    dict.set_item("edge_attr", pyo3::types::PyBytes::new(py, as_bytes(&bt.edge_attr)))?;
+    dict.set_item("legal_mask", pyo3::types::PyBytes::new(py, as_bytes(&bt.legal_mask)))?;
+    dict.set_item("batch", pyo3::types::PyBytes::new(py, as_bytes(&bt.batch)))?;
+    dict.set_item("coords", pyo3::types::PyBytes::new(py, as_bytes(&bt.coords)))?;
+    dict.set_item("legal_counts", pyo3::types::PyBytes::new(py, as_bytes(&bt.legal_counts)))?;
+    dict.set_item("legal_idx", pyo3::types::PyBytes::new(py, as_bytes(&bt.legal_idx)))?;
+    dict.set_item("stone_idx", pyo3::types::PyBytes::new(py, as_bytes(&bt.stone_idx)))?;
+    dict.set_item("stone_batch", pyo3::types::PyBytes::new(py, as_bytes(&bt.stone_batch)))?;
+    dict.set_item("num_graphs", bt.num_graphs)?;
+    dict.set_item("n_feat", n_feat)?;
+    Ok(dict)
+}
+
 /// Collate AXIS graphs for a batch of states into flat native-endian byte
 /// buffers, ready for zero-copy `torch.frombuffer` — avoids the per-element
 /// Python list -> tensor conversion cost of the dict-based builders.
@@ -1407,19 +1454,7 @@ fn py_game_states_to_axis_batch_bytes(
 ) -> PyResult<Py<PyDict>> {
     use crate::batch_tensors::collate_axis_graphs;
 
-    let inner_states: Vec<GameState> = states
-        .iter()
-        .enumerate()
-        .map(|(i, g)| {
-            let gs = g.borrow(py);
-            if gs.inner.is_terminal() {
-                return Err(PyValueError::new_err(format!(
-                    "Cannot construct graph for a terminal game state (game index {i})."
-                )));
-            }
-            Ok(gs.inner.clone())
-        })
-        .collect::<PyResult<Vec<_>>>()?;
+    let inner_states = collect_inner_states(py, &states)?;
 
     let bt = py.detach(|| {
         let graphs = crate::axis_graph::game_to_axis_graph_batch_opts(
@@ -1431,23 +1466,7 @@ fn py_game_states_to_axis_batch_bytes(
         collate_axis_graphs(&graphs)
     });
 
-    let total_nodes = bt.batch.len();
-    let n_feat = if total_nodes > 0 { bt.features.len() / total_nodes } else { 0 };
-
-    let dict = PyDict::new(py);
-    dict.set_item("x", pyo3::types::PyBytes::new(py, as_bytes(&bt.features)))?;
-    dict.set_item("edge_src", pyo3::types::PyBytes::new(py, as_bytes(&bt.edge_index_src)))?;
-    dict.set_item("edge_dst", pyo3::types::PyBytes::new(py, as_bytes(&bt.edge_index_dst)))?;
-    dict.set_item("edge_attr", pyo3::types::PyBytes::new(py, as_bytes(&bt.edge_attr)))?;
-    dict.set_item("legal_mask", pyo3::types::PyBytes::new(py, as_bytes(&bt.legal_mask)))?;
-    dict.set_item("batch", pyo3::types::PyBytes::new(py, as_bytes(&bt.batch)))?;
-    dict.set_item("coords", pyo3::types::PyBytes::new(py, as_bytes(&bt.coords)))?;
-    dict.set_item("legal_counts", pyo3::types::PyBytes::new(py, as_bytes(&bt.legal_counts)))?;
-    dict.set_item("legal_idx", pyo3::types::PyBytes::new(py, as_bytes(&bt.legal_idx)))?;
-    dict.set_item("stone_idx", pyo3::types::PyBytes::new(py, as_bytes(&bt.stone_idx)))?;
-    dict.set_item("stone_batch", pyo3::types::PyBytes::new(py, as_bytes(&bt.stone_batch)))?;
-    dict.set_item("num_graphs", bt.num_graphs)?;
-    dict.set_item("n_feat", n_feat)?;
+    let dict = axis_batch_to_pydict(py, &bt)?;
     Ok(dict.into())
 }
 
@@ -1492,19 +1511,7 @@ fn py_augment_axis_states_to_batch_bytes(
         }
     }
 
-    let inner_states: Vec<GameState> = states
-        .iter()
-        .enumerate()
-        .map(|(i, g)| {
-            let gs = g.borrow(py);
-            if gs.inner.is_terminal() {
-                return Err(PyValueError::new_err(format!(
-                    "Cannot construct graph for a terminal game state (game index {i})."
-                )));
-            }
-            Ok(gs.inner.clone())
-        })
-        .collect::<PyResult<Vec<_>>>()?;
+    let inner_states = collect_inner_states(py, &states)?;
 
     let (bt, permutations) = py.detach(|| {
         use rayon::prelude::*;
@@ -1534,23 +1541,7 @@ fn py_augment_axis_states_to_batch_bytes(
         (collate_axis_graphs(&graphs), permutations)
     });
 
-    let total_nodes = bt.batch.len();
-    let n_feat = if total_nodes > 0 { bt.features.len() / total_nodes } else { 0 };
-
-    let dict = PyDict::new(py);
-    dict.set_item("x", pyo3::types::PyBytes::new(py, as_bytes(&bt.features)))?;
-    dict.set_item("edge_src", pyo3::types::PyBytes::new(py, as_bytes(&bt.edge_index_src)))?;
-    dict.set_item("edge_dst", pyo3::types::PyBytes::new(py, as_bytes(&bt.edge_index_dst)))?;
-    dict.set_item("edge_attr", pyo3::types::PyBytes::new(py, as_bytes(&bt.edge_attr)))?;
-    dict.set_item("legal_mask", pyo3::types::PyBytes::new(py, as_bytes(&bt.legal_mask)))?;
-    dict.set_item("batch", pyo3::types::PyBytes::new(py, as_bytes(&bt.batch)))?;
-    dict.set_item("coords", pyo3::types::PyBytes::new(py, as_bytes(&bt.coords)))?;
-    dict.set_item("legal_counts", pyo3::types::PyBytes::new(py, as_bytes(&bt.legal_counts)))?;
-    dict.set_item("legal_idx", pyo3::types::PyBytes::new(py, as_bytes(&bt.legal_idx)))?;
-    dict.set_item("stone_idx", pyo3::types::PyBytes::new(py, as_bytes(&bt.stone_idx)))?;
-    dict.set_item("stone_batch", pyo3::types::PyBytes::new(py, as_bytes(&bt.stone_batch)))?;
-    dict.set_item("num_graphs", bt.num_graphs)?;
-    dict.set_item("n_feat", n_feat)?;
+    let dict = axis_batch_to_pydict(py, &bt)?;
     let perms = pyo3::types::PyList::empty(py);
     for perm in &permutations {
         perms.append(pyo3::types::PyList::new(py, perm)?)?;
