@@ -1507,16 +1507,27 @@ fn py_augment_axis_states_to_batch_bytes(
         .collect::<PyResult<Vec<_>>>()?;
 
     let (bt, permutations) = py.detach(|| {
-        let mut graphs = Vec::with_capacity(inner_states.len());
-        let mut permutations = Vec::with_capacity(inner_states.len());
-        for (state, &idx) in inner_states.iter().zip(transform_indices.iter()) {
-            let (graph, perm) = crate::axis_graph::augment_axis_graph_single(
-                state,
-                D6_TRANSFORMS[idx],
-                prune_empty_edges,
-                threat_features,
-                relative_stones,
-            );
+        use rayon::prelude::*;
+        // Build per-state (graph, permutation) pairs in parallel. rayon's
+        // par_iter().map().collect() preserves input order, which is required
+        // so that `permutations[i]` and the collated graphs line up with state
+        // `i` (and the caller's policy targets).
+        let pairs: Vec<(crate::axis_graph::AxisGraphData, Vec<usize>)> = inner_states
+            .par_iter()
+            .zip(transform_indices.par_iter())
+            .map(|(state, &idx)| {
+                crate::axis_graph::augment_axis_graph_single(
+                    state,
+                    D6_TRANSFORMS[idx],
+                    prune_empty_edges,
+                    threat_features,
+                    relative_stones,
+                )
+            })
+            .collect();
+        let mut graphs = Vec::with_capacity(pairs.len());
+        let mut permutations = Vec::with_capacity(pairs.len());
+        for (graph, perm) in pairs {
             graphs.push(graph);
             permutations.push(perm);
         }
