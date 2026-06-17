@@ -1060,18 +1060,17 @@ fn try_reload_model(
 // ---------------------------------------------------------------------------
 
 /// A single training example written to the output file.
-/// Contains pre-built graph data + targets. Serialized with msgpack.
+/// Contains board state + targets (HX07). The graph is rebuilt downstream
+/// via `GameState::from_state`. Serialized as JSON in batch mode.
 #[derive(serde::Serialize)]
 struct ExampleRecord {
-    features: Vec<f32>,    // N×8 flat
-    edge_src: Vec<i64>,
-    edge_dst: Vec<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    edge_attr: Option<Vec<f32>>,  // E×5 flat, axis only
-    legal_mask: Vec<bool>,
-    stone_mask: Vec<bool>,
-    coords: Vec<i32>,      // N×2 flat
-    num_nodes: usize,
+    /// Placed stones as `(q, r, player)` with player 0 = P1, 1 = P2.
+    /// Includes the (0,0) opening stone.
+    stones: Vec<(i32, i32, u8)>,
+    /// Side to move: 0 = P1, 1 = P2.
+    current_player: u8,
+    /// Moves left in the current player's turn (1 or 2).
+    moves_remaining: u8,
     policy: Vec<f64>,
     value: f64,
     sample_weight: f32,
@@ -1089,19 +1088,18 @@ struct GameRecord {
 struct PositionData {
     policy: Vec<f64>,
     player: &'static str,
-    graph: GraphOutput,
+    /// Board state at this position: placed stones (incl. the (0,0) opening)
+    /// plus the turn info needed to reconstruct the graph via
+    /// `GameState::from_state` on the Python side. HX07 ships board state
+    /// instead of the full serialized graph.
+    stones: Vec<(hexo_engine::types::Coord, hexo_engine::types::Player)>,
+    moves_remaining: u8,
     /// Per-example loss weight in [0, 1]. 1.0 for full-cap MCTS searches;
     /// `1/playout_cap_divisor` for fast-cap searches under PCR. Reflects
     /// the relative trust in the improved-policy target as a function of
     /// the search budget that produced it. Written to the wire format
     /// (HX04) and applied multiplicatively in the trainer's loss.
     sample_weight: f32,
-}
-
-/// Holds the raw graph data for serialization (avoids cloning into JSON).
-enum GraphOutput {
-    Hex(hexo_rs::graph::GraphData),
-    Axis(hexo_rs::axis_graph::AxisGraphData),
 }
 
 /// Completed game data.
@@ -1128,33 +1126,18 @@ impl GameResult {
             } else {
                 -1.0
             };
-            match &pos.graph {
-                GraphOutput::Hex(g) => ExampleRecord {
-                    features: g.features.clone(),
-                    edge_src: g.edge_src.clone(),
-                    edge_dst: g.edge_dst.clone(),
-                    edge_attr: None,
-                    legal_mask: g.legal_mask.clone(),
-                    stone_mask: g.stone_mask.clone(),
-                    coords: g.coords.clone(),
-                    num_nodes: g.num_nodes,
-                    policy: pos.policy.clone(),
-                    value,
-                    sample_weight: pos.sample_weight,
-                },
-                GraphOutput::Axis(g) => ExampleRecord {
-                    features: g.features.clone(),
-                    edge_src: g.edge_src.clone(),
-                    edge_dst: g.edge_dst.clone(),
-                    edge_attr: Some(g.edge_attr.clone()),
-                    legal_mask: g.legal_mask.clone(),
-                    stone_mask: g.stone_mask.clone(),
-                    coords: g.coords.clone(),
-                    num_nodes: g.num_nodes,
-                    policy: pos.policy.clone(),
-                    value,
-                    sample_weight: pos.sample_weight,
-                },
+            let stones = pos
+                .stones
+                .iter()
+                .map(|&((q, r), p)| (q, r, player_byte(p)))
+                .collect();
+            ExampleRecord {
+                stones,
+                current_player: player_byte_from_str(pos.player),
+                moves_remaining: pos.moves_remaining,
+                policy: pos.policy.clone(),
+                value,
+                sample_weight: pos.sample_weight,
             }
         }).collect();
         GameRecord {
@@ -1181,82 +1164,65 @@ impl GameResult {
 /// - HX06: added 12B window telemetry after node_dim: [2B in_window_moves u16]
 ///   [2B gated_moves u16][4B mass_removed_sum f32][4B acted_deficit_sum f32].
 ///   Written IFF --truncate-delta is set; gate off → HX05 (byte-identical).
-const RECORD_MAGIC_HX05: &[u8; 4] = b"HX05";
-const RECORD_MAGIC_HX06: &[u8; 4] = b"HX06";
+/// - HX07: board-state record format. The full graph (features/edges/edge_attr/
+///   masks/coords) is no longer serialized; only the board state (stones +
+///   side-to-move + moves_remaining) is shipped, and the graph is rebuilt
+///   downstream via `GameState::from_state`. Drops the HX05 `node_dim` byte
+///   and replaces the HX05/HX06 magic split with a 1B `has_window` flag.
+const RECORD_MAGIC_HX07: &[u8; 4] = b"HX07";
 
-/// Write a game as a length-prefixed binary record.
+/// Map a `Player` to its wire byte: P1 → 0, P2 → 1.
+#[inline]
+fn player_byte(p: hexo_engine::types::Player) -> u8 {
+    match p {
+        hexo_engine::types::Player::P1 => 0,
+        hexo_engine::types::Player::P2 => 1,
+    }
+}
+
+/// Map the internal `"P1"`/`"P2"` side string to its wire byte (0/1).
+#[inline]
+fn player_byte_from_str(s: &str) -> u8 {
+    if s == "P2" { 1 } else { 0 }
+}
+
+/// Write a game as a length-prefixed binary record (HX07).
 ///
-/// When `result.window_stats` is `Some`, writes an HX06 envelope; otherwise
-/// writes HX05 (byte-identical to before, gate-off path unchanged).
+/// Envelope: `[4B magic "HX07"][4B LE record_size][4B LE num_examples]
+/// [1B winner i8][4B LE move_count u32][1B has_window u8]
+/// [opt 12B window stats]`. `record_size` counts everything after the size
+/// field. When `result.window_stats` is `Some`, `has_window` = 1 and the 12B
+/// window telemetry (`[2B in_window_moves u16][2B gated_moves u16]
+/// [4B mass_removed_sum f32][4B acted_deficit_sum f32]`) follows the flag.
 ///
-/// HX05 format: `[4B magic "HX05"][4B LE record_size][4B LE num_examples]
-/// [1B winner i8][4B LE move_count u32][1B node_dim u8][examples...]`
-///
-/// HX06 format: same as HX05 but magic = "HX06" and 12B window telemetry
-/// appended after node_dim: `[2B in_window_moves u16][2B gated_moves u16]
-/// [4B mass_removed_sum f32][4B acted_deficit_sum f32][examples...]`
-/// record_size counts everything after the size field (so +12 vs HX05).
-///
-/// `move_count` is the total number of moves played in the game. With
-/// playout-cap randomisation off (or with the HX04+weighted variant)
-/// `move_count` equals `num_examples`. With legacy PCR-discard active
-/// (HX03) `move_count` could exceed `num_examples`.
-///
+/// `move_count` is the total number of moves played in the game.
 /// `winner`: 1 = P1, -1 = P2, 0 = draw.
 ///
-/// `node_dim` is the per-node feature width (7/8 base depending on
-/// --relative-stones, +4 with threat features → 7, 8, 11, or 12); uniform
-/// across all examples in a record (all positions of one game are built with
-/// the same flags).
-///
-/// Each example:
+/// Each example (board state, no graph):
 /// ```text
-/// [2B num_nodes][2B num_edges][2B num_legal][1B has_edge_attr][4B value f32]
-/// [4B sample_weight f32]                                         -- HX04+
-/// [num_nodes*node_dim*4B features f32]
-/// [num_edges*2B edge_src u16][num_edges*2B edge_dst u16]
-/// [num_edges*5*4B edge_attr f32]  -- only if has_edge_attr
-/// [num_nodes*1B legal_mask u8][num_nodes*1B stone_mask u8]
-/// [num_nodes*2*2B coords i16]
+/// [2B num_stones u16][1B current_player u8 (0=P1,1=P2)][1B moves_remaining u8]
+/// [2B num_legal u16][4B value f32][4B sample_weight f32]
+/// [num_stones*(2B q i16, 2B r i16, 1B player u8)]
 /// [num_legal*4B policy f32]
 /// ```
-fn write_game_binary<W: Write>(writer: &mut W, result: &GameResult, draw_value: f32) -> std::io::Result<()> {
-    // Node-feature width: uniform across the record (all positions of one
-    // game are built with the same threat_features flag).
-    let node_dim = result
-        .positions
-        .first()
-        .map(|pos| {
-            let (n, _, _, _) = example_dims(pos);
-            example_features(pos).len() / n.max(1)
-        })
-        .unwrap_or(8);
-
+/// Per-example header = 14 bytes (2+1+1+2+4+4); body = num_stones*5 + num_legal*4.
+fn write_game_binary_hx07<W: Write>(writer: &mut W, result: &GameResult, draw_value: f32) -> std::io::Result<()> {
     let has_window_stats = result.window_stats.is_some();
 
-    // First pass: compute total size (everything after the 4B size field)
-    // HX05 envelope: num_examples(4) + winner(1) + move_count(4) + node_dim(1) = 10
-    // HX06 envelope: +12 for window stats (2+2+4+4)
+    // First pass: total size (everything after the 4B size field).
+    // Envelope: num_examples(4) + winner(1) + move_count(4) + has_window(1) = 10
+    //           + 12 when window stats present.
     let envelope_extra: u32 = if has_window_stats { 12 } else { 0 };
-    let mut size = 4u32 + 1 + 4 + 1 + envelope_extra; // num_examples + winner byte + move_count + node_dim [+ window]
+    let mut size = 4u32 + 1 + 4 + 1 + envelope_extra;
     for pos in &result.positions {
-        let (n, e, nl, has_ea) = example_dims(pos);
-        debug_assert_eq!(
-            example_features(pos).len(),
-            n * node_dim,
-            "record contains examples with mixed node feature dims"
-        );
-        size += 2 + 2 + 2 + 1 + 4 + 4; // header (u16×3 + u8 + value f32 + sample_weight f32)
-        size += (n * node_dim * 4) as u32; // features (f32)
-        size += (e * 2 * 2) as u32; // edge_src + edge_dst (u16)
-        if has_ea { size += (e * 5 * 4) as u32; } // edge_attr (f32)
-        size += (n * 2) as u32; // legal_mask + stone_mask (u8)
-        size += (n * 2 * 2) as u32; // coords (i16)
-        size += (nl * 4) as u32; // policy (f32)
+        let num_stones = pos.stones.len();
+        let num_legal = pos.policy.len();
+        size += 14; // per-example header (2+1+1+2+4+4)
+        size += (num_stones * 5) as u32; // stones (2B q + 2B r + 1B player)
+        size += (num_legal * 4) as u32; // policy (f32)
     }
 
-    let magic = if has_window_stats { RECORD_MAGIC_HX06 } else { RECORD_MAGIC_HX05 };
-    writer.write_all(magic)?;
+    writer.write_all(RECORD_MAGIC_HX07)?;
     writer.write_all(&size.to_le_bytes())?;
     writer.write_all(&(result.positions.len() as u32).to_le_bytes())?;
     let winner_byte: i8 = match result.winner {
@@ -1266,7 +1232,7 @@ fn write_game_binary<W: Write>(writer: &mut W, result: &GameResult, draw_value: 
     };
     writer.write_all(&[winner_byte as u8])?;
     writer.write_all(&result.move_count.to_le_bytes())?;
-    writer.write_all(&[u8::try_from(node_dim).expect("node_dim exceeds u8")])?;
+    writer.write_all(&[has_window_stats as u8])?;
 
     if let Some(ws) = result.window_stats {
         writer.write_all(&ws.in_window_moves.to_le_bytes())?;
@@ -1283,58 +1249,29 @@ fn write_game_binary<W: Write>(writer: &mut W, result: &GameResult, draw_value: 
         } else {
             -1.0
         };
-        write_example(writer, pos, value)?;
+        write_example_hx07(writer, pos, value)?;
     }
     writer.flush()
 }
 
-fn example_features(pos: &PositionData) -> &[f32] {
-    match &pos.graph {
-        GraphOutput::Hex(g) => &g.features,
-        GraphOutput::Axis(g) => &g.features,
-    }
-}
-
-fn example_dims(pos: &PositionData) -> (usize, usize, usize, bool) {
-    match &pos.graph {
-        GraphOutput::Hex(g) => (g.num_nodes, g.edge_src.len(), pos.policy.len(), false),
-        GraphOutput::Axis(g) => (g.num_nodes, g.edge_src.len(), pos.policy.len(), true),
-    }
-}
-
-fn write_example<W: Write>(writer: &mut W, pos: &PositionData, value: f64) -> std::io::Result<()> {
-    let (features, edge_src, edge_dst, edge_attr, legal_mask, stone_mask, coords) = match &pos.graph {
-        GraphOutput::Hex(g) => (&g.features, &g.edge_src, &g.edge_dst, None, &g.legal_mask, &g.stone_mask, &g.coords),
-        GraphOutput::Axis(g) => (&g.features, &g.edge_src, &g.edge_dst, Some(&g.edge_attr), &g.legal_mask, &g.stone_mask, &g.coords),
-    };
-
-    let num_nodes = legal_mask.len();
-    let num_edges = edge_src.len();
+fn write_example_hx07<W: Write>(writer: &mut W, pos: &PositionData, value: f64) -> std::io::Result<()> {
+    let num_stones = pos.stones.len();
     let num_legal = pos.policy.len();
-    let has_ea = edge_attr.is_some();
 
-    // Header
-    writer.write_all(&(num_nodes as u16).to_le_bytes())?;
-    writer.write_all(&(num_edges as u16).to_le_bytes())?;
+    // Header (14 bytes)
+    writer.write_all(&(num_stones as u16).to_le_bytes())?;
+    writer.write_all(&[player_byte_from_str(pos.player)])?;
+    writer.write_all(&[pos.moves_remaining])?;
     writer.write_all(&(num_legal as u16).to_le_bytes())?;
-    writer.write_all(&[has_ea as u8])?;
     writer.write_all(&(value as f32).to_le_bytes())?;
     writer.write_all(&pos.sample_weight.to_le_bytes())?;
 
-    // Features (f32 LE)
-    for &f in features { writer.write_all(&f.to_le_bytes())?; }
-    // Edge src/dst (u16 LE)
-    for &s in edge_src { writer.write_all(&(s as u16).to_le_bytes())?; }
-    for &d in edge_dst { writer.write_all(&(d as u16).to_le_bytes())?; }
-    // Edge attr (f32 LE, optional)
-    if let Some(ea) = edge_attr {
-        for &a in ea { writer.write_all(&a.to_le_bytes())?; }
+    // Stones: 2B q i16, 2B r i16, 1B player u8
+    for &((q, r), p) in &pos.stones {
+        writer.write_all(&(q as i16).to_le_bytes())?;
+        writer.write_all(&(r as i16).to_le_bytes())?;
+        writer.write_all(&[player_byte(p)])?;
     }
-    // Masks (u8)
-    for &b in legal_mask { writer.write_all(&[b as u8])?; }
-    for &b in stone_mask { writer.write_all(&[b as u8])?; }
-    // Coords (i16 LE)
-    for &c in coords { writer.write_all(&(c as i16).to_le_bytes())?; }
     // Policy (f32 LE)
     for &p in &pos.policy { writer.write_all(&(p as f32).to_le_bytes())?; }
 
@@ -1351,25 +1288,23 @@ fn game_to_json(result: &GameResult, draw_value: f32) -> serde_json::Value {
 // Game playing
 // ---------------------------------------------------------------------------
 
-/// Build graph data and inference tensors for a position.
-/// Returns (graph_output_for_serialization, tensors_for_inference).
+/// Build the inference tensors for a position. HX07 no longer serializes the
+/// graph, so only the MCTS-root tensors are returned.
 fn build_position_graph(
     game: &GameState,
     graph_type: GraphType,
     prune_empty_edges: bool,
     threat_features: bool,
     relative_stones: bool,
-) -> (GraphOutput, GraphTensors) {
+) -> GraphTensors {
     match graph_type {
         GraphType::Axis => {
             let g = game_to_axis_graph_raw_opts(game, prune_empty_edges, threat_features, relative_stones);
-            let t = GraphTensors::from_axis(&g);
-            (GraphOutput::Axis(g), t)
+            GraphTensors::from_axis(&g)
         }
         GraphType::Hex => {
             let g = game_to_graph_raw_opts(game, threat_features, relative_stones);
-            let t = GraphTensors::from_hex(&g);
-            (GraphOutput::Hex(g), t)
+            GraphTensors::from_hex(&g)
         }
     }
 }
@@ -1458,7 +1393,7 @@ fn play_one_game(
 
         // Build graph ONCE for this position — reuse for both output and root eval
         let t = if profile { Some(Instant::now()) } else { None };
-        let (graph_output, root_tensors) =
+        let root_tensors =
             build_position_graph(&game, graph_type, prune_empty_edges, threat_features, relative_stones);
         let graph_build_ns = t.map(|i| i.elapsed().as_nanos()).unwrap_or(0);
 
@@ -1608,7 +1543,8 @@ fn play_one_game(
         positions.push(PositionData {
             policy: result.improved_policy,
             player: current_player,
-            graph: graph_output,
+            stones: game.placed_stones(),
+            moves_remaining: game.moves_remaining_this_turn(),
             sample_weight,
         });
 
@@ -1709,7 +1645,7 @@ impl RotatingWriter {
             self.rotate();
         }
         let pos_before = self.bytes_written;
-        write_game_binary(&mut self.writer, result, self.draw_value)?;
+        write_game_binary_hx07(&mut self.writer, result, self.draw_value)?;
         // Estimate bytes written (flush ensures data hits OS)
         self.writer.flush()?;
         // Use the file position to track actual bytes
@@ -2907,13 +2843,35 @@ mod tests {
         assert_eq!(logits1.len(), 1);
     }
 
-    fn make_result(graph_type: GraphType, winner: &'static str) -> GameResult {
-        let game = GameState::with_config(small_game_config());
-        let (graph, _tensors) = build_position_graph(&game, graph_type, false, false, false);
+    /// Play a few opening moves and return the resulting non-terminal game.
+    fn played_game() -> GameState {
+        let mut game = GameState::with_config(small_game_config());
+        for &(q, r) in &[(1, 0), (0, 1), (2, 0), (1, 1)] {
+            if game.is_terminal() {
+                break;
+            }
+            game.apply_move((q, r)).unwrap();
+        }
+        game
+    }
+
+    /// Build a single-position GameResult from a real (board-state) position.
+    /// `_graph_type` is retained for call-site compatibility; HX07 ships board
+    /// state, so the graph type does not affect the record.
+    fn make_result(_graph_type: GraphType, winner: &'static str) -> GameResult {
+        let game = played_game();
+        let player = match game.current_player().unwrap() {
+            hexo_engine::types::Player::P1 => "P1",
+            hexo_engine::types::Player::P2 => "P2",
+        };
         GameResult {
-            positions: vec![
-                PositionData { policy: vec![0.5, 0.5], player: "P1", graph, sample_weight: 1.0 },
-            ],
+            positions: vec![PositionData {
+                policy: vec![0.5, 0.5],
+                player,
+                stones: game.placed_stones(),
+                moves_remaining: game.moves_remaining_this_turn(),
+                sample_weight: 1.0,
+            }],
             winner,
             move_count: 1,
             window_stats: None,
@@ -2921,127 +2879,102 @@ mod tests {
     }
 
     #[test]
-    fn hex_binary_roundtrip() {
-        let result = make_result(GraphType::Hex, "P1");
-        let mut buf = Vec::new();
-        write_game_binary(&mut buf, &result, 0.0).unwrap();
-        assert!(buf.len() > 18);
-        // Check magic
-        assert_eq!(&buf[..4], RECORD_MAGIC_HX05);
-        assert_eq!(&buf[..4], b"HX05");
-        // Read length prefix (after magic)
-        let record_len = u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize;
-        assert_eq!(record_len, buf.len() - 8); // total - magic - length
-        // Read num_examples
-        let num_examples = u32::from_le_bytes(buf[8..12].try_into().unwrap());
-        assert_eq!(num_examples, 1);
-        // Winner byte follows num_examples
-        assert_eq!(buf[12] as i8, 1);
-        // move_count u32 follows winner byte
-        let move_count = u32::from_le_bytes(buf[13..17].try_into().unwrap());
-        assert_eq!(move_count, 1);
-        // node_dim u8 follows move_count (8 without threat features)
-        assert_eq!(buf[17], 8);
-    }
-
-    #[test]
-    fn binary_roundtrip_threat_features_node_dim_12() {
-        // 12-dim graphs (threat features on) must record node_dim=12 and a
-        // size field consistent with the wider feature payload.
-        let game = GameState::with_config(small_game_config());
-        let (graph, _) = build_position_graph(&game, GraphType::Hex, false, true, false);
-        let n_nodes = match &graph {
-            GraphOutput::Hex(g) => g.num_nodes,
-            GraphOutput::Axis(g) => g.num_nodes,
+    fn hx07_roundtrip() {
+        // Write an HX07 record, parse the envelope + first example back, then
+        // reconstruct the board via `from_state` and confirm the rebuilt graph
+        // matches the original game's graph (the HX07 round-trip contract).
+        let game = played_game();
+        let orig = game_to_axis_graph_raw_opts(&game, true, false, false);
+        let player = match game.current_player().unwrap() {
+            hexo_engine::types::Player::P1 => "P1",
+            hexo_engine::types::Player::P2 => "P2",
         };
+        let stones = game.placed_stones();
+        let moves_remaining = game.moves_remaining_this_turn();
         let result = GameResult {
             positions: vec![PositionData {
                 policy: vec![0.5, 0.5],
-                player: "P1",
-                graph,
-                sample_weight: 1.0,
+                player,
+                stones: stones.clone(),
+                moves_remaining,
+                sample_weight: 0.5,
             }],
             winner: "P1",
-            move_count: 1,
+            move_count: 7,
             window_stats: None,
         };
         let mut buf = Vec::new();
-        write_game_binary(&mut buf, &result, 0.0).unwrap();
-        assert_eq!(&buf[..4], b"HX05");
-        assert_eq!(buf[17], 12, "node_dim must be 12 with threat features");
-        let record_len = u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize;
-        assert_eq!(record_len, buf.len() - 8, "size field must count 12-dim features");
-        // Sanity: the record is exactly n*4*4 bytes larger than its 8-dim twin.
-        let (graph8, _) = build_position_graph(&game, GraphType::Hex, false, false, false);
-        let result8 = GameResult {
-            positions: vec![PositionData {
-                policy: vec![0.5, 0.5],
-                player: "P1",
-                graph: graph8,
-                sample_weight: 1.0,
-            }],
-            winner: "P1",
-            move_count: 1,
-            window_stats: None,
-        };
-        let mut buf8 = Vec::new();
-        write_game_binary(&mut buf8, &result8, 0.0).unwrap();
-        assert_eq!(buf.len() - buf8.len(), n_nodes * 4 * 4);
-    }
+        write_game_binary_hx07(&mut buf, &result, 0.0).unwrap();
 
-    /// Build a single-position GameResult with the given graph flags and
-    /// return (record bytes, num_nodes).
-    fn roundtrip_buf(threat_features: bool, relative_stones: bool) -> (Vec<u8>, usize) {
-        let game = GameState::with_config(small_game_config());
-        let (graph, _) =
-            build_position_graph(&game, GraphType::Hex, false, threat_features, relative_stones);
-        let n_nodes = match &graph {
-            GraphOutput::Hex(g) => g.num_nodes,
-            GraphOutput::Axis(g) => g.num_nodes,
-        };
-        let result = GameResult {
-            positions: vec![PositionData {
-                policy: vec![0.5, 0.5],
-                player: "P1",
-                graph,
-                sample_weight: 1.0,
-            }],
-            winner: "P1",
-            move_count: 1,
-            window_stats: None,
-        };
-        let mut buf = Vec::new();
-        write_game_binary(&mut buf, &result, 0.0).unwrap();
-        (buf, n_nodes)
-    }
-
-    #[test]
-    fn binary_roundtrip_relative_stones_node_dim_7() {
-        // 7-dim graphs (relative stones, no threat) must record node_dim=7
-        // and a size field consistent with the narrower feature payload.
-        let (buf, n_nodes) = roundtrip_buf(false, true);
-        assert_eq!(&buf[..4], b"HX05");
-        assert_eq!(buf[17], 7, "node_dim must be 7 with relative stones");
+        // Envelope
+        assert_eq!(&buf[..4], RECORD_MAGIC_HX07);
+        assert_eq!(&buf[..4], b"HX07");
         let record_len = u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize;
-        assert_eq!(record_len, buf.len() - 8, "size field must count 7-dim features");
-        // Sanity: exactly n*1*4 bytes smaller than its 8-dim twin.
-        let (buf8, _) = roundtrip_buf(false, false);
-        assert_eq!(buf8[17], 8);
-        assert_eq!(buf8.len() - buf.len(), n_nodes * 4);
-    }
+        assert_eq!(record_len, buf.len() - 8);
+        assert_eq!(u32::from_le_bytes(buf[8..12].try_into().unwrap()), 1); // num_examples
+        assert_eq!(buf[12] as i8, 1); // winner P1
+        assert_eq!(u32::from_le_bytes(buf[13..17].try_into().unwrap()), 7); // move_count
+        assert_eq!(buf[17], 0, "has_window flag off"); // has_window
 
-    #[test]
-    fn binary_roundtrip_relative_stones_threat_node_dim_11() {
-        // 11-dim graphs (relative stones + threat) must record node_dim=11.
-        let (buf, n_nodes) = roundtrip_buf(true, true);
-        assert_eq!(&buf[..4], b"HX05");
-        assert_eq!(buf[17], 11, "node_dim must be 11 with relative stones + threat");
-        let record_len = u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize;
-        assert_eq!(record_len, buf.len() - 8, "size field must count 11-dim features");
-        // Sanity: exactly n*1*4 bytes smaller than its 12-dim twin.
-        let (buf12, _) = roundtrip_buf(true, false);
-        assert_eq!(buf12[17], 12);
-        assert_eq!(buf12.len() - buf.len(), n_nodes * 4);
+        // First example header at offset 18.
+        let mut o = 18usize;
+        let num_stones = u16::from_le_bytes(buf[o..o + 2].try_into().unwrap()) as usize;
+        o += 2;
+        let cur_player = buf[o];
+        o += 1;
+        let mr = buf[o];
+        o += 1;
+        let num_legal = u16::from_le_bytes(buf[o..o + 2].try_into().unwrap()) as usize;
+        o += 2;
+        let value = f32::from_le_bytes(buf[o..o + 4].try_into().unwrap());
+        o += 4;
+        let weight = f32::from_le_bytes(buf[o..o + 4].try_into().unwrap());
+        o += 4;
+        assert_eq!(num_stones, stones.len());
+        assert_eq!(cur_player, player_byte_from_str(player));
+        assert_eq!(mr, moves_remaining);
+        assert_eq!(num_legal, 2);
+        // Winner is "P1": +1 when it's P1's turn, -1 otherwise.
+        let expected_value = if player == "P1" { 1.0 } else { -1.0 };
+        assert_eq!(value, expected_value);
+        assert_eq!(weight, 0.5);
+
+        // Stones body: (2B q i16, 2B r i16, 1B player).
+        let mut rebuilt_stones: Vec<(hexo_engine::types::Coord, hexo_engine::types::Player)> =
+            Vec::with_capacity(num_stones);
+        for _ in 0..num_stones {
+            let q = i16::from_le_bytes(buf[o..o + 2].try_into().unwrap()) as i32;
+            o += 2;
+            let r = i16::from_le_bytes(buf[o..o + 2].try_into().unwrap()) as i32;
+            o += 2;
+            let p = match buf[o] {
+                0 => hexo_engine::types::Player::P1,
+                _ => hexo_engine::types::Player::P2,
+            };
+            o += 1;
+            rebuilt_stones.push(((q, r), p));
+        }
+        // Policy body.
+        for _ in 0..num_legal {
+            let _ = f32::from_le_bytes(buf[o..o + 4].try_into().unwrap());
+            o += 4;
+        }
+        assert_eq!(o, buf.len(), "parsed exactly the whole record");
+
+        // Reconstruct via from_state and confirm the graph matches.
+        let cp = if cur_player == 1 {
+            hexo_engine::types::Player::P2
+        } else {
+            hexo_engine::types::Player::P1
+        };
+        let rebuilt = GameState::from_state(&rebuilt_stones, cp, mr, small_game_config());
+        let g2 = game_to_axis_graph_raw_opts(&rebuilt, true, false, false);
+        assert_eq!(orig.features, g2.features);
+        assert_eq!(orig.edge_src, g2.edge_src);
+        assert_eq!(orig.edge_dst, g2.edge_dst);
+        assert_eq!(orig.edge_attr, g2.edge_attr);
+        assert_eq!(orig.legal_mask, g2.legal_mask);
+        assert_eq!(orig.coords, g2.coords);
     }
 
     #[test]
@@ -3057,8 +2990,8 @@ mod tests {
         for (w, expected) in [("P1", 1i8), ("P2", -1i8), ("draw", 0i8)] {
             let result = make_result(GraphType::Hex, w);
             let mut buf = Vec::new();
-            write_game_binary(&mut buf, &result, 0.0).unwrap();
-            assert_eq!(&buf[..4], b"HX05");
+            write_game_binary_hx07(&mut buf, &result, 0.0).unwrap();
+            assert_eq!(&buf[..4], b"HX07");
             assert_eq!(buf[12] as i8, expected, "winner {w}");
             // Length prefix should match buffer minus magic+size header
             let record_len = u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize;
@@ -3069,22 +3002,21 @@ mod tests {
     #[test]
     fn move_count_roundtrip() {
         // Simulate playout cap: 10 actual moves but only 3 recorded examples.
-        let game = GameState::with_config(small_game_config());
-        let (g1, _) = build_position_graph(&game, GraphType::Hex, false, false, false);
-        let (g2, _) = build_position_graph(&game, GraphType::Hex, false, false, false);
-        let (g3, _) = build_position_graph(&game, GraphType::Hex, false, false, false);
+        let game = played_game();
+        let stones = game.placed_stones();
+        let mr = game.moves_remaining_this_turn();
         let result = GameResult {
             positions: vec![
-                PositionData { policy: vec![0.5, 0.5], player: "P1", graph: g1, sample_weight: 1.0 },
-                PositionData { policy: vec![0.5, 0.5], player: "P2", graph: g2, sample_weight: 1.0 },
-                PositionData { policy: vec![0.5, 0.5], player: "P1", graph: g3, sample_weight: 1.0 },
+                PositionData { policy: vec![0.5, 0.5], player: "P1", stones: stones.clone(), moves_remaining: mr, sample_weight: 1.0 },
+                PositionData { policy: vec![0.5, 0.5], player: "P2", stones: stones.clone(), moves_remaining: mr, sample_weight: 1.0 },
+                PositionData { policy: vec![0.5, 0.5], player: "P1", stones: stones.clone(), moves_remaining: mr, sample_weight: 1.0 },
             ],
             winner: "P1",
             move_count: 10,
             window_stats: None,
         };
         let mut buf = Vec::new();
-        write_game_binary(&mut buf, &result, 0.0).unwrap();
+        write_game_binary_hx07(&mut buf, &result, 0.0).unwrap();
         let num_examples = u32::from_le_bytes(buf[8..12].try_into().unwrap());
         assert_eq!(num_examples, 3, "examples == positions.len()");
         let move_count = u32::from_le_bytes(buf[13..17].try_into().unwrap());
@@ -3092,17 +3024,19 @@ mod tests {
     }
 
     #[test]
-    fn hx06_window_stats_roundtrip() {
-        // Gate on (window_stats: Some): magic flips to HX06 and the 12B
-        // window telemetry sits between node_dim and the first example, in
-        // contract order/offsets. Dyadic floats make equality exact.
-        let game = GameState::with_config(small_game_config());
-        let (graph, _) = build_position_graph(&game, GraphType::Hex, false, false, false);
+    fn hx07_window_stats_roundtrip() {
+        // Gate on (window_stats: Some): has_window flag = 1 and the 12B window
+        // telemetry sits between the flag and the first example, in contract
+        // order/offsets. Dyadic floats make equality exact.
+        let game = played_game();
+        let stones = game.placed_stones();
+        let mr = game.moves_remaining_this_turn();
         let result = GameResult {
             positions: vec![PositionData {
                 policy: vec![0.5, 0.5],
                 player: "P1",
-                graph,
+                stones: stones.clone(),
+                moves_remaining: mr,
                 sample_weight: 1.0,
             }],
             winner: "P1",
@@ -3115,32 +3049,30 @@ mod tests {
             }),
         };
         let mut buf = Vec::new();
-        write_game_binary(&mut buf, &result, 0.0).unwrap();
-        assert_eq!(&buf[..4], RECORD_MAGIC_HX06);
-        assert_eq!(&buf[..4], b"HX06");
+        write_game_binary_hx07(&mut buf, &result, 0.0).unwrap();
+        assert_eq!(&buf[..4], RECORD_MAGIC_HX07);
         // record_size counts everything after the size field, incl. the +12.
         let record_len = u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize;
         assert_eq!(record_len, buf.len() - 8);
-        // Envelope prefix unchanged vs HX05: num_examples / winner /
-        // move_count / node_dim at the same offsets.
+        // Envelope: num_examples / winner / move_count / has_window.
         assert_eq!(u32::from_le_bytes(buf[8..12].try_into().unwrap()), 1);
         assert_eq!(buf[12] as i8, 1);
         assert_eq!(u32::from_le_bytes(buf[13..17].try_into().unwrap()), 1);
-        assert_eq!(buf[17], 8);
-        // Window telemetry at payload offsets 10/12/14/18 (buffer 18/20/22/26).
+        assert_eq!(buf[17], 1, "has_window flag on");
+        // Window telemetry at buffer offsets 18/20/22/26.
         assert_eq!(u16::from_le_bytes(buf[18..20].try_into().unwrap()), 7);
         assert_eq!(u16::from_le_bytes(buf[20..22].try_into().unwrap()), 3);
         assert_eq!(f32::from_le_bytes(buf[22..26].try_into().unwrap()), 0.8125);
         assert_eq!(f32::from_le_bytes(buf[26..30].try_into().unwrap()), 0.4375);
-        // Gate-off twin: identical game, window_stats: None → HX05 magic,
+        // Gate-off twin: identical game, window_stats: None → has_window = 0,
         // exactly 12 bytes shorter, size field smaller by exactly 12.
-        let buf5 = {
-            let (graph, _) = build_position_graph(&game, GraphType::Hex, false, false, false);
-            let result5 = GameResult {
+        let buf_off = {
+            let result_off = GameResult {
                 positions: vec![PositionData {
                     policy: vec![0.5, 0.5],
                     player: "P1",
-                    graph,
+                    stones: stones.clone(),
+                    moves_remaining: mr,
                     sample_weight: 1.0,
                 }],
                 winner: "P1",
@@ -3148,22 +3080,27 @@ mod tests {
                 window_stats: None,
             };
             let mut b = Vec::new();
-            write_game_binary(&mut b, &result5, 0.0).unwrap();
+            write_game_binary_hx07(&mut b, &result_off, 0.0).unwrap();
             b
         };
-        assert_eq!(&buf5[..4], b"HX05");
-        assert_eq!(buf.len() - buf5.len(), 12);
-        let record_len5 = u32::from_le_bytes(buf5[4..8].try_into().unwrap()) as usize;
-        assert_eq!(record_len - record_len5, 12);
-        // Example payloads are byte-identical after the envelopes.
-        assert_eq!(&buf[30..], &buf5[18..]);
+        assert_eq!(&buf_off[..4], b"HX07");
+        assert_eq!(buf_off[17], 0, "has_window flag off");
+        assert_eq!(buf.len() - buf_off.len(), 12);
+        let record_len_off = u32::from_le_bytes(buf_off[4..8].try_into().unwrap()) as usize;
+        assert_eq!(record_len - record_len_off, 12);
+        // Example payloads are byte-identical after the envelopes (the gate-on
+        // record's examples start 12B later, after the window stats).
+        assert_eq!(&buf[30..], &buf_off[18..]);
     }
 
     #[test]
-    fn axis_msgpack_has_edge_attr() {
+    fn to_record_carries_board_state() {
         let result = make_result(GraphType::Axis, "draw");
         let record = result.to_record(0.0);
-        assert!(record.examples[0].edge_attr.is_some());
+        // Board state survives the record conversion: the (0,0) opening is
+        // present and the policy length matches.
+        assert!(record.examples[0].stones.contains(&(0, 0, 0)));
+        assert_eq!(record.examples[0].policy.len(), 2);
     }
 
     #[test]
@@ -3198,13 +3135,13 @@ mod tests {
 
     #[test]
     fn value_targets_win() {
-        let game = GameState::with_config(small_game_config());
-        let (g1, _) = build_position_graph(&game, GraphType::Hex, false, false, false);
-        let (g2, _) = build_position_graph(&game, GraphType::Hex, false, false, false);
+        let game = played_game();
+        let stones = game.placed_stones();
+        let mr = game.moves_remaining_this_turn();
         let result = GameResult {
             positions: vec![
-                PositionData { policy: vec![0.5, 0.5], player: "P1", graph: g1, sample_weight: 1.0 },
-                PositionData { policy: vec![0.3, 0.7], player: "P2", graph: g2, sample_weight: 1.0 },
+                PositionData { policy: vec![0.5, 0.5], player: "P1", stones: stones.clone(), moves_remaining: mr, sample_weight: 1.0 },
+                PositionData { policy: vec![0.3, 0.7], player: "P2", stones: stones.clone(), moves_remaining: mr, sample_weight: 1.0 },
             ],
             winner: "P1",
             move_count: 2,
@@ -3255,6 +3192,33 @@ mod tests {
             let s = pick_pool_side(&mut rng);
             assert!(s == "P1" || s == "P2");
         }
+    }
+
+    #[test]
+    fn from_state_reproduces_axis_graph() {
+        let cfg = small_game_config();
+        let mut game = GameState::with_config(cfg);
+        // (0,0) is pre-seeded in HeXO; start from the rest.
+        for &(q, r) in &[(1, 0), (0, 1), (2, 0), (1, 1)] {
+            if game.is_terminal() {
+                break;
+            }
+            game.apply_move((q, r)).unwrap();
+        }
+        let g1 = game_to_axis_graph_raw_opts(&game, true, false, false);
+        let rebuilt = GameState::from_state(
+            &game.placed_stones(),
+            game.current_player().unwrap(),
+            game.moves_remaining_this_turn(),
+            cfg,
+        );
+        let g2 = game_to_axis_graph_raw_opts(&rebuilt, true, false, false);
+        assert_eq!(g1.features, g2.features);
+        assert_eq!(g1.edge_src, g2.edge_src);
+        assert_eq!(g1.edge_dst, g2.edge_dst);
+        assert_eq!(g1.edge_attr, g2.edge_attr);
+        assert_eq!(g1.legal_mask, g2.legal_mask);
+        assert_eq!(g1.coords, g2.coords);
     }
 
     #[cfg(feature = "torch")]
@@ -3430,9 +3394,13 @@ mod tests {
         let json = game_to_json(&result, 0.0);
         let examples = json["examples"].as_array().unwrap();
         assert_eq!(examples.len(), 1);
-        assert!(examples[0]["features"].is_array());
+        // HX07 board-state keys (no graph fields).
+        assert!(examples[0]["stones"].is_array());
+        assert!(examples[0]["current_player"].is_number());
+        assert!(examples[0]["moves_remaining"].is_number());
         assert!(examples[0]["policy"].is_array());
-        assert_eq!(examples[0]["value"].as_f64().unwrap(), 1.0);
+        assert!(examples[0]["value"].is_number());
+        assert!(examples[0]["features"].is_null(), "graph fields dropped");
     }
 
     // -----------------------------------------------------------------------
