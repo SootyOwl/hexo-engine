@@ -95,7 +95,7 @@ where
         root.expand(root_priors, root_value);
 
         let (candidate_indices, gumbel_samples) =
-            gumbel_top_k(&logits, config.m_actions, rng);
+            gumbel_top_k(&logits, config.m_actions, rng, !config.disable_gumbel_noise);
         let remaining = candidate_indices.clone();
 
         searches.push(SearchState {

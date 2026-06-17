@@ -11,21 +11,31 @@ use super::scoring::{QContext, sigma};
 /// - `candidate_indices` are indices into the actions array, sorted by descending
 ///   score (gumbel + logit).
 /// - `gumbel_samples` are the full Gumbel noise values for all actions.
+///
+/// When `noise` is `false`, the random draw is skipped entirely: every Gumbel
+/// is `0.0`, so candidates collapse to the top-k actions by logit and the RNG
+/// is not advanced. Used at evaluation/play to get the paper's deterministic,
+/// zero-noise action selection.
 pub fn gumbel_top_k<R: Rng>(
     logits: &[f64],
     m: usize,
     rng: &mut R,
+    noise: bool,
 ) -> (Vec<usize>, Vec<f64>) {
     let n = logits.len();
     let k = m.min(n);
 
-    let uniform = Uniform::new(1e-20, 1.0 - 1e-20).unwrap();
-    let gumbels: Vec<f64> = (0..n)
-        .map(|_| {
-            let u: f64 = uniform.sample(rng);
-            -(-u.ln()).ln()
-        })
-        .collect();
+    let gumbels: Vec<f64> = if noise {
+        let uniform = Uniform::new(1e-20, 1.0 - 1e-20).unwrap();
+        (0..n)
+            .map(|_| {
+                let u: f64 = uniform.sample(rng);
+                -(-u.ln()).ln()
+            })
+            .collect()
+    } else {
+        vec![0.0; n]
+    };
 
     let mut scores: Vec<(usize, f64)> = gumbels
         .iter()
@@ -223,7 +233,7 @@ mod tests {
     fn gumbel_top_k_returns_min_m_n() {
         let mut rng = ChaCha8Rng::seed_from_u64(42);
         let logits = vec![1.0, 2.0, 3.0];
-        let (candidates, gumbels) = gumbel_top_k(&logits, 5, &mut rng);
+        let (candidates, gumbels) = gumbel_top_k(&logits, 5, &mut rng, true);
         assert_eq!(candidates.len(), 3); // min(5, 3)
         assert_eq!(gumbels.len(), 3);
     }
@@ -234,8 +244,8 @@ mod tests {
         let mut rng2 = ChaCha8Rng::seed_from_u64(42);
         let logits = vec![1.0, 2.0, 3.0, 4.0];
 
-        let (c1, g1) = gumbel_top_k(&logits, 2, &mut rng1);
-        let (c2, g2) = gumbel_top_k(&logits, 2, &mut rng2);
+        let (c1, g1) = gumbel_top_k(&logits, 2, &mut rng1, true);
+        let (c2, g2) = gumbel_top_k(&logits, 2, &mut rng2, true);
         assert_eq!(c1, c2);
         assert_eq!(g1, g2);
     }
@@ -244,7 +254,7 @@ mod tests {
     fn gumbel_top_k_sorted_descending() {
         let mut rng = ChaCha8Rng::seed_from_u64(42);
         let logits = vec![1.0, 2.0, 3.0, 4.0, 5.0];
-        let (candidates, gumbels) = gumbel_top_k(&logits, 3, &mut rng);
+        let (candidates, gumbels) = gumbel_top_k(&logits, 3, &mut rng, true);
 
         // Verify candidates are sorted by descending gumbel+logit score
         for i in 0..candidates.len() - 1 {
@@ -252,6 +262,21 @@ mod tests {
             let score_b = gumbels[candidates[i + 1]] + logits[candidates[i + 1]];
             assert!(score_a >= score_b);
         }
+    }
+
+    #[test]
+    fn gumbel_top_k_noise_off_is_deterministic_top_logit() {
+        // noise = false: all Gumbels zero, candidates = top-k by logit, and the
+        // RNG is never advanced (so two different seeds agree).
+        let logits = vec![1.0, 5.0, 2.0, 4.0, 3.0];
+        let mut rng_a = ChaCha8Rng::seed_from_u64(1);
+        let mut rng_b = ChaCha8Rng::seed_from_u64(999);
+        let (cand_a, gumbels_a) = gumbel_top_k(&logits, 3, &mut rng_a, false);
+        let (cand_b, _) = gumbel_top_k(&logits, 3, &mut rng_b, false);
+
+        assert!(gumbels_a.iter().all(|&g| g == 0.0));
+        assert_eq!(cand_a, vec![1, 3, 4]); // indices of logits 5,4,3
+        assert_eq!(cand_a, cand_b); // seed-independent: RNG not consumed
     }
 
     #[test]

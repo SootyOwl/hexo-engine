@@ -1413,6 +1413,7 @@ fn reduced_sim_config(base: &MCTSConfig, divisor: u32) -> MCTSConfig {
         root_dirichlet_alpha: base.root_dirichlet_alpha,
         root_dirichlet_fraction: base.root_dirichlet_fraction,
         forced_candidate_capture_k: base.forced_candidate_capture_k,
+        disable_gumbel_noise: base.disable_gumbel_noise,
     }
 }
 
@@ -2074,6 +2075,8 @@ fn main() {
         // would need to flow into the *next* search, which self-play
         // doesn't track per-game-thread). Python eval harness uses it.
         forced_candidate_capture_k: 0,
+        // Self-play keeps Gumbel noise on; only eval/play disable it.
+        disable_gumbel_noise: false,
     });
 
     let batch_timeout = if batch_timeout_ms > 0 {

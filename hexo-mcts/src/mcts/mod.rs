@@ -48,4 +48,12 @@ pub struct MCTSConfig {
     /// (the p₂ search). 0 (default) disables capture entirely (bit-equivalent
     /// to current behaviour).
     pub forced_candidate_capture_k: usize,
+    /// If `true`, skip the Gumbel(0,1) draws in root candidate sampling so the
+    /// search is fully deterministic: candidates become the top-`m_actions`
+    /// actions by logit and the final pick is `argmax(logit + σ(Q))`. This is
+    /// the paper's zero-noise evaluation behaviour. `false` (the derived
+    /// default) keeps Gumbel noise on — bit-equivalent to prior behaviour, so
+    /// self-play is unaffected. Note the improved-policy *target* never used
+    /// the Gumbel noise, so this only changes which action is played.
+    pub disable_gumbel_noise: bool,
 }

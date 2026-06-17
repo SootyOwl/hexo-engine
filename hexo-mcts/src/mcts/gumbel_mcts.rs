@@ -192,7 +192,7 @@ where
 
     // Step 3: Gumbel top-k sampling
     let (mut candidate_indices, mut gumbel_samples) =
-        gumbel_top_k(&logits, config.m_actions, rng);
+        gumbel_top_k(&logits, config.m_actions, rng, !config.disable_gumbel_noise);
 
     // Step 3.1 (E.4-inject consumer): forced candidate injection.
     //
@@ -214,7 +214,11 @@ where
         if game.moves_remaining_this_turn() == 1 && !forced.is_empty() {
             use rand_distr::{Distribution, Uniform};
             let uniform = Uniform::new(1e-20, 1.0 - 1e-20).unwrap();
+            let noise = !config.disable_gumbel_noise;
             let sample_gumbel = |rng: &mut R| -> f64 {
+                if !noise {
+                    return 0.0;
+                }
                 let u: f64 = uniform.sample(rng);
                 -(-u.ln()).ln()
             };
